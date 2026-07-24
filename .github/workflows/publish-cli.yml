@@ -45,6 +45,7 @@ jobs:
           install_dir=$(mktemp -d)
           npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/pisama-cli-*.tgz
           test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$(node -p "require('./packages/cli/package.json').version")"
+          test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
           npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
       - name: Publish through npm trusted publishing
         run: npm publish "$RUNNER_TEMP"/pisama-cli-*.tgz --access public

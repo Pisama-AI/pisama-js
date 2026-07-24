@@ -17,6 +17,8 @@ All notable changes to `@pisama/cli` are documented here.
 - Remove the nonexistent library entry point from this command-only package.
 - Show the production dashboard host after a successful verification while
   retaining the configured host for self-hosted installations.
+- Include license notices for every dependency incorporated into the MCP
+  bundle.
 - Audit the packed CLI artifact as a clean consumer install before publishing.
 
 ## [0.10.0] - 2026-07-23
