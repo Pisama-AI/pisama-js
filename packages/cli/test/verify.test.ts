@@ -110,7 +110,11 @@ test('verify reads project id from .env.local when env var is unset', async () =
 
   const s = spy();
   try {
-    await verify({ cwd: root, baseUrl: 'https://test', timeoutMs: 5000 });
+    await verify({
+      cwd: root,
+      baseUrl: 'https://api.pisama.ai/',
+      timeoutMs: 5000,
+    });
     assert.equal(s.exitCode, null, 'should not exit on success');
     assert.ok(
       s.logs.some((l) => /from \.env\.local/.test(l)),
@@ -123,6 +127,10 @@ test('verify reads project id from .env.local when env var is unset', async () =
     assert.ok(
       s.logs.some((l) => /Install is working/.test(l)),
       'expected success message',
+    );
+    assert.ok(
+      s.logs.some((l) => /Dashboard: https:\/\/pisama\.ai\/live\/ws_fromfile12/.test(l)),
+      'expected the public web dashboard rather than the API host',
     );
   } finally {
     s.restore();
@@ -149,10 +157,43 @@ test('verify fails when ingest returns 5xx', async () => {
       s.errs.some((l) => /HTTP 502/.test(l)),
       'expected HTTP 502 in error',
     );
+    assert.ok(
+      s.errs.some((l) => /https:\/\/test\/api\/v1\/health/.test(l)),
+      'expected the configured API health endpoint in the error',
+    );
   } finally {
     s.restore();
     globalThis.fetch = originalFetch;
     delete process.env.PISAMA_PROJECT_ID;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('verify reports the configured health endpoint when the API is unreachable', async () => {
+  const root = await mktmp();
+  const s = spy();
+  try {
+    try {
+      await verify({
+        cwd: root,
+        projectId: 'ws_unreachable12',
+        baseUrl: 'http://127.0.0.1:1',
+        timeoutMs: 100,
+      });
+    } catch (e) {
+      assert.equal((e as Error).message, '__exit__');
+    }
+    assert.equal(s.exitCode, 1);
+    assert.ok(
+      s.errs.some((l) => /cannot reach the configured API/.test(l)),
+      'expected a host-neutral connectivity error',
+    );
+    assert.ok(
+      s.errs.some((l) => /http:\/\/127\.0\.0\.1:1\/api\/v1\/health/.test(l)),
+      'expected the configured API health endpoint',
+    );
+  } finally {
+    s.restore();
     await rm(root, { recursive: true, force: true });
   }
 });

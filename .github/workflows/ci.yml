@@ -25,6 +25,32 @@ jobs:
       - run: pnpm typecheck
       - run: pnpm test:coverage
       - run: pnpm audit:production
+      - run: pnpm audit:bundle-inputs
       - run: pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP"
       - run: pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP"
       - run: pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP"
+      - name: Verify CLI publish artifact
+        run: |
+          install_dir=$(mktemp -d)
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/pisama-cli-*.tgz
+          test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$(node -p "require('./packages/cli/package.json').version")"
+          test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
+          npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
+
+  node-20-compatibility:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "20"
+          cache: pnpm
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm test
+      - run: pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP"
+      - name: Verify CLI publish artifact
+        run: |
+          install_dir=$(mktemp -d)
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/pisama-cli-*.tgz
+          test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$(node -p "require('./packages/cli/package.json').version")"

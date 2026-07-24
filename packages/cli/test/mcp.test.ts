@@ -1,11 +1,15 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
+import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const binPath = resolve(here, '..', 'dist', 'bin.js');
+const packageVersion = (
+  JSON.parse(readFileSync(resolve(here, '..', 'package.json'), 'utf8')) as { version: string }
+).version;
 
 interface JsonRpcResponse {
   jsonrpc: '2.0';
@@ -14,10 +18,15 @@ interface JsonRpcResponse {
   error?: { code: number; message: string };
 }
 
-async function rpcCall(
+interface RpcExchange {
+  initialization: JsonRpcResponse;
+  response: JsonRpcResponse;
+}
+
+async function rpcExchange(
   request: { id: number; method: string; params?: unknown },
   timeoutMs = 4000,
-): Promise<JsonRpcResponse> {
+): Promise<RpcExchange> {
   const child = spawn(process.execPath, [binPath, 'mcp', '--project-id', 'ws_mcp_test'], {
     stdio: ['pipe', 'pipe', 'pipe'],
     env: { ...process.env, PISAMA_PROJECT_ID: 'ws_mcp_test' },
@@ -43,7 +52,7 @@ async function rpcCall(
   child.stdin.write(JSON.stringify(initialized) + '\n');
   child.stdin.write(JSON.stringify(call) + '\n');
 
-  return await new Promise<JsonRpcResponse>((resolveP, reject) => {
+  return await new Promise<RpcExchange>((resolveP, reject) => {
     const timer = setTimeout(() => {
       child.kill();
       reject(new Error(`mcp rpc timeout after ${timeoutMs}ms`));
@@ -51,6 +60,7 @@ async function rpcCall(
 
     let buffer = '';
     let stderr = '';
+    let initialization: JsonRpcResponse | undefined;
     child.stderr.on('data', (d) => (stderr += d.toString()));
     child.stdout.on('data', (chunk: Buffer) => {
       buffer += chunk.toString();
@@ -64,10 +74,20 @@ async function rpcCall(
         } catch {
           continue;
         }
+        if (parsed.id === initMessage.id) {
+          initialization = parsed;
+          continue;
+        }
         if (parsed.id === request.id) {
+          if (!initialization) {
+            clearTimeout(timer);
+            child.kill();
+            reject(new Error('mcp call completed before initialization response'));
+            return;
+          }
           clearTimeout(timer);
           child.kill();
-          resolveP(parsed);
+          resolveP({ initialization, response: parsed });
           return;
         }
       }
@@ -83,6 +103,13 @@ async function rpcCall(
       }
     });
   });
+}
+
+async function rpcCall(
+  request: { id: number; method: string; params?: unknown },
+  timeoutMs = 4000,
+): Promise<JsonRpcResponse> {
+  return (await rpcExchange(request, timeoutMs)).response;
 }
 
 interface ToolDef {
@@ -106,6 +133,16 @@ test('mcp: tools/list returns 3 pisama tools', async () => {
   const tools = (res.result as { tools: ToolDef[] }).tools;
   const names = tools.map((t) => t.name).sort();
   assert.deepEqual(names, ['get_recent_failures', 'get_recent_traces', 'get_trace']);
+});
+
+test('mcp: initialize advertises the package version', async () => {
+  const exchange = await rpcExchange({ id: 3, method: 'tools/list' });
+  const result = exchange.initialization.result as {
+    serverInfo?: { name?: string; version?: string };
+  };
+
+  assert.equal(result.serverInfo?.name, 'pisama');
+  assert.equal(result.serverInfo?.version, packageVersion);
 });
 
 test('mcp: every tool declares MCP 2025-06-18 ergonomic fields', async () => {

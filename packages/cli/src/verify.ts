@@ -19,11 +19,14 @@ export interface VerifyOptions {
 }
 
 const DEFAULT_BASE = 'https://api.pisama.ai';
+const DEFAULT_DASHBOARD_BASE = 'https://pisama.ai';
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 export async function verify(opts: VerifyOptions): Promise<void> {
   const root = resolve(opts.cwd);
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
+  const dashboardBaseUrl = baseUrl === DEFAULT_BASE ? DEFAULT_DASHBOARD_BASE : baseUrl;
+  const healthUrl = `${baseUrl}/api/v1/health`;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   step('Looking up project id...');
@@ -71,15 +74,15 @@ export async function verify(opts: VerifyOptions): Promise<void> {
     fail(
       `Could not reach ${baseUrl}/api/v1/spans.\n` +
         `  ${kleur.dim((err as Error)?.message ?? String(err))}\n` +
-        `  Either this machine has no network egress to pisama.ai,\n` +
-        `  or pisama.ai itself is down. Check https://pisama.ai/status`,
+        `  Either this machine cannot reach the configured API,\n` +
+        `  or the API is unavailable. Check ${healthUrl}`,
     );
   }
 
   if (!postRes.ok && postRes.status !== 207) {
     fail(
       `Ingest returned HTTP ${postRes.status}. Aborting.\n` +
-        `  If this persists, check https://pisama.ai/status`,
+        `  If this persists, check ${healthUrl}`,
     );
   }
   ok(`Ingest accepted (HTTP ${postRes.status}).`);
@@ -99,7 +102,7 @@ export async function verify(opts: VerifyOptions): Promise<void> {
   }
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
   ok(`Trace arrived in ${elapsed}s. ${kleur.green('Install is working.')}`);
-  console.log(`\n  Dashboard: ${kleur.cyan(`${baseUrl}/live/${projectId}`)}\n`);
+  console.log(`\n  Dashboard: ${kleur.cyan(`${dashboardBaseUrl}/live/${projectId}`)}\n`);
 }
 
 async function pollForTrace(

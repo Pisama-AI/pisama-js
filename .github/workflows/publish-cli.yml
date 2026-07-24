@@ -33,6 +33,8 @@ jobs:
         run: pnpm test:coverage
       - name: Audit production dependencies
         run: pnpm audit:production
+      - name: Audit bundled dependency inputs
+        run: pnpm audit:bundle-inputs
       - name: Verify tag matches package version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#cli-v}"
@@ -40,5 +42,12 @@ jobs:
           test "$TAG_VERSION" = "$PACKAGE_VERSION"
       - name: Pack and inspect publish artifact
         run: pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP"
+      - name: Verify publish artifact
+        run: |
+          install_dir=$(mktemp -d)
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/pisama-cli-*.tgz
+          test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$(node -p "require('./packages/cli/package.json').version")"
+          test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
+          npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
       - name: Publish through npm trusted publishing
         run: npm publish "$RUNNER_TEMP"/pisama-cli-*.tgz --access public

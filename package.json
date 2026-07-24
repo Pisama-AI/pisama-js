@@ -14,7 +14,8 @@
     "format:check": "prettier --check \"packages/**/*.{ts,tsx}\"",
     "test": "pnpm build && pnpm -r test",
     "test:coverage": "pnpm build && pnpm -r test:coverage",
-    "audit:production": "pnpm audit --prod --audit-level moderate"
+    "audit:production": "pnpm audit --prod --audit-level moderate",
+    "audit:bundle-inputs": "pnpm audit --dev --audit-level moderate"
   },
   "pnpm": {
     "overrides": {
