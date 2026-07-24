@@ -25,7 +25,7 @@ const DEFAULT_TIMEOUT_MS = 15_000;
 export async function verify(opts: VerifyOptions): Promise<void> {
   const root = resolve(opts.cwd);
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
-  const dashboardBaseUrl = opts.baseUrl ? baseUrl : DEFAULT_DASHBOARD_BASE;
+  const dashboardBaseUrl = baseUrl === DEFAULT_BASE ? DEFAULT_DASHBOARD_BASE : baseUrl;
   const healthUrl = `${baseUrl}/api/v1/health`;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 

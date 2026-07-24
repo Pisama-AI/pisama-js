@@ -110,7 +110,11 @@ test('verify reads project id from .env.local when env var is unset', async () =
 
   const s = spy();
   try {
-    await verify({ cwd: root, timeoutMs: 5000 });
+    await verify({
+      cwd: root,
+      baseUrl: 'https://api.pisama.ai/',
+      timeoutMs: 5000,
+    });
     assert.equal(s.exitCode, null, 'should not exit on success');
     assert.ok(
       s.logs.some((l) => /from \.env\.local/.test(l)),

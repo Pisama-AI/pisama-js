@@ -61,6 +61,7 @@ interface TracesResponse {
 
 export interface McpOptions {
   projectId: string;
+  serverVersion: string;
   baseUrl?: string;
   fetchImpl?: typeof fetch;
 }
@@ -71,7 +72,7 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
   const projectId = opts.projectId;
 
   const server = new Server(
-    { name: 'pisama', version: '0.0.1' },
+    { name: 'pisama', version: opts.serverVersion },
     {
       // Advertise both tools and prompts. `listChanged:false` tells clients we
       // don't push updates when the menu changes (we don't have a use case for

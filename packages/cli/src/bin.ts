@@ -43,7 +43,11 @@ program
       console.error('no project id. Pass --project-id or set PISAMA_PROJECT_ID.');
       process.exit(1);
     }
-    await startMcpServer({ projectId, baseUrl: opts.baseUrl });
+    await startMcpServer({
+      projectId,
+      baseUrl: opts.baseUrl,
+      serverVersion: version,
+    });
   });
 
 program

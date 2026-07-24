@@ -18,8 +18,11 @@ All notable changes to `@pisama/cli` are documented here.
 - Show the production dashboard host after a successful verification while
   retaining the configured host for self-hosted installations.
 - Direct failure diagnostics to the public API health endpoint.
+- Report the package version in the MCP initialization handshake.
 - Include license notices for every dependency incorporated into the MCP
   bundle.
+- Audit the dependency set incorporated into the bundle and continuously test
+  the documented Node.js 20 minimum.
 - Audit the packed CLI artifact as a clean consumer install before publishing.
 
 ## [0.10.0] - 2026-07-23
