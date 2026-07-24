@@ -153,3 +153,22 @@ test('init reuses an existing project id from .env.local', async () => {
     await rm(root, { recursive: true, force: true });
   }
 });
+
+test('init appends a project id after an env file without a trailing newline', async () => {
+  const root = await makeFixture();
+  try {
+    await writeFile(join(root, '.env.local'), 'OTHER_VAR=kept');
+    const log = console.log;
+    console.log = () => {};
+    try {
+      await init({ cwd: root, open: false, dryRun: false });
+    } finally {
+      console.log = log;
+    }
+
+    const env = await readFile(join(root, '.env.local'), 'utf8');
+    assert.match(env, /^OTHER_VAR=kept\nPISAMA_PROJECT_ID=ps_/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});

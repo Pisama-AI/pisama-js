@@ -23,7 +23,8 @@ jobs:
       - run: pnpm lint
       - run: pnpm format:check
       - run: pnpm typecheck
-      - run: pnpm test
+      - run: pnpm test:coverage
+      - run: pnpm audit:production
       - run: pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP"
       - run: pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP"
       - run: pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP"
