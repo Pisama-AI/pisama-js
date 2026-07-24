@@ -153,10 +153,43 @@ test('verify fails when ingest returns 5xx', async () => {
       s.errs.some((l) => /HTTP 502/.test(l)),
       'expected HTTP 502 in error',
     );
+    assert.ok(
+      s.errs.some((l) => /https:\/\/test\/api\/v1\/health/.test(l)),
+      'expected the configured API health endpoint in the error',
+    );
   } finally {
     s.restore();
     globalThis.fetch = originalFetch;
     delete process.env.PISAMA_PROJECT_ID;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('verify reports the configured health endpoint when the API is unreachable', async () => {
+  const root = await mktmp();
+  const s = spy();
+  try {
+    try {
+      await verify({
+        cwd: root,
+        projectId: 'ws_unreachable12',
+        baseUrl: 'http://127.0.0.1:1',
+        timeoutMs: 100,
+      });
+    } catch (e) {
+      assert.equal((e as Error).message, '__exit__');
+    }
+    assert.equal(s.exitCode, 1);
+    assert.ok(
+      s.errs.some((l) => /cannot reach the configured API/.test(l)),
+      'expected a host-neutral connectivity error',
+    );
+    assert.ok(
+      s.errs.some((l) => /http:\/\/127\.0\.0\.1:1\/api\/v1\/health/.test(l)),
+      'expected the configured API health endpoint',
+    );
+  } finally {
+    s.restore();
     await rm(root, { recursive: true, force: true });
   }
 });

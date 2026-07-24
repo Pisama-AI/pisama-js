@@ -26,6 +26,7 @@ export async function verify(opts: VerifyOptions): Promise<void> {
   const root = resolve(opts.cwd);
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
   const dashboardBaseUrl = opts.baseUrl ? baseUrl : DEFAULT_DASHBOARD_BASE;
+  const healthUrl = `${baseUrl}/api/v1/health`;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   step('Looking up project id...');
@@ -73,15 +74,15 @@ export async function verify(opts: VerifyOptions): Promise<void> {
     fail(
       `Could not reach ${baseUrl}/api/v1/spans.\n` +
         `  ${kleur.dim((err as Error)?.message ?? String(err))}\n` +
-        `  Either this machine has no network egress to pisama.ai,\n` +
-        `  or pisama.ai itself is down. Check https://pisama.ai/status`,
+        `  Either this machine cannot reach the configured API,\n` +
+        `  or the API is unavailable. Check ${healthUrl}`,
     );
   }
 
   if (!postRes.ok && postRes.status !== 207) {
     fail(
       `Ingest returned HTTP ${postRes.status}. Aborting.\n` +
-        `  If this persists, check https://pisama.ai/status`,
+        `  If this persists, check ${healthUrl}`,
     );
   }
   ok(`Ingest accepted (HTTP ${postRes.status}).`);

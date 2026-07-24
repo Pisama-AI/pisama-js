@@ -134,4 +134,5 @@ Flags:
 
 Report defects in the
 [Pisama JavaScript repository](https://github.com/Pisama-AI/pisama-js/issues).
-For service status, see [pisama.ai/status](https://pisama.ai/status).
+The public API exposes its current dependency health at
+[api.pisama.ai/api/v1/health](https://api.pisama.ai/api/v1/health).
