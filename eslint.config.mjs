@@ -17,6 +17,9 @@ export default tseslint.config(
       ecmaVersion: 2022,
       sourceType: 'module',
     },
+    rules: {
+      complexity: ['error', 15],
+    },
   },
   prettier,
 );

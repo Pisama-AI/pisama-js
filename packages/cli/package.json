@@ -4,6 +4,7 @@
   "description": "CLI for Pisama. `init` patches your project, `verify` round-trips a synthetic trace, `mcp` runs the MCP server, `analyze-atif` runs Pisama detectors on Harbor trajectories.",
   "type": "module",
   "bin": {
+    "pisama": "./dist/bin.js",
     "pisama-ts": "./dist/bin.js"
   },
   "main": "./dist/index.js",

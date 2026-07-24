@@ -85,19 +85,100 @@ interface AnalyzeResponse {
   } | null;
 }
 
+async function resolveApplyCredentials(
+  opts: AnalyzeAtifOptions,
+): Promise<Record<string, unknown> | undefined> {
+  if (!opts.apply) return undefined;
+  if (!opts.framework) fail('--apply requires --framework <name>');
+  if (!opts.entityId) fail('--apply requires --entity-id <id>');
+  if (!opts.credentials) {
+    fail('--apply requires --credentials (inline JSON or path to a .json file)');
+  }
+  return loadCredentials(opts.credentials);
+}
+
+function parseTrajectory(file: string, raw: string): { schema_version?: string } {
+  let trajectory: { schema_version?: string };
+  try {
+    trajectory = JSON.parse(raw);
+  } catch (error) {
+    fail(`${basename(file)}: not valid JSON (${(error as Error).message})`);
+  }
+
+  const version = trajectory.schema_version;
+  if (!version || !SUPPORTED_SCHEMA_VERSIONS.has(version)) {
+    fail(
+      `${basename(file)}: unsupported schema_version ${kleur.red(
+        String(version),
+      )}. Expected one of: ${[...SUPPORTED_SCHEMA_VERSIONS].join(', ')}`,
+    );
+  }
+  return trajectory;
+}
+
+async function requestAnalysis(
+  file: string,
+  baseUrl: string,
+  trajectory: { schema_version?: string },
+  opts: AnalyzeAtifOptions,
+  credentials: Record<string, unknown> | undefined,
+): Promise<AnalyzeResponse> {
+  let response: Response;
+  try {
+    response = await fetch(`${baseUrl}/api/v1/atif/analyze`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({
+        trajectory,
+        ...(opts.projectId ? { project_id: opts.projectId } : {}),
+        ...(opts.apply
+          ? {
+              apply_fix: true,
+              framework: opts.framework,
+              entity_id: opts.entityId,
+              credentials: credentials ?? {},
+            }
+          : {}),
+      }),
+    });
+  } catch (error) {
+    fail(
+      `${basename(file)}: could not reach ${baseUrl}/api/v1/atif/analyze\n` +
+        `  ${kleur.dim((error as Error).message)}`,
+    );
+  }
+
+  if (!response.ok) {
+    const body = await safeReadBody(response);
+    fail(`${basename(file)}: HTTP ${response.status} from analyze endpoint\n  ${kleur.dim(body)}`);
+  }
+  return (await response.json()) as AnalyzeResponse;
+}
+
+async function analyzeTrajectory(
+  file: string,
+  target: string,
+  targetIsDirectory: boolean,
+  baseUrl: string,
+  opts: AnalyzeAtifOptions,
+  credentials: Record<string, unknown> | undefined,
+): Promise<{ failureCount: number; highSeverity: boolean }> {
+  const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
+  const data = await requestAnalysis(file, baseUrl, trajectory, opts, credentials);
+  const highSeverity = data.diagnosis.all_detections.some(
+    (detection) => (detection.severity ?? '').toLowerCase() === 'high',
+  );
+  const label = targetIsDirectory ? relative(target, file) || basename(file) : basename(file);
+
+  renderTrajectorySummary(label, data);
+  if (opts.apply && data.healing) renderHealingSummary(data.healing);
+  return { failureCount: data.diagnosis.failure_count, highSeverity };
+}
+
 export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   const target = resolve(opts.path);
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
-
-  let credentials: Record<string, unknown> | undefined;
-  if (opts.apply) {
-    if (!opts.framework) fail('--apply requires --framework <name>');
-    if (!opts.entityId) fail('--apply requires --entity-id <id>');
-    if (!opts.credentials) {
-      fail('--apply requires --credentials (inline JSON or path to a .json file)');
-    }
-    credentials = await loadCredentials(opts.credentials!);
-  }
+  const credentials = await resolveApplyCredentials(opts);
 
   const files = await collectTrajectoryFiles(target);
   if (files.length === 0) {
@@ -119,65 +200,9 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   let totalFailures = 0;
 
   for (const file of files) {
-    const raw = await readFile(file, 'utf8');
-    let trajectory: { schema_version?: string };
-    try {
-      trajectory = JSON.parse(raw);
-    } catch (err) {
-      fail(`${basename(file)}: not valid JSON (${(err as Error).message})`);
-    }
-    const ver = trajectory.schema_version;
-    if (!ver || !SUPPORTED_SCHEMA_VERSIONS.has(ver)) {
-      fail(
-        `${basename(file)}: unsupported schema_version ${kleur.red(
-          String(ver),
-        )}. Expected one of: ${[...SUPPORTED_SCHEMA_VERSIONS].join(', ')}`,
-      );
-    }
-
-    let res: Response;
-    try {
-      res = await fetch(`${baseUrl}/api/v1/atif/analyze`, {
-        method: 'POST',
-        headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({
-          trajectory,
-          ...(opts.projectId ? { project_id: opts.projectId } : {}),
-          ...(opts.apply
-            ? {
-                apply_fix: true,
-                framework: opts.framework,
-                entity_id: opts.entityId,
-                credentials: credentials ?? {},
-              }
-            : {}),
-        }),
-      });
-    } catch (err) {
-      fail(
-        `${basename(file)}: could not reach ${baseUrl}/api/v1/atif/analyze\n` +
-          `  ${kleur.dim((err as Error).message)}`,
-      );
-    }
-
-    if (!res.ok) {
-      const body = await safeReadBody(res);
-      fail(`${basename(file)}: HTTP ${res.status} from analyze endpoint\n  ${kleur.dim(body)}`);
-    }
-
-    const data = (await res.json()) as AnalyzeResponse;
-    const failures = data.diagnosis.failure_count;
-    totalFailures += failures;
-    const high = data.diagnosis.all_detections.filter(
-      (d) => (d.severity ?? '').toLowerCase() === 'high',
-    );
-    if (high.length > 0) highSeverityFound = true;
-
-    const label = targetIsDir ? relative(target, file) || basename(file) : basename(file);
-    renderTrajectorySummary(label, data);
-    if (opts.apply && data.healing) {
-      renderHealingSummary(data.healing);
-    }
+    const result = await analyzeTrajectory(file, target, targetIsDir, baseUrl, opts, credentials);
+    totalFailures += result.failureCount;
+    highSeverityFound ||= result.highSeverity;
   }
 
   console.log();
@@ -250,6 +275,30 @@ async function findTrajectoryFiles(root: string, maxDepth: number): Promise<stri
   return out;
 }
 
+type Detection = AnalyzeResponse['diagnosis']['all_detections'][number];
+
+function severityColor(severity: string): (value: string) => string {
+  if (severity === 'high') return kleur.red;
+  if (severity === 'medium') return kleur.yellow;
+  return kleur.cyan;
+}
+
+function renderSeverityGroup(severity: string, items: Detection[]): void {
+  if (items.length === 0) return;
+
+  const color = severityColor(severity);
+  console.log(`    ${color(severity.toUpperCase())} (${items.length}):`);
+  for (const item of items.slice(0, 3)) {
+    const name = item.category ?? item.detector ?? item.detection_type ?? 'unknown';
+    const confidence =
+      item.confidence === undefined ? '' : ` (${(item.confidence * 100).toFixed(0)}%)`;
+    console.log(`      - ${name}${confidence}  ${kleur.dim(item.title ?? '')}`);
+  }
+  if (items.length > 3) {
+    console.log(`      ${kleur.dim(`... and ${items.length - 3} more`)}`);
+  }
+}
+
 function renderTrajectorySummary(label: string, data: AnalyzeResponse): void {
   const name = label;
   const t = data.trace;
@@ -272,19 +321,8 @@ function renderTrajectorySummary(label: string, data: AnalyzeResponse): void {
     `  ${kleur.yellow('!')} ${d.failure_count} detection(s) across ${d.detectors_run.length} detector(s)`,
   );
   const grouped = groupBySeverity(d.all_detections);
-  for (const sev of ['high', 'medium', 'low']) {
-    const items = grouped.get(sev) ?? [];
-    if (items.length === 0) continue;
-    const color = sev === 'high' ? kleur.red : sev === 'medium' ? kleur.yellow : kleur.cyan;
-    console.log(`    ${color(sev.toUpperCase())} (${items.length}):`);
-    for (const item of items.slice(0, 3)) {
-      const name = item.category ?? item.detector ?? item.detection_type ?? 'unknown';
-      const conf = item.confidence !== undefined ? ` (${(item.confidence * 100).toFixed(0)}%)` : '';
-      console.log(`      - ${name}${conf}  ${kleur.dim(item.title ?? '')}`);
-    }
-    if (items.length > 3) {
-      console.log(`      ${kleur.dim(`... and ${items.length - 3} more`)}`);
-    }
+  for (const severity of ['high', 'medium', 'low']) {
+    renderSeverityGroup(severity, grouped.get(severity) ?? []);
   }
 
   if (Object.keys(d.detectors_failed).length > 0) {

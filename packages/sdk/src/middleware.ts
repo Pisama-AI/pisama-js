@@ -169,40 +169,46 @@ export function pisamaMiddleware(opts: PisamaMiddlewareOptions = {}): LanguageMo
   }) as unknown as LanguageModelV3Middleware;
 }
 
-function buildMiddleware(opts: PisamaMiddlewareOptions = {}): PisamaLanguageModelMiddleware {
-  const projectId =
-    opts.projectId ?? (typeof process !== 'undefined' ? process.env.PISAMA_PROJECT_ID : undefined);
+function resolveProjectId(opts: PisamaMiddlewareOptions): string | undefined {
+  return (
+    opts.projectId ?? (typeof process !== 'undefined' ? process.env.PISAMA_PROJECT_ID : undefined)
+  );
+}
 
-  const enabled = opts.enabled !== false && Boolean(projectId) && !isTelemetryDisabled();
-  const redactMode: RedactMode = opts.redact ?? 'standard';
-
-  const noopGenerate = async ({ doGenerate }: MiddlewareWrapGenerateArgs) => doGenerate();
-  const noopStream = async ({ doStream }: MiddlewareWrapStreamArgs) => doStream();
-
-  if (!enabled || !projectId) {
-    return {
-      specificationVersion: 'v3',
-      wrapGenerate: noopGenerate,
-      wrapStream: noopStream,
-    };
-  }
-
-  const exporter = opts.exporter ?? new TraceExporter({ projectId, endpoint: opts.endpoint });
-  const baseMetadata: Record<string, unknown> = {};
+function buildBaseMetadata(opts: PisamaMiddlewareOptions): Record<string, unknown> {
+  const metadata: Record<string, unknown> = {};
   if (opts.contact && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(opts.contact)) {
-    baseMetadata.contact = opts.contact;
+    metadata.contact = opts.contact;
   }
-  // Install-source tag. Written by the AI builder during install (per the
-  // /install prompt), so traces carry where the install came from. Lets the
-  // dashboard surface per-platform first-install success rate and alarm
-  // when a platform regresses. Validated against a strict slug allowlist —
-  // junk values are dropped so we can rely on the column server-side.
+
+  // The installer writes a strict platform slug so the dashboard can measure
+  // first-install success by source without accepting arbitrary metadata.
   if (typeof process !== 'undefined') {
     const rawPlatform = process.env.PISAMA_PLATFORM?.trim().toLowerCase();
     if (rawPlatform && /^[a-z0-9-]{1,32}$/.test(rawPlatform)) {
-      baseMetadata.pisama_platform = rawPlatform;
+      metadata.pisama_platform = rawPlatform;
     }
   }
+  return metadata;
+}
+
+function disabledMiddleware(): PisamaLanguageModelMiddleware {
+  return {
+    specificationVersion: 'v3',
+    wrapGenerate: async ({ doGenerate }) => doGenerate(),
+    wrapStream: async ({ doStream }) => doStream(),
+  };
+}
+
+function buildMiddleware(opts: PisamaMiddlewareOptions = {}): PisamaLanguageModelMiddleware {
+  const projectId = resolveProjectId(opts);
+  const enabled = opts.enabled !== false && Boolean(projectId) && !isTelemetryDisabled();
+  const redactMode: RedactMode = opts.redact ?? 'standard';
+
+  if (!enabled || !projectId) return disabledMiddleware();
+
+  const exporter = opts.exporter ?? new TraceExporter({ projectId, endpoint: opts.endpoint });
+  const baseMetadata = buildBaseMetadata(opts);
 
   // Eager flush: required on Cloudflare Workers / Vercel Edge / Deno Deploy
   // where the isolate is frozen after the response finishes — the lazy

@@ -13,6 +13,12 @@ export interface ExporterOptions {
 
 const HOSTED_ENDPOINT = 'https://api.pisama.ai/api/v1/spans';
 
+interface PartialFlushBody {
+  accepted?: number;
+  submitted?: number;
+  failed?: Array<{ traceId: string; reason: string }>;
+}
+
 function defaultEndpoint(): string {
   if (typeof process !== 'undefined' && process.env.PISAMA_INGEST_URL) {
     return process.env.PISAMA_INGEST_URL;
@@ -58,75 +64,88 @@ export class TraceExporter {
   }
 
   async flush(): Promise<void> {
-    if (isTelemetryDisabled()) {
-      this.buffer.length = 0;
-      this.clearTimer();
-      return;
-    }
-    if (this.buffer.length === 0) {
-      this.clearTimer();
-      return;
-    }
-    const batch = this.buffer.splice(0, this.buffer.length);
+    const batch = this.takeBatch();
+    if (!batch) return;
+
     const debug = isDebug();
     try {
-      const res = await this.fetchImpl(this.endpoint, {
-        method: 'POST',
-        headers: {
-          'content-type': 'application/json',
-          'x-pisama-project-id': this.projectId,
-          'x-pisama-client-id': getClientId(),
-          'x-pisama-sdk-version': SDK_VERSION,
-          'x-pisama-runtime': detectRuntime(),
-        },
-        body: JSON.stringify({ events: batch }),
-        keepalive: true,
-      });
+      const res = await this.send(batch);
       if (debug) {
         console.log(`[pisama] flushed ${batch.length} event(s) → HTTP ${res.status}`);
       }
-      // The ingest API returns 207 Multi-Status when only some events in the
-      // batch were persisted (e.g. some were malformed, or persist_failed
-      // mid-batch). Always surface this — silent partial drop is exactly the
-      // failure mode we're trying not to ship. In debug mode, log each
-      // failed event's reason.
-      if (res.status === 207 && !isSilent()) {
-        try {
-          const body = (await res
-            .clone()
-            .json()
-            .catch(() => null)) as {
-            accepted?: number;
-            submitted?: number;
-            failed?: Array<{ traceId: string; reason: string }>;
-          } | null;
-          const failed = body?.failed ?? [];
-          const accepted = body?.accepted ?? '?';
-          const submitted = body?.submitted ?? batch.length;
-          console.warn(
-            `[pisama] partial flush: ${accepted}/${submitted} accepted, ${failed.length} dropped`,
-          );
-          if (debug) {
-            for (const f of failed) {
-              console.warn(`[pisama]   - traceId=${f.traceId} reason=${f.reason}`);
-            }
-          }
-        } catch {
-          if (debug) {
-            console.warn(`[pisama] partial flush (HTTP 207) but response body could not be parsed`);
-          }
+      await this.reportPartialFlush(res, batch.length, debug);
+    } catch (err) {
+      this.reportFailure(err, debug);
+    }
+  }
+
+  private takeBatch(): TraceEvent[] | null {
+    if (isTelemetryDisabled()) {
+      this.buffer.length = 0;
+      this.clearTimer();
+      return null;
+    }
+    if (this.buffer.length === 0) {
+      this.clearTimer();
+      return null;
+    }
+    return this.buffer.splice(0, this.buffer.length);
+  }
+
+  private send(batch: TraceEvent[]): Promise<Response> {
+    return this.fetchImpl(this.endpoint, {
+      method: 'POST',
+      headers: {
+        'content-type': 'application/json',
+        'x-pisama-project-id': this.projectId,
+        'x-pisama-client-id': getClientId(),
+        'x-pisama-sdk-version': SDK_VERSION,
+        'x-pisama-runtime': detectRuntime(),
+      },
+      body: JSON.stringify({ events: batch }),
+      keepalive: true,
+    });
+  }
+
+  private async reportPartialFlush(
+    res: Response,
+    submittedCount: number,
+    debug: boolean,
+  ): Promise<void> {
+    // HTTP 207 means some events were dropped. This must never be silent.
+    if (res.status !== 207 || isSilent()) return;
+
+    try {
+      const body = (await res
+        .clone()
+        .json()
+        .catch(() => null)) as PartialFlushBody | null;
+      const failed = body?.failed ?? [];
+      const accepted = body?.accepted ?? '?';
+      const submitted = body?.submitted ?? submittedCount;
+      console.warn(
+        `[pisama] partial flush: ${accepted}/${submitted} accepted, ${failed.length} dropped`,
+      );
+      if (debug) {
+        for (const failure of failed) {
+          console.warn(`[pisama]   - traceId=${failure.traceId} reason=${failure.reason}`);
         }
       }
-    } catch (err) {
-      // Silent in production: telemetry must never break the host app. Debug
-      // mode surfaces the underlying error so misconfigured network egress
-      // (sandboxed runtimes, blocked outbound, etc.) shows up.
+    } catch {
       if (debug) {
-        console.warn(
-          `[pisama] flush failed (suppressed in production):`,
-          (err as Error)?.message ?? err,
-        );
+        console.warn(`[pisama] partial flush (HTTP 207) but response body could not be parsed`);
       }
+    }
+  }
+
+  private reportFailure(error: unknown, debug: boolean): void {
+    // Telemetry must never break the host app. Debug mode surfaces blocked
+    // network egress and other configuration failures.
+    if (debug) {
+      console.warn(
+        `[pisama] flush failed (suppressed in production):`,
+        (error as Error)?.message ?? error,
+      );
     }
   }
 

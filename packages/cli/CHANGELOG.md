@@ -2,6 +2,15 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## [Unreleased]
+
+### Changed
+
+- Expose `pisama` as the canonical global command while retaining the
+  `pisama-ts` compatibility alias.
+- Split ATIF loading, validation, API transport, and rendering into bounded
+  functions, with a repository-wide cyclomatic complexity ceiling of 15.
+
 ## [0.10.0] - 2026-07-23
 
 ### Added
