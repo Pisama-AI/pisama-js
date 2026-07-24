@@ -1,9 +1,11 @@
 name: Publish detectors to npm
 
+# detectors-v0.10.0-alpha.2 already points to a commit that predates artifact promotion.
+# Do not move or reuse it. The first release using this workflow must be alpha.3 or newer.
 on:
   push:
     tags:
-      - "detectors-v*"
+      - 'detectors-v*'
 
 permissions:
   contents: read
@@ -16,7 +18,7 @@ jobs:
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
@@ -41,6 +43,20 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/release"
           pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP/release"
+      - name: Verify publish artifact
+        run: |
+          install_dir=$(mktemp -d)
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/release/pisama-detectors-*.tgz
+          test -f "$install_dir/node_modules/@pisama/detectors/dist/index.d.ts"
+          (
+            cd "$install_dir"
+            node --input-type=module - <<'NODE'
+          const detectors = await import('@pisama/detectors');
+          if (typeof detectors.runDetectors !== 'function' || !Array.isArray(detectors.v1Detectors)) {
+            throw new Error('packed @pisama/detectors public API is incomplete');
+          }
+          NODE
+          )
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package
@@ -55,7 +71,7 @@ jobs:
     steps:
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0

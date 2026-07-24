@@ -3,7 +3,7 @@ name: Publish CLI to npm
 on:
   push:
     tags:
-      - "cli-v*"
+      - 'cli-v*'
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
@@ -64,12 +64,24 @@ jobs:
     steps:
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           name: package
           path: dist/
+      - name: Select npm dist-tag
+        id: dist
+        run: |
+          VERSION="${GITHUB_REF_NAME#cli-v}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish through npm trusted publishing
-        run: npm publish dist/pisama-cli-*.tgz --access public
+        run: >-
+          npm publish dist/pisama-cli-*.tgz
+          --access public
+          --tag "${{ steps.dist.outputs.tag }}"

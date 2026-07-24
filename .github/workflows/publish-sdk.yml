@@ -3,7 +3,7 @@ name: Publish SDK to npm
 on:
   push:
     tags:
-      - "v*"
+      - 'v*'
 
 permissions:
   contents: read
@@ -16,7 +16,7 @@ jobs:
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
@@ -41,6 +41,21 @@ jobs:
         run: |
           mkdir -p "$RUNNER_TEMP/release"
           pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP/release"
+      - name: Verify publish artifact
+        run: |
+          install_dir=$(mktemp -d)
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/release/pisama-sdk-*.tgz
+          test -f "$install_dir/node_modules/@pisama/sdk/dist/index.d.ts"
+          (
+            cd "$install_dir"
+            EXPECTED_VERSION=$(node -p "require('./node_modules/@pisama/sdk/package.json').version") \
+              node --input-type=module - <<'NODE'
+          const sdk = await import('@pisama/sdk');
+          if (typeof sdk.observe !== 'function' || sdk.SDK_VERSION !== process.env.EXPECTED_VERSION) {
+            throw new Error('packed @pisama/sdk public API or version is incomplete');
+          }
+          NODE
+          )
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: package
@@ -55,7 +70,7 @@ jobs:
     steps:
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
