@@ -12,7 +12,14 @@
     "typecheck": "pnpm -r typecheck",
     "lint": "eslint packages/sdk/src packages/detectors/src packages/cli/src",
     "format:check": "prettier --check \"packages/**/*.{ts,tsx}\"",
-    "test": "pnpm build && pnpm -r test"
+    "test": "pnpm build && pnpm -r test",
+    "test:coverage": "pnpm build && pnpm -r test:coverage",
+    "audit:production": "pnpm audit --prod --audit-level moderate"
+  },
+  "pnpm": {
+    "overrides": {
+      "@hono/node-server": "2.0.11"
+    }
   },
   "devDependencies": {
     "@eslint/js": "^10.0.1",

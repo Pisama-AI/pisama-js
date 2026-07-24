@@ -13,15 +13,27 @@ import { nanoid } from 'nanoid';
 
 let _cached: string | undefined;
 
+function builtin<T>(name: string): T | null {
+  try {
+    if (typeof process === 'undefined') return null;
+    const getBuiltinModule = (
+      process as NodeJS.Process & {
+        getBuiltinModule?: (id: string) => unknown;
+      }
+    ).getBuiltinModule;
+    return getBuiltinModule ? (getBuiltinModule(name) as T) : null;
+  } catch {
+    return null;
+  }
+}
+
 function clientFilePath(): string | null {
   try {
     if (typeof process === 'undefined') return null;
     const home = process.env.HOME || process.env.USERPROFILE;
     if (!home) return null;
-    // require is fine here — `node:path` and `node:os` are always present.
-    // Dynamic import would force the whole module async.
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require('node:path') as typeof import('node:path');
+    const path = builtin<typeof import('node:path')>('node:path');
+    if (!path) return null;
     return path.join(home, '.pisama', 'client.json');
   } catch {
     return null;
@@ -32,8 +44,8 @@ function readPersisted(): string | undefined {
   const file = clientFilePath();
   if (!file) return undefined;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs');
+    const fs = builtin<typeof import('node:fs')>('node:fs');
+    if (!fs) return undefined;
     if (!fs.existsSync(file)) return undefined;
     const raw = fs.readFileSync(file, 'utf8');
     const parsed = JSON.parse(raw) as { client_id?: unknown };
@@ -50,10 +62,9 @@ function writePersisted(id: string): void {
   const file = clientFilePath();
   if (!file) return;
   try {
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const fs = require('node:fs') as typeof import('node:fs');
-    // eslint-disable-next-line @typescript-eslint/no-require-imports
-    const path = require('node:path') as typeof import('node:path');
+    const fs = builtin<typeof import('node:fs')>('node:fs');
+    const path = builtin<typeof import('node:path')>('node:path');
+    if (!fs || !path) return;
     fs.mkdirSync(path.dirname(file), { recursive: true });
     fs.writeFileSync(
       file,
