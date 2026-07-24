@@ -1,0 +1,44 @@
+{
+  "name": "@pisama/detectors",
+  "version": "0.10.0-alpha.1",
+  "description": "TypeScript-native failure detectors for AI agent traces.",
+  "type": "module",
+  "main": "./dist/index.js",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js"
+    }
+  },
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "dev": "tsc -p tsconfig.json --watch",
+    "typecheck": "tsc --noEmit",
+    "test": "tsx --test src/*.test.ts"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  },
+  "license": "MIT",
+  "keywords": [
+    "ai",
+    "agent",
+    "failure-detection",
+    "observability"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Pisama-AI/pisama-js",
+    "directory": "packages/detectors"
+  },
+  "homepage": "https://pisama.ai",
+  "bugs": {
+    "url": "https://github.com/Pisama-AI/pisama-js/issues"
+  }
+}

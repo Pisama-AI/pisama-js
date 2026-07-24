@@ -1,0 +1,42 @@
+name: Publish detectors to npm
+
+on:
+  push:
+    tags:
+      - "detectors-v*"
+
+permissions:
+  contents: read
+  id-token: write
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: "24"
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm --filter "@pisama/detectors" build
+      - run: pnpm --filter "@pisama/detectors" typecheck
+      - run: pnpm --filter "@pisama/detectors" test
+      - name: Verify tag matches package version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#detectors-v}"
+          PACKAGE_VERSION=$(node -p "require('./packages/detectors/package.json').version")
+          test "$TAG_VERSION" = "$PACKAGE_VERSION"
+      - name: Select npm dist-tag
+        id: dist
+        run: |
+          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+            echo "tag=alpha" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Publish through npm trusted publishing
+        run: npm publish --access public --tag "${{ steps.dist.outputs.tag }}"
+        working-directory: packages/detectors
