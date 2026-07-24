@@ -28,3 +28,9 @@ jobs:
       - run: pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP"
       - run: pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP"
       - run: pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP"
+      - name: Verify CLI publish artifact
+        run: |
+          install_dir=$(mktemp -d)
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/pisama-cli-*.tgz
+          test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$(node -p "require('./packages/cli/package.json').version")"
+          npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"

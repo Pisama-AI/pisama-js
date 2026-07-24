@@ -36,7 +36,7 @@ program
     "Run an MCP server over stdio so any MCP-compatible AI assistant can read your project's failures.",
   )
   .option('-p, --project-id <id>', 'Pisama project id (defaults to PISAMA_PROJECT_ID env var)')
-  .option('--base-url <url>', 'Override the Pisama base URL (default https://pisama.ai)')
+  .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
   .action(async (opts: { projectId?: string; baseUrl?: string }) => {
     const projectId = opts.projectId ?? process.env.PISAMA_PROJECT_ID;
     if (!projectId) {
@@ -56,7 +56,7 @@ program
     '-p, --project-id <id>',
     'Override project id (defaults to PISAMA_PROJECT_ID or .env.local)',
   )
-  .option('--base-url <url>', 'Override the Pisama base URL (default https://pisama.ai)')
+  .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
   .option('--timeout-ms <ms>', 'How long to wait for the trace to surface (default 15000)', (v) =>
     Number(v),
   )

@@ -19,11 +19,13 @@ export interface VerifyOptions {
 }
 
 const DEFAULT_BASE = 'https://api.pisama.ai';
+const DEFAULT_DASHBOARD_BASE = 'https://pisama.ai';
 const DEFAULT_TIMEOUT_MS = 15_000;
 
 export async function verify(opts: VerifyOptions): Promise<void> {
   const root = resolve(opts.cwd);
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
+  const dashboardBaseUrl = opts.baseUrl ? baseUrl : DEFAULT_DASHBOARD_BASE;
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
 
   step('Looking up project id...');
@@ -99,7 +101,7 @@ export async function verify(opts: VerifyOptions): Promise<void> {
   }
   const elapsed = ((Date.now() - start) / 1000).toFixed(1);
   ok(`Trace arrived in ${elapsed}s. ${kleur.green('Install is working.')}`);
-  console.log(`\n  Dashboard: ${kleur.cyan(`${baseUrl}/live/${projectId}`)}\n`);
+  console.log(`\n  Dashboard: ${kleur.cyan(`${dashboardBaseUrl}/live/${projectId}`)}\n`);
 }
 
 async function pollForTrace(

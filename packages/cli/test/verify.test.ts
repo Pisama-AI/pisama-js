@@ -110,7 +110,7 @@ test('verify reads project id from .env.local when env var is unset', async () =
 
   const s = spy();
   try {
-    await verify({ cwd: root, baseUrl: 'https://test', timeoutMs: 5000 });
+    await verify({ cwd: root, timeoutMs: 5000 });
     assert.equal(s.exitCode, null, 'should not exit on success');
     assert.ok(
       s.logs.some((l) => /from \.env\.local/.test(l)),
@@ -123,6 +123,10 @@ test('verify reads project id from .env.local when env var is unset', async () =
     assert.ok(
       s.logs.some((l) => /Install is working/.test(l)),
       'expected success message',
+    );
+    assert.ok(
+      s.logs.some((l) => /Dashboard: https:\/\/pisama\.ai\/live\/ws_fromfile12/.test(l)),
+      'expected the public web dashboard rather than the API host',
     );
   } finally {
     s.restore();
