@@ -21,9 +21,18 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter "@pisama/sdk..." build
-      - run: pnpm --filter "@pisama/sdk" typecheck
-      - run: pnpm --filter "@pisama/sdk" test
+      - name: Lint
+        run: pnpm lint
+      - name: Check formatting
+        run: pnpm format:check
+      - name: Type-check
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Test with coverage gates
+        run: pnpm test:coverage
+      - name: Audit production dependencies
+        run: pnpm audit:production
       - name: Verify tag matches package version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#v}"
@@ -37,7 +46,7 @@ jobs:
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
-      - name: Pack workspace dependencies
+      - name: Pack and inspect publish artifact
         run: pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP"
       - name: Publish through npm trusted publishing
         run: npm publish "$RUNNER_TEMP"/pisama-sdk-*.tgz --access public --tag "${{ steps.dist.outputs.tag }}"

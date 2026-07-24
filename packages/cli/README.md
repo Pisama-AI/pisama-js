@@ -8,6 +8,13 @@ Four subcommands.
 npx @pisama/cli init
 ```
 
+For a persistent command, install the package globally and run `pisama`:
+
+```bash
+npm install --global @pisama/cli
+pisama init
+```
+
 Run inside your Next.js + Vercel AI SDK project. The CLI:
 
 1. Detects `ai` + `next` in `package.json`.

@@ -1,6 +1,6 @@
 {
   "name": "@pisama/sdk",
-  "version": "0.9.0-alpha.1",
+  "version": "0.9.0-alpha.2",
   "description": "Catch silent failures in your AI agents. TypeScript SDK for Pisama, the failure detector for vibe-coded agents (Cursor, Claude Code, LangGraph, Vercel AI SDK).",
   "type": "module",
   "main": "./dist/index.js",
@@ -13,8 +13,10 @@
     }
   },
   "files": [
-    "dist"
+    "dist",
+    "CHANGELOG.md"
   ],
+  "sideEffects": false,
   "scripts": {
     "build": "tsc -p tsconfig.json",
     "dev": "tsc -p tsconfig.json --watch",
