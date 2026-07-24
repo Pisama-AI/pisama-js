@@ -10,7 +10,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm -r typecheck",
-    "lint": "eslint packages/{sdk,detectors,cli}/src",
+    "lint": "eslint packages/sdk/src packages/detectors/src packages/cli/src",
     "format:check": "prettier --check \"packages/**/*.{ts,tsx}\"",
     "test": "pnpm build && pnpm -r test"
   },
