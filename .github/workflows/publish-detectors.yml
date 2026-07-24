@@ -21,9 +21,18 @@ jobs:
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
-      - run: pnpm --filter "@pisama/detectors" build
-      - run: pnpm --filter "@pisama/detectors" typecheck
-      - run: pnpm --filter "@pisama/detectors" test
+      - name: Lint
+        run: pnpm lint
+      - name: Check formatting
+        run: pnpm format:check
+      - name: Type-check
+        run: pnpm typecheck
+      - name: Build
+        run: pnpm build
+      - name: Test with coverage gates
+        run: pnpm test:coverage
+      - name: Audit production dependencies
+        run: pnpm audit:production
       - name: Verify tag matches package version
         run: |
           TAG_VERSION="${GITHUB_REF_NAME#detectors-v}"
@@ -32,11 +41,16 @@ jobs:
       - name: Select npm dist-tag
         id: dist
         run: |
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          TAG_VERSION="${GITHUB_REF_NAME#detectors-v}"
+          if [[ "$TAG_VERSION" == *-* ]]; then
             echo "tag=alpha" >> "$GITHUB_OUTPUT"
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
+      - name: Pack and inspect publish artifact
+        run: pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP"
       - name: Publish through npm trusted publishing
-        run: npm publish --access public --tag "${{ steps.dist.outputs.tag }}"
-        working-directory: packages/detectors
+        run: >-
+          npm publish "$RUNNER_TEMP"/pisama-detectors-*.tgz
+          --access public
+          --tag "${{ steps.dist.outputs.tag }}"

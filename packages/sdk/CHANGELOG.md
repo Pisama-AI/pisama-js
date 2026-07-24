@@ -4,6 +4,8 @@ All notable changes to `@pisama/sdk` are documented here.
 
 ## [Unreleased]
 
+## [0.9.0-alpha.2] - 2026-07-23
+
 - Bound exporter and middleware complexity to the repository ceiling of 15.
 - Preserve partial-flush diagnostics while isolating batching, transport, and
   failure reporting.
