@@ -89,6 +89,6 @@ jobs:
           fi
       - name: Publish through npm trusted publishing
         run: >-
-          npm publish dist/pisama-detectors-*.tgz
+          npm publish ./dist/pisama-detectors-*.tgz
           --access public
           --tag "${{ steps.dist.outputs.tag }}"

@@ -40,11 +40,14 @@ jobs:
       - name: Pack publish artifact
         run: |
           mkdir -p "$RUNNER_TEMP/release"
+          pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP/release"
           pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP/release"
       - name: Verify publish artifact
         run: |
           install_dir=$(mktemp -d)
-          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/release/pisama-sdk-*.tgz
+          npm install --ignore-scripts --prefix "$install_dir" \
+            "$RUNNER_TEMP"/release/pisama-detectors-*.tgz \
+            "$RUNNER_TEMP"/release/pisama-sdk-*.tgz
           test -f "$install_dir/node_modules/@pisama/sdk/dist/index.d.ts"
           (
             cd "$install_dir"
@@ -86,4 +89,4 @@ jobs:
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
       - name: Publish through npm trusted publishing
-        run: npm publish dist/pisama-sdk-*.tgz --access public --tag "${{ steps.dist.outputs.tag }}"
+        run: npm publish ./dist/pisama-sdk-*.tgz --access public --tag "${{ steps.dist.outputs.tag }}"
