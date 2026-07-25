@@ -3,21 +3,20 @@ name: Publish CLI to npm
 on:
   push:
     tags:
-      - "cli-v*"
+      - 'cli-v*'
 
 permissions:
   contents: read
-  id-token: write
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
-          node-version: "24"
+          node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
       - run: pnpm install --frozen-lockfile
@@ -40,14 +39,49 @@ jobs:
           TAG_VERSION="${GITHUB_REF_NAME#cli-v}"
           PACKAGE_VERSION=$(node -p "require('./packages/cli/package.json').version")
           test "$TAG_VERSION" = "$PACKAGE_VERSION"
-      - name: Pack and inspect publish artifact
-        run: pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP"
+      - name: Pack publish artifact
+        run: |
+          mkdir -p "$RUNNER_TEMP/release"
+          pnpm --dir packages/cli pack --pack-destination "$RUNNER_TEMP/release"
       - name: Verify publish artifact
         run: |
           install_dir=$(mktemp -d)
-          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/pisama-cli-*.tgz
+          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/release/pisama-cli-*.tgz
           test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$(node -p "require('./packages/cli/package.json').version")"
           test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
           npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: package
+          path: ${{ runner.temp }}/release/*.tgz
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: '24'
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: package
+          path: dist/
+      - name: Select npm dist-tag
+        id: dist
+        run: |
+          VERSION="${GITHUB_REF_NAME#cli-v}"
+          if [[ "$VERSION" == *-* ]]; then
+            echo "tag=next" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          fi
       - name: Publish through npm trusted publishing
-        run: npm publish "$RUNNER_TEMP"/pisama-cli-*.tgz --access public
+        run: >-
+          npm publish dist/pisama-cli-*.tgz
+          --access public
+          --tag "${{ steps.dist.outputs.tag }}"
