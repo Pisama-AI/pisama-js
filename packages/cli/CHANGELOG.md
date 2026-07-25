@@ -4,6 +4,13 @@ All notable changes to `@pisama/cli` are documented here.
 
 ## [Unreleased]
 
+## [0.10.2] - 2026-07-25
+
+### Fixed
+
+- Promote the verified tarball through an explicit filesystem path in the npm
+  publishing job.
+
 ## [0.10.1] - 2026-07-23
 
 ### Changed

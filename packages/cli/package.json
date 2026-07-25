@@ -1,6 +1,6 @@
 {
   "name": "@pisama/cli",
-  "version": "0.10.1",
+  "version": "0.10.2",
   "description": "CLI for Pisama. `init` patches your project, `verify` round-trips a synthetic trace, `mcp` runs the MCP server, `analyze-atif` runs Pisama detectors on Harbor trajectories.",
   "type": "module",
   "bin": {
