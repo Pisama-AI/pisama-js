@@ -24,6 +24,8 @@ All notable changes to `@pisama/cli` are documented here.
 - Audit the dependency set incorporated into the bundle and continuously test
   the documented Node.js 20 minimum.
 - Audit the packed CLI artifact as a clean consumer install before publishing.
+- Upgrade `ts-morph` to remove the vulnerable transitive `brace-expansion`
+  release from the production dependency graph.
 
 ## [0.10.0] - 2026-07-23
 
