@@ -4,7 +4,7 @@
  * Pure typed POST client — NO detection logic in TS. Every call round-trips
  * to the Pisama backend, which owns the calibrated detectors.
  *
- * Backend endpoint reality (as of 0.10.0-alpha.2): the backend does NOT yet
+ * Backend endpoint reality at this prerelease stage: the backend does NOT yet
  * expose discrete `POST /api/v1/detect/{type}` routes for these multi-agent
  * detectors. The orchestrator is reachable via `POST /api/v1/diagnose/why-failed`
  * which takes a full trace and returns ALL detections; we wrap that and filter
