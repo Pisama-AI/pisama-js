@@ -1,6 +1,6 @@
 {
   "name": "@pisama/detectors",
-  "version": "0.10.0-alpha.3",
+  "version": "0.10.0-alpha.4",
   "description": "TypeScript-native failure detectors for AI agent traces.",
   "type": "module",
   "main": "./dist/index.js",

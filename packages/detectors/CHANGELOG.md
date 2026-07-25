@@ -4,6 +4,11 @@ All notable changes to `@pisama/detectors` are documented here.
 
 ## [Unreleased]
 
+## [0.10.0-alpha.4] - 2026-07-25
+
+- Promote the verified tarball through an explicit filesystem path in the npm
+  publishing job.
+
 ## [0.10.0-alpha.3] - 2026-07-25
 
 - Publish through an isolated, tag-verified npm trusted-publishing workflow
