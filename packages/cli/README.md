@@ -6,30 +6,34 @@ trajectories, and expose failure data to MCP clients.
 Requires Node.js 20 or newer. You can run every command through `npx` without
 a global install.
 
-| Command               | Purpose                                  | Network behavior                                           |
-| --------------------- | ---------------------------------------- | ---------------------------------------------------------- |
-| `pisama init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
-| `pisama verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
-| `pisama analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API             |
-| `pisama mcp`          | Expose Pisama failures to an MCP client  | Reads project trace data from the configured API           |
+| Command                  | Purpose                                  | Network behavior                                           |
+| ------------------------ | ---------------------------------------- | ---------------------------------------------------------- |
+| `pisama-ts init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
+| `pisama-ts verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
+| `pisama-ts analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API             |
+| `pisama-ts mcp`          | Expose Pisama failures to an MCP client  | Reads project trace data from the configured API           |
+
+The `pisama` and `pisama-ts` commands are equivalent starting in version
+0.10.3. The registry-backed examples use `pisama-ts` so they also work with
+earlier public releases.
 
 Check the installed version at any time:
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama --version
+npx --yes --package=@pisama/cli@latest -- pisama-ts --version
 ```
 
-### `pisama init`
+### `pisama-ts init`
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama init
+npx --yes --package=@pisama/cli@latest -- pisama-ts init
 ```
 
-For a persistent command, install the package globally and run `pisama`:
+For a persistent command, install the package globally and run `pisama-ts`:
 
 ```bash
 npm install --global @pisama/cli
-pisama init
+pisama-ts init
 ```
 
 Run this inside your Next.js and Vercel AI SDK project. The CLI:
@@ -48,10 +52,10 @@ Flags:
 - `--no-open`: skip browser open
 - `--dry-run`: print planned changes, don't write
 
-### `pisama verify`
+### `pisama-ts verify`
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama verify
+npx --yes --package=@pisama/cli@latest -- pisama-ts verify
 ```
 
 Posts a generated verification trace to Pisama's ingest API and waits for it
@@ -75,13 +79,13 @@ Flags:
 
 Exit code is 0 on success, 1 on any failure (no project id, ingest 5xx, network error, or trace didn't land within the timeout).
 
-### `pisama analyze-atif`
+### `pisama-ts analyze-atif`
 
 Analyze one ATIF trajectory, a flat directory of trajectories, or a Harbor job
 output directory:
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama analyze-atif ./harbor-output
+npx --yes --package=@pisama/cli@latest -- pisama-ts analyze-atif ./harbor-output
 ```
 
 The command accepts ATIF v1.0 through v1.7, checks the declared schema version,
@@ -96,7 +100,7 @@ To apply the primary recommended fix, pass a single trajectory and explicitly
 provide the target framework, entity, and credentials:
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama analyze-atif ./trajectory.json \
+npx --yes --package=@pisama/cli@latest -- pisama-ts analyze-atif ./trajectory.json \
   --apply \
   --framework n8n \
   --entity-id workflow-id \
@@ -110,7 +114,7 @@ least-privilege credentials before applying a change.
 Trajectory content is sent to the configured Pisama API for analysis. Review
 your data handling requirements before analyzing sensitive production traces.
 
-### `pisama mcp`
+### `pisama-ts mcp`
 
 Runs an MCP server over stdio so any MCP-compatible AI assistant can read your
 project's failures inline. The server exposes three read-only tools:
@@ -135,7 +139,7 @@ Add this to your MCP client's server config (path varies by client: consult your
   "mcpServers": {
     "pisama": {
       "command": "npx",
-      "args": ["--yes", "--package=@pisama/cli@latest", "--", "pisama", "mcp"],
+      "args": ["--yes", "--package=@pisama/cli@latest", "--", "pisama-ts", "mcp"],
       "env": { "PISAMA_PROJECT_ID": "ws_yourprojectid" }
     }
   }

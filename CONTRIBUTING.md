@@ -45,5 +45,5 @@ dist-tag match:
 
 ```bash
 npm view @pisama/cli@latest version dist.integrity dist.attestations
-npx --yes --package=@pisama/cli@latest -- pisama --version
+npx --yes --package=@pisama/cli@latest -- pisama-ts --version
 ```
