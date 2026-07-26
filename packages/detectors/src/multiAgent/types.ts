@@ -1,9 +1,6 @@
 /**
  * Typed input/output shapes for MultiAgentDetectors.
  *
- * Inputs mirror the backend's golden_dataset keys (see CLAUDE.md Golden
- * Dataset Key Reference) so requests round-trip without rename gymnastics.
- *
  * Outputs are a thin TS projection of the backend's `DiagnoseDetectionResult`
  * schema (see app/api/v1/schemas.py — DiagnoseDetectionResult). Each detector
  * surfaces the matching detection from the full diagnose response.
@@ -49,24 +46,6 @@ export interface CoordinationResult extends MultiAgentDetection {
   category: 'coordination';
 }
 
-// ---- Delegation ----
-
-export interface DelegationInput {
-  /** The handoff message from the delegating agent to the subagent. */
-  handoff_instruction: string;
-  /** 0.0–1.0 — how complete is the context bundle accompanying the handoff. */
-  context_completeness: number;
-  /** Explicit limits / boundaries given to the subagent. */
-  bounds: string[];
-  /** What "done" looks like for the delegated task. */
-  success_criteria: string[];
-  correlation_id?: string;
-}
-
-export interface DelegationResult extends MultiAgentDetection {
-  category: 'delegation';
-}
-
 // ---- Persona ----
 
 export interface PersonaAgent {
@@ -84,26 +63,4 @@ export interface PersonaInput {
 
 export interface PersonaResult extends MultiAgentDetection {
   category: 'persona_drift';
-}
-
-// ---- Consensus collapse ----
-
-export interface ConsensusCollapseInput {
-  /** Final outputs from each agent in the debate. */
-  agent_outputs: Array<{ agent_id: string; output: string }>;
-  /** Patterns observed across the debate (e.g. ["dropped_dissent", "anchor_bias"]). */
-  challenge_patterns: string[];
-  /** 0.0–1.0 final agreement ratio across agents. */
-  agreement_ratio: number;
-  /** Full ordered debate trace for the backend to re-analyze. */
-  debate_trace: Array<{
-    agent_id: string;
-    round: number;
-    content: string;
-  }>;
-  correlation_id?: string;
-}
-
-export interface ConsensusCollapseResult extends MultiAgentDetection {
-  category: 'consensus_collapse';
 }

@@ -44,9 +44,14 @@ export const myDetector: Detector = {
 
 The `MultiAgentDetectors` namespace exposes typed TS clients for Pisama's
 multi-agent failure detectors. **No detection runs in TS**: every call
-round-trips to the Pisama backend, which owns the calibrated detector suite
-(53 detectors as of Sprint 11; multi-agent F1: coordination 0.914, persona
-0.828, consensus_collapse 0.967).
+round-trips to the Pisama backend, which owns the calibrated detector suite.
+The client exposes only operations that the current endpoint can return
+reliably.
+
+| Operation | Backend category | Status |
+|---|---|---|
+| `coordination` | `coordination` | Available |
+| `persona` | `persona_drift` | Available |
 
 ```ts
 import { createMultiAgentDetectors } from "@pisama/detectors";
@@ -67,14 +72,6 @@ const coord = await detectors.coordination({
 });
 if (coord.detected) console.warn(coord.title, coord.suggestedFix);
 
-// Delegation: handoff quality
-await detectors.delegation({
-  handoff_instruction: "Pls handle the user thing",
-  context_completeness: 0.3,
-  bounds: ["no destructive writes"],
-  success_criteria: [],
-});
-
 // Persona drift
 await detectors.persona({
   agent: {
@@ -84,41 +81,21 @@ await detectors.persona({
   },
   output: "ugh fine, here's your refund or whatever.",
 });
-
-// Consensus collapse in a multi-agent debate
-await detectors.consensus_collapse({
-  agent_outputs: [
-    { agent_id: "a", output: "X is true" },
-    { agent_id: "b", output: "X is true" },
-  ],
-  challenge_patterns: ["dropped_dissent"],
-  agreement_ratio: 1.0,
-  debate_trace: [
-    { agent_id: "a", round: 1, content: "I think X" },
-    { agent_id: "b", round: 1, content: "agreed, X" },
-  ],
-});
 ```
 
-#### Backend coverage gap (honest disclosure)
+#### Capability boundary
 
 The backend does NOT yet expose discrete `POST /api/v1/detect/{type}` routes
-for these four detectors. Today's clients POST to `/api/v1/diagnose/why-failed`
+for these detectors. Today's clients POST to `/api/v1/diagnose/why-failed`
 (the orchestrator entry point) and filter the returned `all_detections` by
-category. Consequences:
+category. The endpoint returns `coordination` and `persona_drift`, so those
+are the only public client operations.
 
-- `coordination` and `persona` map cleanly: the orchestrator returns
-  `coordination` and `persona_drift` categories in `all_detections`.
-- `delegation` and `consensus_collapse` are evaluated by the calibration
-  runner but are NOT yet emitted as discrete categories from
-  `/diagnose/why-failed`. The TS calls round-trip and validate end-to-end,
-  but will return `detected: false` until the backend route lands. The B2
-  multi-trace batch endpoint (`/api/v1/diagnose/batch`) is the natural home
-  for `consensus_collapse`; this client will switch paths once shipped.
-
-Follow-up tracked: add per-detector REST routes that accept the
-golden_dataset input shapes directly, so the wrap-and-filter layer can be
-removed.
+`delegation` and `consensus_collapse` are intentionally not exposed. The
+current endpoint cannot return their categories, and representing an
+unsupported operation as `detected: false` would be indistinguishable from a
+clean detector result. These operations can be added when dedicated backend
+routes exist.
 
 ### License
 

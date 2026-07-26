@@ -4,6 +4,10 @@ All notable changes to `@pisama/detectors` are documented here.
 
 ## [Unreleased]
 
+- Remove the unsupported `delegation` and `consensus_collapse` client
+  operations so an unavailable backend capability cannot look like a clean
+  detector result.
+
 ## [0.10.0-alpha.4] - 2026-07-25
 
 - Promote the verified tarball through an explicit filesystem path in the npm
