@@ -4,6 +4,8 @@ All notable changes to `@pisama/cli` are documented here.
 
 ## [Unreleased]
 
+## [0.10.3] - 2026-07-26
+
 ### Added
 
 - Verify the exact CLI tarball, both command aliases, public package metadata,
@@ -23,6 +25,13 @@ All notable changes to `@pisama/cli` are documented here.
 
 - Only release tags whose commit belongs to `main` may publish the CLI.
 - Declare npm public access and registry policy in package metadata.
+
+### Fixed
+
+- Use an explicit package and binary in every `npx` example so the command
+  remains unambiguous while `pisama` and `pisama-ts` are both published.
+- Reserve a fresh package version after the `cli-v0.10.2` publishing attempt
+  failed, because npm release tags and package versions are immutable.
 
 ## [0.10.2] - 2026-07-25
 

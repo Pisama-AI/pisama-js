@@ -13,6 +13,8 @@ if [[ ! -f "$artifact" ]]; then
   echo "CLI tarball not found: $artifact" >&2
   exit 2
 fi
+artifact_dir=$(cd -- "$(dirname -- "$artifact")" && pwd -P)
+artifact="$artifact_dir/$(basename -- "$artifact")"
 
 tarball_bytes=$(wc -c < "$artifact" | tr -d ' ')
 if (( tarball_bytes > max_tarball_bytes )); then
@@ -46,7 +48,9 @@ then
 fi
 
 install_dir=$(mktemp -d)
-trap 'rm -rf -- "$install_dir"' EXIT
+consumer_dir=$(mktemp -d)
+consumer_cache=$(mktemp -d)
+trap 'rm -rf -- "$install_dir" "$consumer_dir" "$consumer_cache"' EXIT
 
 npm install --ignore-scripts --prefix "$install_dir" "$artifact"
 
@@ -95,6 +99,18 @@ for command in pisama pisama-ts; do
   test "$("$install_dir/node_modules/.bin/$command" --version)" = "$expected_version"
   "$install_dir/node_modules/.bin/$command" --help >/dev/null
 done
+
+documented_version=$(
+  cd "$consumer_dir"
+  npm_config_cache="$consumer_cache" \
+    npx --yes --package="$artifact" -- pisama --version
+)
+test "$documented_version" = "$expected_version"
+(
+  cd "$consumer_dir"
+  npm_config_cache="$consumer_cache" \
+    npx --yes --package="$artifact" -- pisama --help >/dev/null
+)
 
 test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
 

@@ -6,23 +6,23 @@ trajectories, and expose failure data to MCP clients.
 Requires Node.js 20 or newer. You can run every command through `npx` without
 a global install.
 
-| Command | Purpose | Network behavior |
-|---|---|---|
-| `pisama init` | Patch a Next.js and AI SDK project | Opens the project dashboard unless `--no-open` is set |
-| `pisama verify` | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
-| `pisama analyze-atif` | Analyze Harbor ATIF trajectories | Sends trajectory content to the configured API |
-| `pisama mcp` | Expose Pisama failures to an MCP client | Reads project trace data from the configured API |
+| Command               | Purpose                                  | Network behavior                                           |
+| --------------------- | ---------------------------------------- | ---------------------------------------------------------- |
+| `pisama init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
+| `pisama verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
+| `pisama analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API             |
+| `pisama mcp`          | Expose Pisama failures to an MCP client  | Reads project trace data from the configured API           |
 
 Check the installed version at any time:
 
 ```bash
-npx -y @pisama/cli@latest --version
+npx --yes --package=@pisama/cli@latest -- pisama --version
 ```
 
 ### `pisama init`
 
 ```bash
-npx @pisama/cli init
+npx --yes --package=@pisama/cli@latest -- pisama init
 ```
 
 For a persistent command, install the package globally and run `pisama`:
@@ -51,7 +51,7 @@ Flags:
 ### `pisama verify`
 
 ```bash
-npx @pisama/cli verify
+npx --yes --package=@pisama/cli@latest -- pisama verify
 ```
 
 Posts a generated verification trace to Pisama's ingest API and waits for it
@@ -81,7 +81,7 @@ Analyze one ATIF trajectory, a flat directory of trajectories, or a Harbor job
 output directory:
 
 ```bash
-npx @pisama/cli analyze-atif ./harbor-output
+npx --yes --package=@pisama/cli@latest -- pisama analyze-atif ./harbor-output
 ```
 
 The command accepts ATIF v1.0 through v1.7, checks the declared schema version,
@@ -96,7 +96,7 @@ To apply the primary recommended fix, pass a single trajectory and explicitly
 provide the target framework, entity, and credentials:
 
 ```bash
-npx @pisama/cli analyze-atif ./trajectory.json \
+npx --yes --package=@pisama/cli@latest -- pisama analyze-atif ./trajectory.json \
   --apply \
   --framework n8n \
   --entity-id workflow-id \
@@ -135,7 +135,7 @@ Add this to your MCP client's server config (path varies by client: consult your
   "mcpServers": {
     "pisama": {
       "command": "npx",
-      "args": ["-y", "@pisama/cli", "mcp"],
+      "args": ["--yes", "--package=@pisama/cli@latest", "--", "pisama", "mcp"],
       "env": { "PISAMA_PROJECT_ID": "ws_yourprojectid" }
     }
   }
