@@ -40,8 +40,8 @@ test('SDK guides use supported project and CLI commands', async () => {
     new URL('./integration/nextjs/README.md', import.meta.url),
     new URL('./integration/tanstack-start/README.md', import.meta.url),
   ];
-  const approvedInit = 'npx --yes --package=@pisama/cli@latest -- pisama init';
-  const approvedVerify = 'npx --yes --package=@pisama/cli@latest -- pisama verify';
+  const approvedInit = 'npx --yes --package=@pisama/cli@latest -- pisama-ts init';
+  const approvedVerify = 'npx --yes --package=@pisama/cli@latest -- pisama-ts verify';
 
   const rootGuide = await readFile(packageReadme, 'utf8');
   assert.match(rootGuide, new RegExp(approvedInit.replaceAll('/', '\\/')));

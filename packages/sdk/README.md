@@ -46,7 +46,7 @@ PISAMA_PROJECT_ID=ps_your_project_id
 Get a project ID with:
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama init
+npx --yes --package=@pisama/cli@latest -- pisama-ts init
 ```
 
 You can also create one at [pisama.ai](https://pisama.ai).

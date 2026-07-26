@@ -36,7 +36,7 @@ another terminal:
 
 ```bash
 PISAMA_PROJECT_ID=ps_your_project_id \
-  npx --yes --package=@pisama/cli@latest -- pisama verify
+  npx --yes --package=@pisama/cli@latest -- pisama-ts verify
 ```
 
 The reference app validates the framework wiring. Hosted ingest and dashboard

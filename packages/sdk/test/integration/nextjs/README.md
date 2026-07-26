@@ -25,5 +25,5 @@ pnpm dev
 In another terminal, verify delivery:
 
 ```bash
-npx --yes --package=@pisama/cli@latest -- pisama verify
+npx --yes --package=@pisama/cli@latest -- pisama-ts verify
 ```

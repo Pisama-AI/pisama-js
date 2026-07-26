@@ -25,7 +25,7 @@ In another terminal, verify delivery:
 
 ```bash
 PISAMA_PROJECT_ID=ps_your_project_id \
-  npx --yes --package=@pisama/cli@latest -- pisama verify
+  npx --yes --package=@pisama/cli@latest -- pisama-ts verify
 ```
 
 Express needs an explicit response pipe because it does not natively return
