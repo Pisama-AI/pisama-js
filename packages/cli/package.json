@@ -1,7 +1,17 @@
 {
   "name": "@pisama/cli",
   "version": "0.10.2",
-  "description": "CLI for Pisama. `init` patches your project, `verify` round-trips a synthetic trace, `mcp` runs the MCP server, `analyze-atif` runs Pisama detectors on Harbor trajectories.",
+  "description": "CLI for Pisama. `init` patches your project, `verify` round-trips a verification trace, `mcp` runs the MCP server, `analyze-atif` runs Pisama detectors on Harbor trajectories.",
+  "keywords": [
+    "ai",
+    "agents",
+    "observability",
+    "failure-detection",
+    "mcp",
+    "harbor",
+    "atif",
+    "vercel-ai-sdk"
+  ],
   "type": "module",
   "bin": {
     "pisama": "./dist/bin.js",
@@ -17,6 +27,7 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json && esbuild src/mcp.ts --bundle --platform=node --format=esm --target=node20 --outfile=dist/mcp.js --legal-comments=inline",
+    "prepack": "pnpm run build",
     "dev": "tsc -p tsconfig.json --watch",
     "typecheck": "tsc --noEmit",
     "test": "tsx --test test/*.test.ts",
@@ -45,5 +56,9 @@
   "homepage": "https://pisama.ai",
   "bugs": {
     "url": "https://github.com/Pisama-AI/pisama-js/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   }
 }

@@ -12,6 +12,12 @@ pnpm --dir packages/detectors pack --pack-destination "$release_dir"
 pnpm --dir packages/sdk pack --pack-destination "$release_dir"
 pnpm --dir packages/cli pack --pack-destination "$release_dir"
 
+expected_cli_version=$(node -p "require('./packages/cli/package.json').version")
+AUDIT_CLI_ARTIFACT="${AUDIT_PACKED_CONSUMER:-0}" \
+  ./scripts/verify-cli-artifact.sh \
+  "$release_dir"/pisama-cli-*.tgz \
+  "$expected_cli_version"
+
 install_dir=$(mktemp -d)
 trap 'rm -rf -- "$install_dir"' EXIT
 
@@ -23,8 +29,6 @@ npm install --ignore-scripts --prefix "$install_dir" \
 test -f "$install_dir/node_modules/@pisama/detectors/dist/index.d.ts"
 test -f "$install_dir/node_modules/@pisama/sdk/dist/index.d.ts"
 test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
-
-expected_cli_version=$(node -p "require('./packages/cli/package.json').version")
 test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$expected_cli_version"
 
 (

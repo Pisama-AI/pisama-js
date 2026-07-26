@@ -53,7 +53,7 @@ program
 program
   .command('verify')
   .description(
-    'POST a synthetic trace and confirm it round-trips through the dashboard. Use after install to prove integration works.',
+    'POST a generated verification trace and confirm it round-trips through the dashboard. Use after install to prove integration works.',
   )
   .option('--cwd <path>', 'Project root for reading .env.local', process.cwd())
   .option(
@@ -81,10 +81,7 @@ program
     "Analyze a Harbor ATIF trajectory (or directory of trajectories) with Pisama's detectors. Exits non-zero on any high-severity finding so it works in CI.",
   )
   .argument('<path>', 'Path to an ATIF .json file or a directory of them')
-  .option(
-    '-p, --project-id <id>',
-    'Optional Pisama project id to correlate with (reserved, not used in v0)',
-  )
+  .option('-p, --project-id <id>', 'Optional Pisama project id for correlation')
   .option('--base-url <url>', 'Override the Pisama base URL (default https://api.pisama.ai)')
   .option(
     '--apply',

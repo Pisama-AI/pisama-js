@@ -4,6 +4,26 @@ All notable changes to `@pisama/cli` are documented here.
 
 ## [Unreleased]
 
+### Added
+
+- Verify the exact CLI tarball, both command aliases, public package metadata,
+  archive contents, dependency health, and a 200 kB compressed-size budget.
+- Rebuild the CLI automatically before every local or automated pack
+  operation.
+- Hold automated dependency updates for seven days before review.
+- Record SHA-256 checksums and GitHub build provenance for release tarballs.
+- Reinstall every successful release from npm and verify its npm provenance,
+  registry signatures, dist-tag, command version, and production audit.
+- Document MCP prompts, command network behavior, privacy boundaries, release
+  provenance, and useful support diagnostics.
+- Correct `analyze-atif --project-id` help to describe its active correlation
+  behavior.
+
+### Changed
+
+- Only release tags whose commit belongs to `main` may publish the CLI.
+- Declare npm public access and registry policy in package metadata.
+
 ## [0.10.2] - 2026-07-25
 
 ### Fixed
