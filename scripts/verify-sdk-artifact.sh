@@ -68,10 +68,11 @@ npm install \
   "$detectors_archive" \
   "$sdk_archive"
 
-REPO_ROOT="$repo_root" CONSUMER_DIR="$consumer_dir" node --input-type=module <<'NODE'
+(
+  cd "$consumer_dir"
+  REPO_ROOT="$repo_root" CONSUMER_DIR="$consumer_dir" node --input-type=module <<'NODE'
 import assert from "node:assert/strict";
 import { readFile } from "node:fs/promises";
-import { pathToFileURL } from "node:url";
 
 const repoRoot = process.env.REPO_ROOT;
 const consumerDir = process.env.CONSUMER_DIR;
@@ -124,9 +125,7 @@ assert.equal(
 assert.ok(!JSON.stringify(installed).includes("workspace:"));
 assert.match(changelog, new RegExp(`^## \\[${source.version.replaceAll(".", "\\.")}\\]`, "m"));
 
-const sdk = await import(
-  pathToFileURL(`${consumerDir}/node_modules/@pisama/sdk/dist/index.js`)
-);
+const sdk = await import("@pisama/sdk");
 assert.deepEqual(Object.keys(sdk).sort(), [
   "SDK_VERSION",
   "observe",
@@ -136,6 +135,7 @@ assert.deepEqual(Object.keys(sdk).sort(), [
 ]);
 assert.equal(sdk.SDK_VERSION, installed.version);
 NODE
+)
 
 cat >"$consumer_dir/type-contract.mts" <<'TYPESCRIPT'
 import {

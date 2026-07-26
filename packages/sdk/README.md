@@ -43,8 +43,13 @@ Set the project ID in your server environment:
 PISAMA_PROJECT_ID=ps_your_project_id
 ```
 
-Get a project ID with `npx pisama init` or from
-[pisama.ai](https://pisama.ai).
+Get a project ID with:
+
+```bash
+npx --yes --package=@pisama/cli@latest -- pisama init
+```
+
+You can also create one at [pisama.ai](https://pisama.ai).
 
 Wrap the model once:
 

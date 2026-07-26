@@ -32,6 +32,29 @@ test('SDK_VERSION matches the package version', async () => {
   assert.equal(SDK_VERSION, manifest.version);
 });
 
+test('SDK guides use supported project and CLI commands', async () => {
+  const packageReadme = new URL('../README.md', import.meta.url);
+  const integrationGuides = [
+    new URL('./integration/express/README.md', import.meta.url),
+    new URL('./integration/hono/README.md', import.meta.url),
+    new URL('./integration/nextjs/README.md', import.meta.url),
+    new URL('./integration/tanstack-start/README.md', import.meta.url),
+  ];
+  const approvedInit = 'npx --yes --package=@pisama/cli@latest -- pisama init';
+  const approvedVerify = 'npx --yes --package=@pisama/cli@latest -- pisama verify';
+
+  const rootGuide = await readFile(packageReadme, 'utf8');
+  assert.match(rootGuide, new RegExp(approvedInit.replaceAll('/', '\\/')));
+
+  for (const guideUrl of integrationGuides) {
+    const guide = await readFile(guideUrl, 'utf8');
+    assert.doesNotMatch(guide, /\bWHOOPSIE_PROJECT_ID\b/);
+    assert.doesNotMatch(guide, /\bnpx\s+(?:pisama|@pisama\/cli)\b/);
+    assert.match(guide, /\bPISAMA_PROJECT_ID\b/);
+    assert.match(guide, new RegExp(approvedVerify.replaceAll('/', '\\/')));
+  }
+});
+
 const ENDPOINT = process.env.PISAMA_E2E_ENDPOINT;
 const PROJECT_ID = process.env.PISAMA_E2E_PROJECT_ID ?? `e2e_${Date.now().toString(36)}`;
 

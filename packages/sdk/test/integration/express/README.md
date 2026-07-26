@@ -1,6 +1,7 @@
 # Express integration
 
-Replit Agent commonly defaults to Express for backend APIs. The reference at `src/index.ts` shows the `observe()` wrap inside a standard Express route.
+The reference at `src/index.ts` shows `observe()` inside a standard Express
+route.
 
 ## Run the automated test
 
@@ -14,9 +15,18 @@ pnpm test
 ```bash
 mkdir my-app && cd my-app
 pnpm init
-pnpm add express @pisama/sdk @ai-sdk/openai ai
+pnpm add express @pisama/sdk@alpha ai@^6 @ai-sdk/openai@^2
+pnpm add --save-dev tsx typescript @types/express
 # copy src/index.ts as a reference
-WHOOPSIE_PROJECT_ID=ws_yourid OPENAI_API_KEY=sk-... node --loader tsx src/index.ts
+PISAMA_PROJECT_ID=ps_your_project_id OPENAI_API_KEY="$OPENAI_API_KEY" pnpm exec tsx src/index.ts
 ```
 
-Express is more verbose than Hono/Next/TanStack for AI SDK responses because Express doesn't natively support `Response` objects — see `src/index.ts` for the pipe-through pattern. The `observe()` wrap itself is unchanged.
+In another terminal, verify delivery:
+
+```bash
+PISAMA_PROJECT_ID=ps_your_project_id \
+  npx --yes --package=@pisama/cli@latest -- pisama verify
+```
+
+Express needs an explicit response pipe because it does not natively return
+Web `Response` objects. The `observe()` call is unchanged.
