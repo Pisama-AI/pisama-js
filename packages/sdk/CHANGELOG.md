@@ -4,6 +4,17 @@ All notable changes to `@pisama/sdk` are documented here.
 
 ## [Unreleased]
 
+## [0.9.0-alpha.4] - 2026-07-26
+
+- Declare and verify the supported Node.js runtime contract.
+- Publish canonical repository metadata, GitHub build attestation, and npm
+  provenance from an exact, checksum-verified tarball.
+- Verify package contents, size budget, runtime exports, type declarations,
+  dependency versions, and production audit health on Node.js 20, 22, and 24
+  before artifact promotion.
+- Document stable and prerelease channels, compatibility, privacy controls,
+  diagnostics, and support paths.
+
 ## [0.9.0-alpha.3] - 2026-07-25
 
 - Verify the SDK against its packed detector dependency before artifact

@@ -20,9 +20,17 @@
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
 import { TraceExporter } from '../src/exporter.js';
 import { SDK_VERSION } from '../src/version.js';
 import type { TraceEvent } from '../src/types.js';
+
+test('SDK_VERSION matches the package version', async () => {
+  const manifest = JSON.parse(
+    await readFile(new URL('../package.json', import.meta.url), 'utf8'),
+  ) as { version?: unknown };
+  assert.equal(SDK_VERSION, manifest.version);
+});
 
 const ENDPOINT = process.env.PISAMA_E2E_ENDPOINT;
 const PROJECT_ID = process.env.PISAMA_E2E_PROJECT_ID ?? `e2e_${Date.now().toString(36)}`;
