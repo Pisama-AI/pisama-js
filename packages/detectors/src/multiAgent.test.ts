@@ -8,6 +8,7 @@
  *   - 4xx and 5xx surface as PisamaBackendError with status
  *   - network errors surface as PisamaBackendError
  *   - input validation rejects malformed inputs
+ *   - unsupported backend categories are absent from the public API
  */
 
 import { test } from 'node:test';
@@ -16,10 +17,24 @@ import {
   createMultiAgentDetectors,
   PisamaBackendError,
   type CoordinationInput,
-  type DelegationInput,
   type PersonaInput,
-  type ConsensusCollapseInput,
 } from './multiAgent/index.js';
+// @ts-expect-error Unsupported operations do not have public input types.
+import type { DelegationInput } from './index.js';
+// @ts-expect-error Unsupported operations do not have public input types.
+import type { ConsensusCollapseInput } from './index.js';
+
+type Equal<A, B> =
+  (<T>() => T extends A ? 1 : 2) extends <T>() => T extends B ? 1 : 2 ? true : false;
+type Assert<T extends true> = T;
+type PublicDetectorOperation = keyof ReturnType<typeof createMultiAgentDetectors>;
+type PublicOperationsAreSupported = Assert<
+  Equal<PublicDetectorOperation, 'coordination' | 'persona'>
+>;
+type RemovedPublicInputs = [DelegationInput, ConsensusCollapseInput];
+
+const publicOperationsAreSupported: PublicOperationsAreSupported = true;
+const removedPublicInputs: RemovedPublicInputs | undefined = undefined;
 
 interface CapturedRequest {
   url: string;
@@ -161,64 +176,6 @@ test('coordination: validates input', async () => {
   );
 });
 
-// ---- delegation ----
-
-test('delegation: posts typed input and surfaces detection by category', async () => {
-  const { fetch, calls } = makeFetchMock(() => ({
-    status: 200,
-    body: baseResponse([
-      {
-        category: 'delegation',
-        detected: true,
-        confidence: 0.74,
-        severity: 'medium',
-        title: 'Vague handoff',
-        description: 'Handoff lacks success criteria.',
-        evidence: [],
-        affected_spans: [],
-        suggested_fix: null,
-      },
-    ]),
-  }));
-
-  const det = createMultiAgentDetectors({
-    endpoint: 'http://mock.local',
-    fetchImpl: fetch,
-  });
-  const input: DelegationInput = {
-    handoff_instruction: 'Pls handle the user thing',
-    context_completeness: 0.3,
-    bounds: ['no destructive writes'],
-    success_criteria: [],
-  };
-  const result = await det.delegation(input);
-
-  const body = calls[0]!.body as { content: string };
-  const innerTrace = JSON.parse(body.content) as Record<string, unknown>;
-  assert.equal(innerTrace['detector_hint'], 'delegation');
-  assert.equal(innerTrace['context_completeness'], 0.3);
-  assert.deepEqual(innerTrace['bounds'], ['no destructive writes']);
-  assert.equal(result.detected, true);
-  assert.equal(result.category, 'delegation');
-});
-
-test('delegation: validates context_completeness range', async () => {
-  const det = createMultiAgentDetectors({
-    endpoint: 'http://mock.local',
-    fetchImpl: (async () => new Response('{}')) as unknown as typeof fetch,
-  });
-  await assert.rejects(
-    () =>
-      det.delegation({
-        handoff_instruction: 'x',
-        context_completeness: 1.5,
-        bounds: [],
-        success_criteria: [],
-      }),
-    /context_completeness must be a number in \[0, 1\]/,
-  );
-});
-
 // ---- persona ----
 
 test('persona: posts agent persona + output, maps persona_drift category', async () => {
@@ -263,70 +220,22 @@ test('persona: posts agent persona + output, maps persona_drift category', async
   assert.equal(result.severity, 'high');
 });
 
-// ---- consensus_collapse ----
-
-test('consensus_collapse: posts debate trace and surfaces detection', async () => {
-  const { fetch, calls } = makeFetchMock(() => ({
-    status: 200,
-    body: baseResponse([
-      {
-        category: 'consensus_collapse',
-        detected: true,
-        confidence: 0.95,
-        severity: 'critical',
-        title: 'Consensus collapse',
-        description: 'Debate converged on a hallucinated fact via anchor bias.',
-        evidence: [{ pattern: 'dropped_dissent' }],
-        affected_spans: [],
-        suggested_fix: 'Inject adversarial reviewer.',
-      },
-    ]),
-  }));
-
+test('public API omits detector operations that the backend cannot surface', () => {
+  let requestCount = 0;
   const det = createMultiAgentDetectors({
-    endpoint: 'http://mock.local',
-    fetchImpl: fetch,
+    endpoint: 'http://unused.local',
+    fetchImpl: (async () => {
+      requestCount += 1;
+      return new Response('{}');
+    }) as unknown as typeof fetch,
   });
-  const input: ConsensusCollapseInput = {
-    agent_outputs: [
-      { agent_id: 'a', output: 'X is true' },
-      { agent_id: 'b', output: 'X is true' },
-      { agent_id: 'c', output: 'X is true' },
-    ],
-    challenge_patterns: ['dropped_dissent', 'anchor_bias'],
-    agreement_ratio: 1.0,
-    debate_trace: [
-      { agent_id: 'a', round: 1, content: 'I think X' },
-      { agent_id: 'b', round: 1, content: 'agreed, X' },
-      { agent_id: 'c', round: 1, content: 'X for sure' },
-    ],
-  };
-  const result = await det.consensus_collapse(input);
 
-  const body = calls[0]!.body as { content: string };
-  const innerTrace = JSON.parse(body.content) as Record<string, unknown>;
-  assert.equal(innerTrace['detector_hint'], 'consensus_collapse');
-  assert.equal(innerTrace['agreement_ratio'], 1.0);
-  assert.deepEqual(innerTrace['challenge_patterns'], ['dropped_dissent', 'anchor_bias']);
-  assert.equal(result.category, 'consensus_collapse');
-  assert.equal(result.severity, 'critical');
-});
-
-test('consensus_collapse: rejects empty agent_outputs', async () => {
-  const det = createMultiAgentDetectors({
-    endpoint: 'http://mock.local',
-    fetchImpl: (async () => new Response('{}')) as unknown as typeof fetch,
-  });
-  await assert.rejects(
-    () =>
-      det.consensus_collapse({
-        agent_outputs: [],
-        challenge_patterns: [],
-        agreement_ratio: 0.5,
-        debate_trace: [],
-      }),
-    /agent_outputs must be a non-empty array/,
-  );
+  assert.equal(publicOperationsAreSupported, true);
+  assert.equal(removedPublicInputs, undefined);
+  assert.deepEqual(Object.keys(det).sort(), ['coordination', 'persona']);
+  assert.equal('delegation' in det, false);
+  assert.equal('consensus_collapse' in det, false);
+  assert.equal(requestCount, 0);
 });
 
 // ---- auth & errors ----

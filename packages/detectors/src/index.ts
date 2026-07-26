@@ -22,13 +22,9 @@ export {
   type MultiAgentSeverity,
   type CoordinationInput,
   type CoordinationResult,
-  type DelegationInput,
-  type DelegationResult,
   type PersonaAgent,
   type PersonaInput,
   type PersonaResult,
-  type ConsensusCollapseInput,
-  type ConsensusCollapseResult,
 } from './multiAgent/index.js';
 
 import { loopDetector } from './loop.js';

@@ -7,12 +7,8 @@ export {
 } from './detectors.js';
 
 export type {
-  ConsensusCollapseInput,
-  ConsensusCollapseResult,
   CoordinationInput,
   CoordinationResult,
-  DelegationInput,
-  DelegationResult,
   MultiAgentDetection,
   MultiAgentSeverity,
   PersonaAgent,

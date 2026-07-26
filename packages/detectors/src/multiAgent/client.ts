@@ -1,19 +1,15 @@
 /**
  * Shared HTTP client for the MultiAgentDetectors namespace.
  *
- * Pure typed POST client — NO detection logic in TS. Every call round-trips
+ * Pure typed POST client. No detection logic runs in TS. Every call round-trips
  * to the Pisama backend, which owns the calibrated detectors.
  *
  * Backend endpoint reality at this prerelease stage: the backend does NOT yet
  * expose discrete `POST /api/v1/detect/{type}` routes for these multi-agent
- * detectors. The orchestrator is reachable via `POST /api/v1/diagnose/why-failed`
- * which takes a full trace and returns ALL detections; we wrap that and filter
- * by category. The B2 batch endpoint `POST /api/v1/diagnose/batch` is being
- * built in parallel for `consensus_collapse`.
- *
- * Follow-up: see TODO in this package's README — backend should add per-type
- * detector routes matching the golden_dataset input shapes so we can drop the
- * wrap-and-filter layer.
+ * detectors. The orchestrator is reachable via
+ * `POST /api/v1/diagnose/why-failed`, which takes a full trace and returns all
+ * supported detections. The public client exposes only categories that this
+ * endpoint can return.
  */
 
 export interface MultiAgentClientOptions {
