@@ -4,9 +4,19 @@ All notable changes to `@pisama/detectors` are documented here.
 
 ## [Unreleased]
 
+## [0.10.0-alpha.5] - 2026-07-26
+
 - Remove the unsupported `delegation` and `consensus_collapse` client
   operations so an unavailable backend capability cannot look like a clean
   detector result.
+- Declare and verify the supported Node.js runtime contract.
+- Publish canonical repository metadata, GitHub build attestation, and npm
+  provenance from an exact, checksum-verified tarball.
+- Verify package contents, size budget, runtime exports, type declarations,
+  and production audit health on Node.js 20, 22, and 24 before artifact
+  promotion.
+- Document all seven local detectors, the remote-client boundary, stable and
+  prerelease channels, and support paths.
 
 ## [0.10.0-alpha.4] - 2026-07-25
 

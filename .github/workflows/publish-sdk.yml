@@ -1,5 +1,7 @@
 name: Publish SDK to npm
 
+# Tags are immutable release inputs. Use vX.Y.Z for stable releases and
+# vX.Y.Z-alpha.N for alpha releases.
 on:
   push:
     tags:
@@ -8,11 +10,19 @@ on:
 permissions:
   contents: read
 
+concurrency:
+  group: publish-sdk-${{ github.ref }}
+  cancel-in-progress: false
+
 jobs:
   build:
+    name: Build and verify artifact
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -32,61 +42,187 @@ jobs:
         run: pnpm test:coverage
       - name: Audit production dependencies
         run: pnpm audit:production
+      - name: Audit bundled dependency inputs
+        run: pnpm audit:bundle-inputs
       - name: Verify tag matches package version
         run: |
+          set -euo pipefail
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PACKAGE_VERSION=$(node -p "require('./packages/sdk/package.json').version")
           test "$TAG_VERSION" = "$PACKAGE_VERSION"
+          if [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            :
+          elif [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
+            :
+          else
+            echo "unsupported SDK release version: $TAG_VERSION" >&2
+            exit 1
+          fi
+          if npm view "@pisama/sdk@$TAG_VERSION" version >/dev/null 2>&1; then
+            echo "@pisama/sdk@$TAG_VERSION already exists on npm" >&2
+            exit 1
+          fi
+      - name: Verify release commit belongs to main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Pack publish artifact
         run: |
+          set -euo pipefail
           mkdir -p "$RUNNER_TEMP/release"
           pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP/release"
           pnpm --dir packages/sdk pack --pack-destination "$RUNNER_TEMP/release"
-      - name: Verify publish artifact
+          test "$(find "$RUNNER_TEMP/release" -maxdepth 1 -name 'pisama-detectors-*.tgz' | wc -l)" -eq 1
+          test "$(find "$RUNNER_TEMP/release" -maxdepth 1 -name 'pisama-sdk-*.tgz' | wc -l)" -eq 1
+      - name: Verify exact publish artifact
         run: |
-          install_dir=$(mktemp -d)
-          npm install --ignore-scripts --prefix "$install_dir" \
-            "$RUNNER_TEMP"/release/pisama-detectors-*.tgz \
-            "$RUNNER_TEMP"/release/pisama-sdk-*.tgz
-          test -f "$install_dir/node_modules/@pisama/sdk/dist/index.d.ts"
-          (
-            cd "$install_dir"
-            EXPECTED_VERSION=$(node -p "require('./node_modules/@pisama/sdk/package.json').version") \
-              node --input-type=module - <<'NODE'
-          const sdk = await import('@pisama/sdk');
-          if (typeof sdk.observe !== 'function' || sdk.SDK_VERSION !== process.env.EXPECTED_VERSION) {
-            throw new Error('packed @pisama/sdk public API or version is incomplete');
-          }
-          NODE
-          )
+          ./scripts/verify-sdk-artifact.sh \
+            "$RUNNER_TEMP"/release/pisama-sdk-*.tgz \
+            "$RUNNER_TEMP"/release/pisama-detectors-*.tgz
+      - name: Record artifact checksums
+        run: |
+          cd "$RUNNER_TEMP/release"
+          sha256sum ./*.tgz > SHA256SUMS
       - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: package
-          path: ${{ runner.temp }}/release/*.tgz
+          name: sdk-release-${{ github.sha }}
+          path: |
+            ${{ runner.temp }}/release/*.tgz
+            ${{ runner.temp }}/release/SHA256SUMS
+          if-no-files-found: error
+          retention-days: 90
 
-  publish:
+  node-compatibility:
+    name: Verify artifact on Node ${{ matrix.node }}
+    needs: build
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          persist-credentials: false
+      - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
+      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+        with:
+          node-version: ${{ matrix.node }}
+          package-manager-cache: false
+      - run: pnpm install --frozen-lockfile
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-${{ github.sha }}
+          path: dist/
+      - name: Verify exact artifact on Node ${{ matrix.node }}
+        run: |
+          ./scripts/verify-sdk-artifact.sh \
+            ./dist/pisama-sdk-*.tgz \
+            ./dist/pisama-detectors-*.tgz
+
+  attest:
+    name: Attest artifact
     needs: build
     runs-on: ubuntu-latest
     permissions:
+      attestations: write # Record build provenance for the exact SDK tarball.
       contents: read
-      id-token: write
+      id-token: write # Authenticate the GitHub attestation with OIDC.
+    steps:
+      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+        with:
+          name: sdk-release-${{ github.sha }}
+          path: dist/
+      - name: Verify artifact checksums
+        run: cd dist && sha256sum --check SHA256SUMS
+      - name: Attest publish artifacts
+        uses: actions/attest@36051bcae73b7c2a8a6945a48cbf80953c6baa35 # v4.2.0
+        with:
+          subject-path: dist/pisama-sdk-*.tgz
+
+  publish:
+    name: Publish and verify registry
+    needs: [attest, node-compatibility]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write # Authenticate npm trusted publishing with OIDC.
     steps:
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
           package-manager-cache: false
+      - name: Install trusted-publishing capable npm
+        run: | # zizmor: ignore[adhoc-packages] Trusted publishing requires npm 11.5.1 or newer.
+          npm install --global npm@11.18.0
+          test "$(npm --version)" = "11.18.0"
       - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
-          name: package
+          name: sdk-release-${{ github.sha }}
           path: dist/
+      - name: Verify promoted artifact checksum
+        run: |
+          set -euo pipefail
+          cd dist
+          sha256sum --check SHA256SUMS
+          test "$(find . -maxdepth 1 -name 'pisama-sdk-*.tgz' | wc -l)" -eq 1
       - name: Select npm dist-tag
         id: dist
         run: |
-          if [[ "$GITHUB_REF_NAME" == *-* ]]; then
+          set -euo pipefail
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          echo "version=$TAG_VERSION" >> "$GITHUB_OUTPUT"
+          if [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "tag=latest" >> "$GITHUB_OUTPUT"
+          elif [[ "$TAG_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+-alpha\.[0-9]+$ ]]; then
             echo "tag=alpha" >> "$GITHUB_OUTPUT"
           else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
+            echo "unsupported SDK release version: $TAG_VERSION" >&2
+            exit 1
           fi
       - name: Publish through npm trusted publishing
-        run: npm publish ./dist/pisama-sdk-*.tgz --access public --tag "${{ steps.dist.outputs.tag }}"
+        env:
+          NPM_DIST_TAG: ${{ steps.dist.outputs.tag }}
+        run: >-
+          npm publish ./dist/pisama-sdk-*.tgz
+          --access public
+          --provenance
+          --tag "$NPM_DIST_TAG"
+      - name: Verify public registry release
+        env:
+          DIST_TAG: ${{ steps.dist.outputs.tag }}
+          VERSION: ${{ steps.dist.outputs.version }}
+        run: | # zizmor: ignore[adhoc-packages] This intentionally tests a fresh registry resolution.
+          set -euo pipefail
+          published=false
+          for attempt in {1..12}; do
+            if [[ "$(npm view "@pisama/sdk@$VERSION" version 2>/dev/null || true)" == "$VERSION" ]]; then
+              published=true
+              break
+            fi
+            echo "Waiting for @pisama/sdk@$VERSION to reach npm ($attempt/12)"
+            sleep 5
+          done
+          test "$published" = true
+          test "$(npm view "@pisama/sdk" "dist-tags.$DIST_TAG")" = "$VERSION"
+          test \
+            "$(npm view "@pisama/sdk@$VERSION" dist.attestations.provenance.predicateType)" \
+            = "https://slsa.dev/provenance/v1"
+          test "$(npm view "@pisama/sdk@$VERSION" engines.node)" = ">=20"
+          test \
+            "$(npm view "@pisama/sdk@$VERSION" repository.url)" \
+            = "git+https://github.com/Pisama-AI/pisama-js.git"
+
+          install_dir=$(mktemp -d)
+          trap 'rm -rf -- "$install_dir"' EXIT
+          npm install --ignore-scripts --prefix "$install_dir" "@pisama/sdk@$VERSION"
+          (
+            cd "$install_dir"
+            EXPECTED_VERSION="$VERSION" node --input-type=module <<'NODE'
+          const sdk = await import("@pisama/sdk");
+          if (sdk.SDK_VERSION !== process.env.EXPECTED_VERSION) {
+            throw new Error("registry SDK version does not match its runtime export");
+          }
+          NODE
+          )
+          npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
+          npm audit signatures --prefix "$install_dir"

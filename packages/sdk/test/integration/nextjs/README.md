@@ -1,6 +1,7 @@
 # Next.js App Router integration
 
-The primary supported framework. The reference route at `src/app/api/chat/route.ts` matches what the install prompt asks AI builders to produce.
+The reference route at `src/app/api/chat/route.ts` shows the supported
+`observe()` integration for a Next.js App Router handler.
 
 ## Run the automated test
 
@@ -12,12 +13,17 @@ pnpm test
 ## Verify in a real Next.js app
 
 ```bash
-npx create-next-app@latest my-app
+npx create-next-app@latest my-app --use-pnpm
 cd my-app
-pnpm add @pisama/sdk @ai-sdk/openai
+pnpm add @pisama/sdk@alpha ai@^6 @ai-sdk/openai@^2
 # copy src/app/api/chat/route.ts into your project
-echo 'WHOOPSIE_PROJECT_ID=ws_yourid' >> .env.local
-echo 'OPENAI_API_KEY=sk-...' >> .env.local
+echo 'PISAMA_PROJECT_ID=ps_your_project_id' >> .env.local
+# Add OPENAI_API_KEY to .env.local through your normal secret-management flow.
 pnpm dev
-# then npx @pisama/cli verify
+```
+
+In another terminal, verify delivery:
+
+```bash
+npx --yes --package=@pisama/cli@latest -- pisama-ts verify
 ```

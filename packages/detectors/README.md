@@ -1,102 +1,130 @@
-## @pisama/detectors
+# @pisama/detectors
 
-TypeScript-native failure detectors for AI agent traces. Pure functions, zero runtime dependencies, no LLM calls.
+[![npm version](https://img.shields.io/npm/v/%40pisama%2Fdetectors)](https://www.npmjs.com/package/@pisama/detectors)
+[![npm downloads](https://img.shields.io/npm/dm/%40pisama%2Fdetectors)](https://www.npmjs.com/package/@pisama/detectors)
+[![CI](https://github.com/Pisama-AI/pisama-js/actions/workflows/ci.yml/badge.svg)](https://github.com/Pisama-AI/pisama-js/actions/workflows/ci.yml)
+[![license](https://img.shields.io/npm/l/%40pisama%2Fdetectors)](../../LICENSE)
 
-```ts
-import { runDetectors, v1Detectors } from "@pisama/detectors";
+Run deterministic failure detectors over AI agent traces. The local detector
+pack has zero runtime dependencies and makes no network calls.
 
-const hits = runDetectors({
-  traceId: "t1",
-  startTime: 0,
-  toolCalls: [
-    { toolName: "search", startTime: 0 },
-    { toolName: "search", startTime: 1 },
-    { toolName: "search", startTime: 2 },
-    { toolName: "search", startTime: 3 },
-    { toolName: "search", startTime: 4 },
-  ],
-});
-// hits[0]: { detector: "loop", detected: true, severity: 50, ... }
+## Requirements
+
+- Node.js 20 or newer
+- An ESM project or an ESM-aware build tool
+
+## Choose a release channel
+
+```bash
+# Stable local detector pack
+pnpm add @pisama/detectors
+
+# Current prerelease, including typed hosted-detector clients
+pnpm add @pisama/detectors@alpha
 ```
 
-### Algorithms
+Prereleases are published only under the npm `alpha` dist-tag. Stable versions
+are published under `latest`. Pin an exact version in production if you need
+fully repeatable installs.
 
-The v1 pack ports a subset of the [Pisama](https://pisama.ai) detector library to TypeScript. Same algorithms, simplified to drop platform overrides and async.
+## Run the local detector pack
 
-- **loop**: consecutive repetition, cyclic patterns (A to B to A to B), low tool diversity
-- (more shipping in v1)
+```ts
+import { runDetectors } from "@pisama/detectors";
 
-### Adding a detector
+const detections = runDetectors(trace);
+
+for (const detection of detections) {
+  console.warn(
+    `${detection.detector}: ${detection.summary} (${detection.severity}/100)`,
+  );
+}
+```
+
+`runDetectors()` returns only detected issues. Each result includes a detector
+key, severity from 0 to 100, summary, and optional fix and evidence fields.
+Individual detector functions are exported when you need a narrower policy.
+
+## Local algorithms
+
+| Detector | Signal |
+| --- | --- |
+| `loop` | Consecutive calls, cyclic tool patterns, and low tool diversity. |
+| `repetition` | Repeated or looping completion text. |
+| `cost` | Token or cost spikes and missing model attribution. |
+| `completion` | Premature stops and runaway completions. |
+| `hallucination` | Claims unsupported by a supplied sources block. This is heuristic. |
+| `context` | Completions that ignore key tokens from a supplied context block. |
+| `derailment` | Tool sequences that do not align with task verbs in the prompt. |
+
+These detectors are deterministic heuristics. A detection is evidence for
+review, not proof that an agent failed. Calibrate thresholds on representative
+production traces before using results for automated enforcement.
+
+## Add a local detector
 
 ```ts
 import type { Detector } from "@pisama/detectors";
 
-export const myDetector: Detector = {
-  name: "my_detector",
-  description: "what it catches",
+export const policyDetector: Detector = {
+  name: "policy_check",
+  description: "Describe the signal this detector evaluates",
   detect(trace) {
-    // return { detector, detected, severity, summary, fix?, evidence? }
+    return evaluatePolicy(trace);
   },
 };
 ```
 
-### MultiAgentDetectors (0.10): typed backend clients
+Pass custom detectors as the second argument to `runDetectors(trace,
+detectors)`.
 
-The `MultiAgentDetectors` namespace exposes typed TS clients for Pisama's
-multi-agent failure detectors. **No detection runs in TS**: every call
-round-trips to the Pisama backend, which owns the calibrated detector suite.
-The client exposes only operations that the current endpoint can return
-reliably.
+## Hosted multi-agent clients
 
-| Operation | Backend category | Status |
-|---|---|---|
-| `coordination` | `coordination` | Available |
-| `persona` | `persona_drift` | Available |
+The `alpha` channel also exposes typed clients for backend-owned multi-agent
+detectors. Detection runs on the Pisama backend, so these calls require network
+access and may require an API key. They are separate from the zero-dependency
+local pack.
 
 ```ts
 import { createMultiAgentDetectors } from "@pisama/detectors";
 
 const detectors = createMultiAgentDetectors({
-  endpoint: process.env.PISAMA_ENDPOINT, // defaults to https://api.pisama.ai
+  endpoint: process.env.PISAMA_ENDPOINT,
   apiKey: process.env.PISAMA_API_KEY,
   projectId: process.env.PISAMA_PROJECT_ID,
 });
 
-// Coordination: agent message stream
-const coord = await detectors.coordination({
-  agent_ids: ["planner", "executor"],
-  messages: [
-    { sender: "planner", recipient: "executor", content: "do X" },
-    { sender: "executor", recipient: "planner", content: "doing Y instead" },
-  ],
-});
-if (coord.detected) console.warn(coord.title, coord.suggestedFix);
-
-// Persona drift
-await detectors.persona({
-  agent: {
-    id: "support-bot",
-    persona_description: "polite customer-support agent",
-    allowed_actions: ["respond_to_user", "lookup_order"],
-  },
-  output: "ugh fine, here's your refund or whatever.",
+const result = await detectors.coordination({
+  agent_ids: agentIds,
+  messages: messageStream,
 });
 ```
 
-#### Capability boundary
+Currently supported operations:
 
-The backend does NOT yet expose discrete `POST /api/v1/detect/{type}` routes
-for these detectors. Today's clients POST to `/api/v1/diagnose/why-failed`
-(the orchestrator entry point) and filter the returned `all_detections` by
-category. The endpoint returns `coordination` and `persona_drift`, so those
-are the only public client operations.
+| Operation | Backend category |
+| --- | --- |
+| `coordination` | `coordination` |
+| `persona` | `persona_drift` |
 
-`delegation` and `consensus_collapse` are intentionally not exposed. The
-current endpoint cannot return their categories, and representing an
-unsupported operation as `detected: false` would be indistinguishable from a
-clean detector result. These operations can be added when dedicated backend
-routes exist.
+The clients call `POST /api/v1/diagnose/why-failed` and select the matching
+category from the response. Discrete per-detector routes do not exist today.
+`delegation` and `consensus_collapse` are intentionally absent because this
+endpoint cannot return those categories reliably.
 
-### License
+## Compatibility evidence
 
-MIT
+The release gate exercises packed artifacts on Node.js 20, 22, and 24. It
+checks the exact public export surface, generated declarations, package
+contents, canonical metadata, zero runtime dependencies, and production audit
+health.
+
+## Support and security
+
+- [Open a bug or feature request](https://github.com/Pisama-AI/pisama-js/issues)
+- [Read the security policy](https://github.com/Pisama-AI/pisama-js/security/policy)
+- [Review the source](https://github.com/Pisama-AI/pisama-js/tree/main/packages/detectors)
+
+## License
+
+[MIT](../../LICENSE)
