@@ -103,13 +103,13 @@ done
 documented_version=$(
   cd "$consumer_dir"
   npm_config_cache="$consumer_cache" \
-    npx --yes --package="$artifact" -- pisama --version
+    npx --yes --package="$artifact" -- pisama-ts --version
 )
 test "$documented_version" = "$expected_version"
 (
   cd "$consumer_dir"
   npm_config_cache="$consumer_cache" \
-    npx --yes --package="$artifact" -- pisama --help >/dev/null
+    npx --yes --package="$artifact" -- pisama-ts --help >/dev/null
 )
 
 test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"

@@ -30,6 +30,8 @@ All notable changes to `@pisama/cli` are documented here.
 
 - Use an explicit package and binary in every `npx` example so the command
   remains unambiguous while `pisama` and `pisama-ts` are both published.
+- Use the cross-version `pisama-ts` binary in registry-backed examples until
+  the new `pisama` alias is available in the public release.
 - Reserve a fresh package version after the `cli-v0.10.2` publishing attempt
   failed, because npm release tags and package versions are immutable.
 
