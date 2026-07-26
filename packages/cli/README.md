@@ -6,10 +6,23 @@ trajectories, and expose failure data to MCP clients.
 Requires Node.js 20 or newer. You can run every command through `npx` without
 a global install.
 
+| Command               | Purpose                                  | Network behavior                                           |
+| --------------------- | ---------------------------------------- | ---------------------------------------------------------- |
+| `pisama init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
+| `pisama verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
+| `pisama analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API             |
+| `pisama mcp`          | Expose Pisama failures to an MCP client  | Reads project trace data from the configured API           |
+
+Check the installed version at any time:
+
+```bash
+npx --yes --package=@pisama/cli@latest -- pisama --version
+```
+
 ### `pisama init`
 
 ```bash
-npx @pisama/cli init
+npx --yes --package=@pisama/cli@latest -- pisama init
 ```
 
 For a persistent command, install the package globally and run `pisama`:
@@ -38,14 +51,14 @@ Flags:
 ### `pisama verify`
 
 ```bash
-npx @pisama/cli verify
+npx --yes --package=@pisama/cli@latest -- pisama verify
 ```
 
-Posts a synthetic trace to Pisama's ingest API and waits for it to surface on
-`/live/<projectId>`. Use this after installation to prove the full round trip
-works independently of the SDK instrumentation. If `verify` succeeds but your
-real chat produces no traces, check that the model is wrapped in a code path
-your application actually imports.
+Posts a generated verification trace to Pisama's ingest API and waits for it
+to surface on `/live/<projectId>`. Use this after installation to prove the
+full round trip works independently of the SDK instrumentation. If `verify`
+succeeds but your real chat produces no traces, check that the model is
+wrapped in a code path your application actually imports.
 
 Project ID resolution order:
 
@@ -68,11 +81,12 @@ Analyze one ATIF trajectory, a flat directory of trajectories, or a Harbor job
 output directory:
 
 ```bash
-npx @pisama/cli analyze-atif ./harbor-output
+npx --yes --package=@pisama/cli@latest -- pisama analyze-atif ./harbor-output
 ```
 
-The command validates ATIF v1.0 through v1.7, sends each real trajectory to
-Pisama's analysis endpoint, prints detector evidence, and exits with code 1
+The command accepts ATIF v1.0 through v1.7, checks the declared schema version,
+then sends each real trajectory to Pisama's analysis endpoint for full
+validation and analysis. It prints detector evidence and exits with code 1
 when a high-severity finding is present. This makes it suitable for CI gates.
 
 Use `--base-url` for a self-hosted Pisama API. `--project-id` adds project
@@ -82,7 +96,7 @@ To apply the primary recommended fix, pass a single trajectory and explicitly
 provide the target framework, entity, and credentials:
 
 ```bash
-npx @pisama/cli analyze-atif ./trajectory.json \
+npx --yes --package=@pisama/cli@latest -- pisama analyze-atif ./trajectory.json \
   --apply \
   --framework n8n \
   --entity-id workflow-id \
@@ -105,6 +119,13 @@ project's failures inline. The server exposes three read-only tools:
 - `get_recent_traces(limit?)`: recent traces, regardless of failure status
 - `get_trace(traceId)`: full prompt, completion, tool calls, detector hits for one trace
 
+It also exposes four reusable MCP prompts:
+
+- `investigate_recent_failures`: triage failures for a configurable lookback
+- `explain_trace`: explain one trace from detector evidence
+- `propose_fix`: inspect a failure and propose a reviewable fix
+- `daily_quality_report`: summarize recent trace and failure health
+
 #### Connecting an MCP client
 
 Add this to your MCP client's server config (path varies by client: consult your client's docs):
@@ -114,7 +135,7 @@ Add this to your MCP client's server config (path varies by client: consult your
   "mcpServers": {
     "pisama": {
       "command": "npx",
-      "args": ["-y", "@pisama/cli", "mcp"],
+      "args": ["--yes", "--package=@pisama/cli@latest", "--", "pisama", "mcp"],
       "env": { "PISAMA_PROJECT_ID": "ws_yourprojectid" }
     }
   }
@@ -130,9 +151,32 @@ Flags:
 - `-p, --project-id <id>`: overrides the `PISAMA_PROJECT_ID` env var
 - `--base-url <url>`: point at a self-hosted Pisama API (default `https://api.pisama.ai`)
 
+## Trust and privacy
+
+`init --dry-run` shows source and environment-file changes without writing
+them. `verify`, `analyze-atif`, and `mcp` communicate with the configured API,
+so use `--base-url` for a self-hosted deployment when data must stay in your
+environment. Do not pass credentials through shared shell history. For
+`analyze-atif --apply`, prefer a least-privilege credentials file and remove it
+when the operation is complete.
+
+Official releases are built from a commit on `main`, tested on Node.js 20 and
+24, installed from the exact packed tarball, checked for vulnerable production
+dependencies, and published through npm trusted publishing. npm records
+provenance for successful releases. Inspect it with:
+
+```bash
+npm view @pisama/cli@latest dist.integrity dist.attestations
+npm pack @pisama/cli@latest
+gh attestation verify pisama-cli-*.tgz --repo Pisama-AI/pisama-js
+```
+
 ## Support
 
 Report defects in the
 [Pisama JavaScript repository](https://github.com/Pisama-AI/pisama-js/issues).
+Include the CLI version, Node.js version, command, exit code, and redacted
+output. Report security issues privately as described in the repository's
+[security policy](https://github.com/Pisama-AI/pisama-js/security/policy).
 The public API exposes its current dependency health at
 [api.pisama.ai/api/v1/health](https://api.pisama.ai/api/v1/health).
