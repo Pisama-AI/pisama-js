@@ -34,7 +34,7 @@
     "test:coverage": "node --import tsx --test --experimental-test-coverage --test-coverage-lines=95 --test-coverage-branches=75 test/*.test.ts"
   },
   "dependencies": {
-    "commander": "^12.0.0",
+    "commander": "^15.0.0",
     "kleur": "^4.1.5",
     "nanoid": "^5.0.0",
     "open": "^10.0.0",
