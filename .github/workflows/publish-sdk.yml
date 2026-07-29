@@ -1,6 +1,7 @@
 name: Publish SDK to npm
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'v*'
@@ -13,6 +14,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
       - uses: pnpm/action-setup@fc06bc1257f339d1d5d8b3a19a8cae5388b55320 # v4.4.0
       - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
         with:
@@ -37,6 +41,8 @@ jobs:
           TAG_VERSION="${GITHUB_REF_NAME#v}"
           PACKAGE_VERSION=$(node -p "require('./packages/sdk/package.json').version")
           test "$TAG_VERSION" = "$PACKAGE_VERSION"
+      - name: Verify release commit belongs to main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
       - name: Pack publish artifact
         run: |
           mkdir -p "$RUNNER_TEMP/release"
@@ -67,6 +73,8 @@ jobs:
   publish:
     needs: build
     runs-on: ubuntu-latest
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
     permissions:
       contents: read
       id-token: write
@@ -87,5 +95,49 @@ jobs:
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
+      # PR #24 removed `registry-url` from this job's setup-node: with no token supplied,
+      # setup-node still writes the literal placeholder `XXXXX-XXXXX-XXXXX-XXXXX` as
+      # `_authToken`, so npm authenticated with garbage instead of attempting OIDC.
+      # That fix is kept. This step writes a real token and only when one is configured,
+      # so with no NPM_TOKEN secret it is skipped and the OIDC path is byte-for-byte
+      # unchanged. A classic "Publish" token will NOT work here: those still require an
+      # OTP (verified 2026-07-28, `npm dist-tag add` returned EOTP), and CI cannot answer
+      # one. Use a granular or automation token.
+      - name: Enable token auth when NPM_TOKEN is configured
+        if: env.HAS_NPM_TOKEN == 'true'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" >> "$HOME/.npmrc"
       - name: Publish through npm trusted publishing
-        run: npm publish ./dist/pisama-sdk-*.tgz --access public --tag "${{ steps.dist.outputs.tag }}"
+        run: npm publish ./dist/pisama-sdk-*.tgz --access public --provenance --tag "${{ steps.dist.outputs.tag }}"
+      - name: Verify public registry release
+        env:
+          DIST_TAG: ${{ steps.dist.outputs.tag }}
+        run: | # zizmor: ignore[adhoc-packages] Intentionally tests a fresh registry resolution.
+          VERSION="${GITHUB_REF_NAME#v}"
+          published=false
+          for attempt in {1..12}; do
+            if [[ "$(npm view "@pisama/sdk@$VERSION" version 2>/dev/null || true)" == "$VERSION" ]]; then
+              published=true
+              break
+            fi
+            echo "Waiting for @pisama/sdk@$VERSION to reach npm ($attempt/12)"
+            sleep 5
+          done
+          test "$published" = true
+          test "$(npm view "@pisama/sdk" "dist-tags.$DIST_TAG")" = "$VERSION"
+          test \
+            "$(npm view "@pisama/sdk@$VERSION" dist.attestations.provenance.predicateType)" \
+            = "https://slsa.dev/provenance/v1"
+
+          install_dir=$(mktemp -d)
+          trap 'rm -rf -- "$install_dir"' EXIT
+          npm install --ignore-scripts --prefix "$install_dir" "@pisama/sdk@$VERSION"
+          node -e "
+            const m = require('$install_dir/node_modules/@pisama/sdk/package.json');
+            for (const [d, spec] of Object.entries(m.dependencies || {})) {
+              if (String(spec).startsWith('workspace:')) {
+                throw new Error('published tarball leaked a workspace specifier: ' + d + '@' + spec);
+              }
+            }
+          "
