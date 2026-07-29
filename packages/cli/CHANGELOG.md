@@ -2,6 +2,22 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## 0.10.5
+
+### Fixed
+
+- `init` now tells you to install `@pisama/sdk`. It patches your call site to
+  `import { observe } from "@pisama/sdk"` but never added the package, so every fresh
+  `init` left a project that could not resolve the import. The install line uses the
+  package manager your lockfile implies (`pnpm add`, `yarn add`, `bun add`, otherwise
+  `npm i`), and is skipped when the dependency is already present. `init` still does not
+  edit your `package.json`.
+- `init` no longer prints `https://pisama.ai/live/<projectId>`. That route does not exist:
+  it redirects to `/sign-in` and resolves to nothing after login. It now prints
+  `https://pisama.ai/dashboard`, which is a real page. The dashboard is not project-scoped,
+  so the project id is no longer appended to the link; `init` still prints the id on its
+  own line.
+
 ## 0.10.4
 
 ### Fixed

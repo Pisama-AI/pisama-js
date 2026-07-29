@@ -80,6 +80,100 @@ test('init writes PISAMA_PROJECT_ID and patches the streamText call', async () =
   }
 });
 
+/** Run init with stdout captured, so output copy can be asserted on. */
+async function initCapturingOutput(root: string, opts: { dryRun?: boolean } = {}): Promise<string> {
+  const lines: string[] = [];
+  const log = console.log;
+  console.log = (...args: unknown[]) => {
+    lines.push(args.map(String).join(' '));
+  };
+  try {
+    await init({ cwd: root, open: false, dryRun: opts.dryRun ?? false });
+  } finally {
+    console.log = log;
+  }
+  return lines.join('\n');
+}
+
+test('init tells the user to install @pisama/sdk', async () => {
+  const root = await makeFixture();
+  try {
+    const output = await initCapturingOutput(root);
+
+    // The patched route imports @pisama/sdk, so init must not leave the user
+    // with a project that cannot resolve it.
+    const route = await readFile(join(root, 'app', 'api', 'chat', 'route.ts'), 'utf8');
+    assert.match(route, /from "@pisama\/sdk"/);
+    assert.match(output, /npm i @pisama\/sdk/);
+    assert.match(output, /not installed yet/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('init uses the package manager the project already has a lockfile for', async () => {
+  const root = await makeFixture();
+  try {
+    await writeFile(join(root, 'pnpm-lock.yaml'), 'lockfileVersion: 9.0\n');
+    const output = await initCapturingOutput(root);
+    assert.match(output, /pnpm add @pisama\/sdk/);
+    assert.doesNotMatch(output, /npm i @pisama\/sdk/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('init does not nag when @pisama/sdk is already a dependency', async () => {
+  const root = await makeFixture();
+  try {
+    await writeFile(
+      join(root, 'package.json'),
+      JSON.stringify(
+        {
+          ...FIXTURE_PKG,
+          dependencies: { ...FIXTURE_PKG.dependencies, '@pisama/sdk': '^0.10.0' },
+        },
+        null,
+        2,
+      ),
+    );
+
+    const output = await initCapturingOutput(root);
+    assert.doesNotMatch(output, /npm i @pisama\/sdk/);
+    assert.match(output, /already a dependency/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('init does not modify package.json', async () => {
+  const root = await makeFixture();
+  try {
+    const before = await readFile(join(root, 'package.json'), 'utf8');
+    await initCapturingOutput(root);
+    const after = await readFile(join(root, 'package.json'), 'utf8');
+    assert.equal(after, before, 'init must not silently edit the user manifest');
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
+test('init points at a dashboard route that exists', async () => {
+  const root = await makeFixture();
+  try {
+    const output = await initCapturingOutput(root);
+
+    assert.match(output, /https:\/\/pisama\.ai\/dashboard/);
+    // /live/<projectId> has no route on pisama.ai; it 307s to /sign-in and
+    // then resolves to nothing. Never print it again.
+    assert.doesNotMatch(output, /pisama\.ai\/live/);
+    // The dashboard is not project-scoped, so no id may be appended.
+    assert.doesNotMatch(output, /pisama\.ai\/dashboard\/\S/);
+  } finally {
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('init dry-run does not modify files', async () => {
   const root = await makeFixture();
   try {

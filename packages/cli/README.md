@@ -42,7 +42,9 @@ Run this inside your Next.js and Vercel AI SDK project. The CLI:
 2. Uses the TypeScript AST to patch the first `streamText` or `generateText`
    call so its model is wrapped with `observe(model)` from `@pisama/sdk`.
 3. Writes `PISAMA_PROJECT_ID` to `.env.local`.
-4. Opens `https://pisama.ai/live/<projectId>`.
+4. Prints the command to install `@pisama/sdk` when it is missing. The CLI does not
+   edit your `package.json`, so run that command yourself before building.
+5. Opens `https://pisama.ai/dashboard`.
 
 Hit your chat route once. The first failure your agent throws will show up live.
 
