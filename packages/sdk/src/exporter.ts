@@ -71,12 +71,45 @@ export class TraceExporter {
     try {
       const res = await this.send(batch);
       if (debug) {
-        console.log(`[pisama] flushed ${batch.length} event(s) → HTTP ${res.status}`);
+        console.log(`[pisama] flushed ${batch.length} event(s), HTTP ${res.status}`);
       }
+      this.reportRejectedFlush(res, batch.length);
       await this.reportPartialFlush(res, batch.length, debug);
     } catch (err) {
       this.reportFailure(err, debug);
     }
+  }
+
+  // `fetch` does not throw on HTTP error statuses, and the batch has already been
+  // spliced out of the buffer by the time we get here. Without this, a rejected
+  // flush is discarded in complete silence: the caller believes telemetry is
+  // working while nothing is being delivered. That is exactly what happened when
+  // the hosted ingest route was removed server-side, and it went unnoticed because
+  // only HTTP 207 was ever inspected.
+  private reportRejectedFlush(res: Response, droppedCount: number): void {
+    if (res.ok || res.status === 207 || isSilent()) return;
+
+    if (res.status === 404) {
+      console.warn(
+        `[pisama] ingest endpoint not found (HTTP 404) at ${this.endpoint}. ` +
+          `${droppedCount} event(s) dropped. This SDK version targets an ingest route ` +
+          `that the configured host does not serve. Point PISAMA_INGEST_URL at a ` +
+          `deployment that does, or upgrade @pisama/sdk.`,
+      );
+      return;
+    }
+    if (res.status === 401 || res.status === 403) {
+      console.warn(
+        `[pisama] ingest rejected the request (HTTP ${res.status}) at ${this.endpoint}. ` +
+          `${droppedCount} event(s) dropped. The configured host requires credentials ` +
+          `this SDK version does not send.`,
+      );
+      return;
+    }
+    console.warn(
+      `[pisama] ingest returned HTTP ${res.status} at ${this.endpoint}. ` +
+        `${droppedCount} event(s) dropped.`,
+    );
   }
 
   private takeBatch(): TraceEvent[] | null {
