@@ -26,7 +26,7 @@
   },
   "peerDependencies": {
     "@ai-sdk/provider": "^3.0.0",
-    "ai": "^6.0.0"
+    "ai": "^7.0.34"
   },
   "peerDependenciesMeta": {
     "@ai-sdk/provider": {
@@ -39,7 +39,7 @@
   },
   "devDependencies": {
     "@ai-sdk/provider": "^3.0.0",
-    "ai": "^6.0.0",
+    "ai": "^7.0.34",
     "tsx": "^4.19.0",
     "typescript": "^5.6.0",
     "zod": "^4.0.0"
