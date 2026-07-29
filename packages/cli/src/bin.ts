@@ -55,25 +55,20 @@ program
   .description(
     'POST a generated verification trace and confirm it round-trips through the dashboard. Use after install to prove integration works.',
   )
-  .option('--cwd <path>', 'Project root for reading .env.local', process.cwd())
-  .option(
-    '-p, --project-id <id>',
-    'Override project id (defaults to PISAMA_PROJECT_ID or .env.local)',
-  )
+  .option('--cwd <path>', 'Project root', process.cwd())
+  .option('--api-key <key>', 'Pisama API key (defaults to PISAMA_API_KEY)')
   .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
   .option('--timeout-ms <ms>', 'How long to wait for the trace to surface (default 15000)', (v) =>
     Number(v),
   )
-  .action(
-    async (opts: { cwd: string; projectId?: string; baseUrl?: string; timeoutMs?: number }) => {
-      await verify({
-        cwd: opts.cwd,
-        projectId: opts.projectId,
-        baseUrl: opts.baseUrl,
-        timeoutMs: opts.timeoutMs,
-      });
-    },
-  );
+  .action(async (opts: { cwd: string; apiKey?: string; baseUrl?: string; timeoutMs?: number }) => {
+    await verify({
+      cwd: opts.cwd,
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      timeoutMs: opts.timeoutMs,
+    });
+  });
 
 program
   .command('analyze-atif')
@@ -82,6 +77,7 @@ program
   )
   .argument('<path>', 'Path to an ATIF .json file or a directory of them')
   .option('-p, --project-id <id>', 'Optional Pisama project id for correlation')
+  .option('--api-key <key>', 'Pisama API key (defaults to PISAMA_API_KEY)')
   .option('--base-url <url>', 'Override the Pisama base URL (default https://api.pisama.ai)')
   .option(
     '--apply',
@@ -104,6 +100,7 @@ program
       path: string,
       opts: {
         projectId?: string;
+        apiKey?: string;
         baseUrl?: string;
         apply?: boolean;
         framework?: string;
@@ -114,6 +111,7 @@ program
       await analyzeAtif({
         path,
         projectId: opts.projectId,
+        apiKey: opts.apiKey,
         baseUrl: opts.baseUrl,
         apply: opts.apply,
         framework: opts.framework,

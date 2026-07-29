@@ -2,6 +2,20 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## 0.10.4
+
+### Fixed
+
+- `verify` no longer targets the removed anonymous project-scoped ingest flow. It now
+  authenticates with an API key, resolves the tenant via `/api/v1/auth/me`, sends OTLP to
+  `/api/v1/traces/ingest`, and reads back from `/api/v1/tenants/{tenant_id}/traces`. The
+  previous flow returned 404 on every call.
+- `analyze-atif` accepts `--api-key` (or `PISAMA_API_KEY`) and sends it as a bearer token.
+  `/api/v1/atif/analyze` is authenticated, so this command previously returned 401 for every
+  user with no flag available to fix it.
+- `mcp` reports an actionable error when the trace-read endpoint returns 404 instead of an
+  opaque upstream message.
+
 ## [Unreleased]
 
 ## [0.10.3] - 2026-07-26
