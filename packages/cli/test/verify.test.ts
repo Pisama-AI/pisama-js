@@ -125,10 +125,7 @@ test('verify happy path: tenant resolved, ingest accepted, trace found on second
       s.logs.some((l) => /Dashboard: https:\/\/pisama\.ai\/dashboard/.test(l)),
       'expected the dashboard link',
     );
-    assert.ok(
-      authHeaders.length >= 3,
-      'expected auth header on auth/me, ingest, and poll calls',
-    );
+    assert.ok(authHeaders.length >= 3, 'expected auth header on auth/me, ingest, and poll calls');
     assert.ok(
       authHeaders.every((h) => h === 'Bearer test-key-123'),
       'expected every outbound request to carry the bearer token',

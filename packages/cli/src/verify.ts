@@ -114,7 +114,9 @@ export async function verify(opts: VerifyOptions): Promise<void> {
     );
   }
   if (!postRes.ok && postRes.status !== 207) {
-    fail(`Ingest returned HTTP ${postRes.status}. Aborting.\n  If this persists, check ${healthUrl}`);
+    fail(
+      `Ingest returned HTTP ${postRes.status}. Aborting.\n  If this persists, check ${healthUrl}`,
+    );
   }
   ok(`Ingest accepted (HTTP ${postRes.status}).`);
 

@@ -61,16 +61,14 @@ program
   .option('--timeout-ms <ms>', 'How long to wait for the trace to surface (default 15000)', (v) =>
     Number(v),
   )
-  .action(
-    async (opts: { cwd: string; apiKey?: string; baseUrl?: string; timeoutMs?: number }) => {
-      await verify({
-        cwd: opts.cwd,
-        apiKey: opts.apiKey,
-        baseUrl: opts.baseUrl,
-        timeoutMs: opts.timeoutMs,
-      });
-    },
-  );
+  .action(async (opts: { cwd: string; apiKey?: string; baseUrl?: string; timeoutMs?: number }) => {
+    await verify({
+      cwd: opts.cwd,
+      apiKey: opts.apiKey,
+      baseUrl: opts.baseUrl,
+      timeoutMs: opts.timeoutMs,
+    });
+  });
 
 program
   .command('analyze-atif')
