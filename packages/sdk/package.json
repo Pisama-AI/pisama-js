@@ -29,11 +29,13 @@
     "ai": "^6.0.0"
   },
   "peerDependenciesMeta": {
-    "@ai-sdk/provider": { "optional": true }
+    "@ai-sdk/provider": {
+      "optional": true
+    }
   },
   "dependencies": {
     "@pisama/detectors": "workspace:*",
-    "nanoid": "^5.0.0"
+    "nanoid": "^6.0.0"
   },
   "devDependencies": {
     "@ai-sdk/provider": "^3.0.0",
