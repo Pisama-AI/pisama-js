@@ -296,6 +296,14 @@ async function fetchTraces(
   const res = await fetchImpl(url.toString(), {
     headers: { 'x-pisama-project-id': projectId },
   });
+  if (res.status === 404) {
+    throw new Error(
+      `pisama ${baseUrl} returned 404 from /api/v1/projects/${projectId}/traces. ` +
+        'This CLI version targets the authenticated tenant-scoped API — the anonymous ' +
+        'project-id-only flow is no longer served. Pass --api-key (or set PISAMA_API_KEY) ' +
+        'to use the authenticated contract.',
+    );
+  }
   if (!res.ok) {
     throw new Error(`pisama ${baseUrl} returned ${res.status}`);
   }

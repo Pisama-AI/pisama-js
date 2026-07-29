@@ -19,6 +19,7 @@ import kleur from 'kleur';
 export interface AnalyzeAtifOptions {
   path: string;
   projectId?: string;
+  apiKey?: string;
   baseUrl?: string;
   apply?: boolean;
   framework?: string;
@@ -123,11 +124,17 @@ async function requestAnalysis(
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
 ): Promise<AnalyzeResponse> {
+  const apiKey = opts.apiKey ?? process.env.PISAMA_API_KEY;
   let response: Response;
   try {
     response = await fetch(`${baseUrl}/api/v1/atif/analyze`, {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers: {
+        'content-type': 'application/json',
+        // /api/v1/atif/analyze is HTTPBearer-protected. Without this the command
+        // 401s for every user and there was no flag to fix it from their side.
+        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+      },
       body: JSON.stringify({
         trajectory,
         ...(opts.projectId ? { project_id: opts.projectId } : {}),
