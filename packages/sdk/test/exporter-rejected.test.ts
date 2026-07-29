@@ -51,7 +51,13 @@ function spyConsole(): ConsoleSpy {
   return s;
 }
 
-function exporterReturning(status: number, endpoint = 'https://api.example.test/ingest') {
+const TEST_ENDPOINT = 'https://api.example.test/ingest';
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+function exporterReturning(status: number, endpoint = TEST_ENDPOINT) {
   return new TraceExporter({
     projectId: 'ws_rejected_test',
     endpoint,
@@ -68,8 +74,9 @@ test('a 404 flush warns and names the endpoint instead of failing silently', asy
 
     const warned = spy.warns.join('\n');
     assert.ok(warned.includes('404'), `expected the status in the warning, got: ${warned}`);
-    assert.ok(
-      warned.includes('https://api.example.test/ingest'),
+    assert.match(
+      warned,
+      new RegExp(escapeRegExp(TEST_ENDPOINT)),
       `expected the endpoint in the warning, got: ${warned}`,
     );
     assert.ok(
