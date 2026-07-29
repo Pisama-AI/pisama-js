@@ -5,13 +5,13 @@ pnpm add @pisama/sdk
 ```
 
 ```ts
-import { observe } from "@pisama/sdk";
-import { streamText } from "ai";
-import { openai } from "@ai-sdk/openai";
+import { observe } from '@pisama/sdk';
+import { streamText } from 'ai';
+import { openai } from '@ai-sdk/openai';
 
-const model = observe(openai("gpt-4o"), { redact: "metadata-only" });
+const model = observe(openai('gpt-4o'), { redact: 'metadata-only' });
 
-const result = await streamText({ model, prompt: "..." });
+const result = await streamText({ model, prompt: '...' });
 ```
 
 Set `PISAMA_PROJECT_ID` in `.env.local`. Get yours from `npx pisama init` (or sign up at https://pisama.ai).
@@ -23,21 +23,21 @@ Set `PISAMA_PROJECT_ID` in `.env.local`. Get yours from `npx pisama init` (or si
 If you need direct access to the middleware (e.g. you're composing multiple middlewares), import `pisamaMiddleware` and pass it to `wrapLanguageModel` yourself:
 
 ```ts
-import { wrapLanguageModel } from "ai";
-import { pisamaMiddleware } from "@pisama/sdk";
+import { wrapLanguageModel } from 'ai';
+import { pisamaMiddleware } from '@pisama/sdk';
 
 const model = wrapLanguageModel({
-  model: openai("gpt-4o"),
+  model: openai('gpt-4o'),
   middleware: [pisamaMiddleware(), yourOtherMiddleware],
 });
 ```
 
 ### Privacy
 
-PII is redacted in the SDK before bytes leave the machine. Default mode is `standard` (emails, phones, SSNs, cards, JWTs, OpenAI/Anthropic/AWS/GitHub/Slack-shaped API keys). Pass `redact: 'aggressive'` for more, `'metadata-only'` for token counts and detector verdicts only, or `'off'` to disable. The ingest server re-runs the same redaction patterns before writing to storage: defense in depth.
+PII is redacted in the SDK before bytes leave the machine. Default mode is `standard` (emails, phones, SSNs, cards, JWTs, OpenAI/Anthropic/AWS/GitHub/Slack-shaped API keys). Pass `redact: 'aggressive'` for more, `'metadata-only'` for token counts and detector verdicts only, or `'off'` to disable. Redaction is client-side only. This version does not reach a server-side redaction pass, because the hosted ingest route it targets is not currently served (see below).
 
 ```ts
-observe(model, { redact: "metadata-only" });
+observe(model, { redact: 'metadata-only' });
 ```
 
 ### Diagnostics
@@ -48,11 +48,11 @@ The SDK is loud by default about whether it's wired correctly. On first model ca
 [pisama] enabled · project=ps_abc123… · redact=metadata-only
 ```
 
-If no events fire within 30 seconds, the SDK logs a warning with the most common causes (wrong wrap, file not imported, missing env var, blocked egress) and a link to verify on your dashboard. This catches silent integration failures that previously looked identical to working integration.
+If no events fire within 30 seconds, the SDK logs a warning with the most common causes (wrong wrap, file not imported, missing env var, blocked egress) and where to verify. This catches silent integration failures that previously looked identical to working integration.
 
 ### Telemetry and opt-out
 
-The SDK ships traces (your prompt, completion, token counts, model id, finish reason, timing) to your project's dashboard at `pisama.ai/live/<projectId>`. It also attaches three diagnostic headers on each ingest request:
+The SDK collects traces (your prompt, completion, token counts, model id, finish reason, timing) and posts them to `POST /api/v1/spans`. **That route is not currently served by `api.pisama.ai` and returns 404**, so traces from this version do not reach the hosted dashboard. The exporter reports every rejected batch, with the status, the endpoint and the number of events dropped, rather than discarding them silently as versions before 0.9.0 did. Point `PISAMA_INGEST_URL` at a deployment that serves this contract if you need delivery today. It also attaches three diagnostic headers on each ingest request:
 
 - `x-pisama-client-id`: anonymous 16-char id, persisted to `~/.pisama/client.json` so retention can be measured per install
 - `x-pisama-sdk-version`: the published version of `@pisama/sdk`

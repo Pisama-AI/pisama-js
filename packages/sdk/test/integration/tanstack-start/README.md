@@ -32,7 +32,7 @@ pnpm install
 WHOOPSIE_PROJECT_ID=ws_yourid OPENAI_API_KEY=sk-... pnpm dev
 ```
 
-Open http://localhost:3000, send a chat message, and watch `https://pisama.ai/live/ws_yourid` for the trace.
+Open http://localhost:3000 and send a chat message. The hosted ingest route is not currently served, so the exporter reports the rejected batch rather than delivering it.
 
 ## Why this exists
 
