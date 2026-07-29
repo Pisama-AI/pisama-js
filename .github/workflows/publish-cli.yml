@@ -1,6 +1,7 @@
 name: Publish CLI to npm
 
 on:
+  workflow_dispatch:
   push:
     tags:
       - 'cli-v*'
@@ -97,6 +98,8 @@ jobs:
     name: Publish and verify registry
     needs: attest
     runs-on: ubuntu-latest
+    env:
+      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
     permissions:
       contents: read
       id-token: write # Authenticate npm trusted publishing with OIDC.
@@ -121,12 +124,26 @@ jobs:
           else
             echo "tag=latest" >> "$GITHUB_OUTPUT"
           fi
+      # PR #24 removed `registry-url` from this job's setup-node: with no token supplied,
+      # setup-node still writes the literal placeholder `XXXXX-XXXXX-XXXXX-XXXXX` as
+      # `_authToken`, so npm authenticated with garbage instead of attempting OIDC.
+      # That fix is kept. This step writes a real token and only when one is configured,
+      # so with no NPM_TOKEN secret it is skipped and the OIDC path is byte-for-byte
+      # unchanged. A classic "Publish" token will NOT work here: those still require an
+      # OTP (verified 2026-07-28, `npm dist-tag add` returned EOTP), and CI cannot answer
+      # one. Use a granular or automation token.
+      - name: Enable token auth when NPM_TOKEN is configured
+        if: env.HAS_NPM_TOKEN == 'true'
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" >> "$HOME/.npmrc"
       - name: Publish through npm trusted publishing
         env:
           NPM_DIST_TAG: ${{ steps.dist.outputs.tag }}
         run: >-
           npm publish ./dist/pisama-cli-*.tgz
           --access public
+          --provenance
           --tag "$NPM_DIST_TAG"
       - name: Verify public registry release
         env:
