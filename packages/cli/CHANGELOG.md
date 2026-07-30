@@ -2,6 +2,23 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## 0.11.0
+
+### Added
+
+- `@pisama/cli` now depends on `@pisama/detectors` directly (the same
+  `workspace:*` convention `@pisama/sdk` already uses), so installing the CLI
+  alone gives you real local detector functionality with no separate
+  `npm install @pisama/detectors` step.
+- `analyze-atif --local`: runs `@pisama/detectors`' v1 pack (loop,
+  repetition, cost, completion, hallucination, context, derailment) against
+  each ATIF trajectory in-process. No network call, no `PISAMA_API_KEY`, and
+  no `--apply` (that still needs the hosted auto-apply service). It's the
+  same simplified subset `@pisama/detectors` documents itself as, not a
+  replacement for the backend's full calibrated suite — the default
+  (network) mode is unchanged and still recommended when you have an API
+  key.
+
 ## 0.10.5
 
 ### Fixed

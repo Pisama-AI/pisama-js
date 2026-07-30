@@ -10,7 +10,7 @@ a global install.
 | ------------------------ | ---------------------------------------- | ---------------------------------------------------------- |
 | `pisama-ts init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
 | `pisama-ts verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
-| `pisama-ts analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API             |
+| `pisama-ts analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API (or none, with `--local`) |
 | `pisama-ts mcp`          | Expose Pisama failures to an MCP client  | Reads project trace data from the configured API           |
 
 The `pisama` and `pisama-ts` commands are equivalent starting in version
@@ -90,13 +90,26 @@ output directory:
 npx --yes --package=@pisama/cli@latest -- pisama-ts analyze-atif ./harbor-output
 ```
 
-The command accepts ATIF v1.0 through v1.7, checks the declared schema version,
-then sends each real trajectory to Pisama's analysis endpoint for full
-validation and analysis. It prints detector evidence and exits with code 1
-when a high-severity finding is present. This makes it suitable for CI gates.
+The command accepts ATIF v1.0 through v1.7 and checks the declared schema
+version in both modes below. It prints detector evidence and exits with code
+1 when a high-severity finding is present, making it suitable for CI gates.
+
+- **Default**: sends each trajectory to Pisama's `/api/v1/atif/analyze`
+  endpoint, which runs the full calibrated backend detector suite (and
+  supports `--apply` healing). Requires network access and `PISAMA_API_KEY`.
+- **`--local`**: runs `@pisama/detectors`' v1 pack (loop, repetition, cost,
+  completion, hallucination, context, derailment) in-process. No network
+  call, no API key, and no `--apply` — it's a simplified subset of the
+  backend's suite, the same one `@pisama/detectors` documents itself as, not
+  a replacement for it. `@pisama/cli` depends on `@pisama/detectors`
+  directly, so this works with no separate install.
+
+```bash
+npx --yes --package=@pisama/cli@latest -- pisama-ts analyze-atif ./harbor-output --local
+```
 
 Use `--base-url` for a self-hosted Pisama API. `--project-id` adds project
-correlation to the analysis request.
+correlation to the analysis request. Both are ignored in `--local` mode.
 
 To apply the primary recommended fix, pass a single trajectory and explicitly
 provide the target framework, entity, and credentials:
@@ -113,8 +126,10 @@ Apply mode is intentionally limited to one trajectory. Credentials may be an
 inline JSON object or a path to a JSON file. Review the target and use
 least-privilege credentials before applying a change.
 
-Trajectory content is sent to the configured Pisama API for analysis. Review
-your data handling requirements before analyzing sensitive production traces.
+Trajectory content is sent to the configured Pisama API for analysis, unless
+you pass `--local`. Review your data handling requirements before analyzing
+sensitive production traces; `--local` keeps trajectory content on your
+machine entirely, at the cost of the backend's full calibrated suite.
 
 ### `pisama-ts mcp`
 
@@ -162,9 +177,10 @@ Flags:
 `init --dry-run` shows source and environment-file changes without writing
 them. `verify`, `analyze-atif`, and `mcp` communicate with the configured API,
 so use `--base-url` for a self-hosted deployment when data must stay in your
-environment. Do not pass credentials through shared shell history. For
-`analyze-atif --apply`, prefer a least-privilege credentials file and remove it
-when the operation is complete.
+environment, or `analyze-atif --local` to skip the network entirely. Do not
+pass credentials through shared shell history. For `analyze-atif --apply`,
+prefer a least-privilege credentials file and remove it when the operation is
+complete.
 
 Official releases are built from a commit on `main`, tested on Node.js 20 and
 24, installed from the exact packed tarball, checked for vulnerable production
