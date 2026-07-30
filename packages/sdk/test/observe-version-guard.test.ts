@@ -1,7 +1,7 @@
 // Tests for the observe() peer-dep version guard. Covers the Replit-identified
 // failure mode where an older `ai` / `@ai-sdk/provider` version produces
-// models with specificationVersion != "v3", which silently no-op our
-// middleware.
+// models with specificationVersion outside {"v3", "v4"}, which run in the AI
+// SDK's own degraded compatibility mode or silently no-op our middleware.
 
 import { test, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -47,7 +47,7 @@ test('observe() warns when model has specificationVersion v2 (old provider)', ()
       `expected directional warning about specificationVersion mismatch, got: ${JSON.stringify(c.warns)}`,
     );
     assert.ok(
-      c.warns.some((l) => /ai@\^6/.test(l)),
+      c.warns.some((l) => /ai@\^7/.test(l)),
       'warning should include the fix command',
     );
   } finally {

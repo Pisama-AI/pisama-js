@@ -12,11 +12,11 @@
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {
-    "@ai-sdk/openai": "^2.0.0",
+    "@ai-sdk/openai": "^4.0.0",
     "@tanstack/react-router": "^1.95.0",
     "@tanstack/react-start": "^1.95.0",
     "@pisama/sdk": "workspace:*",
-    "ai": "^6.0.0",
+    "ai": "^7.0.0",
     "react": "^19.0.0",
     "react-dom": "^19.0.0"
   },
