@@ -1,5 +1,5 @@
 import { nanoid } from 'nanoid';
-import type { LanguageModelV3Middleware } from '@ai-sdk/provider';
+import type { LanguageModelV4Middleware } from '@ai-sdk/provider';
 import { redactObject, type RedactMode } from './redact.js';
 import { TraceExporter } from './exporter.js';
 import {
@@ -122,14 +122,14 @@ interface MiddlewareWrapStreamArgs {
 }
 
 export interface PisamaLanguageModelMiddleware {
-  readonly specificationVersion: 'v3';
+  readonly specificationVersion: 'v4';
   wrapGenerate: (args: MiddlewareWrapGenerateArgs) => Promise<GenerateResultLike>;
   wrapStream: (
     args: MiddlewareWrapStreamArgs,
   ) => Promise<{ stream: ReadableStream<StreamPartLike> }>;
 }
 
-export function pisamaMiddleware(opts: PisamaMiddlewareOptions = {}): LanguageModelV3Middleware {
+export function pisamaMiddleware(opts: PisamaMiddlewareOptions = {}): LanguageModelV4Middleware {
   const inner: PisamaLanguageModelMiddleware = buildMiddleware(opts);
   // Misuse guardrail: a common AI-agent mistake is to call the returned
   // middleware as if it were a model wrapper — `pisamaMiddleware(opts)(model)`.
@@ -166,7 +166,7 @@ export function pisamaMiddleware(opts: PisamaMiddlewareOptions = {}): LanguageMo
     getOwnPropertyDescriptor(_t, key) {
       return Reflect.getOwnPropertyDescriptor(inner, key);
     },
-  }) as unknown as LanguageModelV3Middleware;
+  }) as unknown as LanguageModelV4Middleware;
 }
 
 function resolveProjectId(opts: PisamaMiddlewareOptions): string | undefined {
@@ -194,7 +194,7 @@ function buildBaseMetadata(opts: PisamaMiddlewareOptions): Record<string, unknow
 
 function disabledMiddleware(): PisamaLanguageModelMiddleware {
   return {
-    specificationVersion: 'v3',
+    specificationVersion: 'v4',
     wrapGenerate: async ({ doGenerate }) => doGenerate(),
     wrapStream: async ({ doStream }) => doStream(),
   };
@@ -222,7 +222,7 @@ function buildMiddleware(opts: PisamaMiddlewareOptions = {}): PisamaLanguageMode
   maybeStartSilenceWarning(projectId);
 
   return {
-    specificationVersion: 'v3',
+    specificationVersion: 'v4',
 
     async wrapGenerate({ doGenerate, params, model }) {
       const traceId = nanoid();
@@ -403,7 +403,7 @@ function buildFromGenerate(args: BuildArgs & { result: GenerateResultLike }): Tr
     )
     .map((c) => c.text)
     .join('');
-  // Reasoning parts (LanguageModelV3ReasoningPart): { type: "reasoning",
+  // Reasoning parts (LanguageModelV4ReasoningPart): { type: "reasoning",
   // text: string }. Emitted by providers that expose chain-of-thought —
   // o1, Claude extended thinking, Gemini thinking, etc.
   const reasoning = (result.content ?? [])

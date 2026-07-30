@@ -1,6 +1,7 @@
 // Reasoning capture tests. SDK 0.5.0 adds a `reasoning` field to TraceEvent
 // and wires the middleware to collect:
-//   - `reasoning-delta` stream parts (LanguageModelV3 streaming contract)
+//   - `reasoning-delta` stream parts (LanguageModelV3/V4 streaming contract —
+//     unchanged field shape across the ai@6 -> ai@7 migration)
 //   - `type: "reasoning"` content parts from doGenerate
 //
 // Both go through the same redactObject pipeline as prompt/completion. Under

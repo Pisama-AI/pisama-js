@@ -28,7 +28,7 @@ test('pisamaMiddleware properties remain readable through the proxy (advanced co
   // Users who go the explicit wrapLanguageModel route read these props.
   // The proxy must forward them transparently.
   // @ts-expect-error — these props exist on the inner middleware object
-  assert.equal(middleware.specificationVersion, 'v3');
+  assert.equal(middleware.specificationVersion, 'v4');
   // @ts-expect-error
   assert.equal(typeof middleware.wrapGenerate, 'function');
   // @ts-expect-error
@@ -44,7 +44,7 @@ test('observe() still works (uses pisamaMiddleware internally through wrapLangua
     // would throw at construction. Reaching here means the guard didn't
     // regress the happy path.
     assert.ok(wrapped);
-    assert.equal((wrapped as { specificationVersion?: string }).specificationVersion, 'v3');
+    assert.equal((wrapped as { specificationVersion?: string }).specificationVersion, 'v4');
   } finally {
     delete process.env.PISAMA_PROJECT_ID;
     delete process.env.PISAMA_SILENT;
