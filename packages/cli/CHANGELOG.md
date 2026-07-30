@@ -2,6 +2,10 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## 0.11.2
+
+Patch release to exercise the retried attestation checks in `publish-cli.yml`'s "Verify public registry release" step (see repo history): the previous two releases published correctly but the CI run itself failed on an unretried read against npm's attestations endpoint.
+
 ## 0.11.1
 
 Patch release to confirm a clean publish/verification run (the prior release hit a transient npm registry-propagation delay during its own CI verification step, not a real defect -- see repo history).
