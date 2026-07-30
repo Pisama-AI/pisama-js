@@ -2,6 +2,10 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## 0.11.1
+
+Patch release to confirm a clean publish/verification run (the prior release hit a transient npm registry-propagation delay during its own CI verification step, not a real defect -- see repo history).
+
 ## 0.11.0
 
 ### Added

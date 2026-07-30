@@ -4,6 +4,10 @@ All notable changes to `@pisama/sdk` are documented here.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-07-30
+
+Patch release to confirm a clean publish/verification run (the prior release hit a transient npm registry-propagation delay during its own CI verification step, not a real defect -- see repo history).
+
 ## [0.10.0] - 2026-07-29
 
 ### Changed
