@@ -161,9 +161,22 @@ jobs:
           done
           test "$published" = true
           test "$(npm view "@pisama/cli" "dist-tags.$DIST_TAG")" = "$VERSION"
-          test \
-            "$(npm view "@pisama/cli@$VERSION" dist.attestations.provenance.predicateType)" \
-            = "https://slsa.dev/provenance/v1"
+
+          # The attestations endpoint indexes separately from (and observed
+          # slower than) the base package publish above, so both attestation
+          # reads below get their own retry loop instead of a single check.
+          # 2026-07-30: this is what actually 404's when it races the base
+          # publish, first on this field and then on `npm audit signatures`.
+          provenance_ok=false
+          for attempt in {1..12}; do
+            if [[ "$(npm view "@pisama/cli@$VERSION" dist.attestations.provenance.predicateType 2>/dev/null || true)" == "https://slsa.dev/provenance/v1" ]]; then
+              provenance_ok=true
+              break
+            fi
+            echo "Waiting for @pisama/cli@$VERSION provenance attestation to reach npm ($attempt/12)"
+            sleep 5
+          done
+          test "$provenance_ok" = true
 
           install_dir=$(mktemp -d)
           trap 'rm -rf -- "$install_dir"' EXIT
@@ -171,4 +184,14 @@ jobs:
           test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$VERSION"
           test "$("$install_dir/node_modules/.bin/pisama-ts" --version)" = "$VERSION"
           npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
-          npm audit signatures --prefix "$install_dir"
+
+          signatures_ok=false
+          for attempt in {1..12}; do
+            if npm audit signatures --prefix "$install_dir"; then
+              signatures_ok=true
+              break
+            fi
+            echo "Waiting for @pisama/cli@$VERSION attestations to reach npm audit signatures ($attempt/12)"
+            sleep 5
+          done
+          test "$signatures_ok" = true
