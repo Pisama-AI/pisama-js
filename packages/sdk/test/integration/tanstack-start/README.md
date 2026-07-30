@@ -20,7 +20,7 @@ pnpm exec tsx test/integration/tanstack-start/tanstack-start.test.ts
 
 Or just `pnpm test` from `packages/sdk` to run all SDK tests including this one.
 
-This exercises `observe()` against the AI SDK's `LanguageModelV3` contract using mock fetch and a mock model. Passing the test proves the SDK works correctly in any framework that respects the AI SDK middleware contract — TanStack Start included.
+This exercises `observe()` against the AI SDK's `LanguageModelV4` contract using mock fetch and a mock model. Passing the test proves the SDK works correctly in any framework that respects the AI SDK middleware contract — TanStack Start included.
 
 ## Run the real app (manual verification)
 

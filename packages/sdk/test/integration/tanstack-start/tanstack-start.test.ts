@@ -2,7 +2,7 @@
 // The reference route is at src/routes/api/chat.ts — TanStack Start's
 // server-route convention. We exercise the SDK contract directly here rather
 // than booting a full TanStack server, because the middleware operates at the
-// AI SDK's LanguageModelV3 layer, which is framework-agnostic.
+// AI SDK's LanguageModelV4 layer, which is framework-agnostic.
 
 import { test } from 'node:test';
 import assert from 'node:assert/strict';

@@ -3,7 +3,7 @@
 //
 // The integration is identical to Next.js: import `observe` from @pisama/sdk,
 // wrap your model with one call. The middleware contract is on the AI SDK's
-// LanguageModelV3 layer, which is framework-agnostic.
+// LanguageModelV4 layer, which is framework-agnostic.
 
 import { createServerFileRoute } from '@tanstack/react-start/server';
 import { openai } from '@ai-sdk/openai';
