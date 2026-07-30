@@ -2,6 +2,47 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## 0.11.2
+
+Patch release to exercise the retried attestation checks in `publish-cli.yml`'s "Verify public registry release" step (see repo history): the previous two releases published correctly but the CI run itself failed on an unretried read against npm's attestations endpoint.
+
+## 0.11.1
+
+Patch release to confirm a clean publish/verification run (the prior release hit a transient npm registry-propagation delay during its own CI verification step, not a real defect -- see repo history).
+
+## 0.11.0
+
+### Added
+
+- `@pisama/cli` now depends on `@pisama/detectors` directly (the same
+  `workspace:*` convention `@pisama/sdk` already uses), so installing the CLI
+  alone gives you real local detector functionality with no separate
+  `npm install @pisama/detectors` step.
+- `analyze-atif --local`: runs `@pisama/detectors`' v1 pack (loop,
+  repetition, cost, completion, hallucination, context, derailment) against
+  each ATIF trajectory in-process. No network call, no `PISAMA_API_KEY`, and
+  no `--apply` (that still needs the hosted auto-apply service). It's the
+  same simplified subset `@pisama/detectors` documents itself as, not a
+  replacement for the backend's full calibrated suite — the default
+  (network) mode is unchanged and still recommended when you have an API
+  key.
+
+## 0.10.5
+
+### Fixed
+
+- `init` now tells you to install `@pisama/sdk`. It patches your call site to
+  `import { observe } from "@pisama/sdk"` but never added the package, so every fresh
+  `init` left a project that could not resolve the import. The install line uses the
+  package manager your lockfile implies (`pnpm add`, `yarn add`, `bun add`, otherwise
+  `npm i`), and is skipped when the dependency is already present. `init` still does not
+  edit your `package.json`.
+- `init` no longer prints `https://pisama.ai/live/<projectId>`. That route does not exist:
+  it redirects to `/sign-in` and resolves to nothing after login. It now prints
+  `https://pisama.ai/dashboard`, which is a real page. The dashboard is not project-scoped,
+  so the project id is no longer appended to the link; `init` still prints the id on its
+  own line.
+
 ## 0.10.4
 
 ### Fixed

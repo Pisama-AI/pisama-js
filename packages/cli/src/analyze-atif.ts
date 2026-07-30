@@ -8,13 +8,25 @@
 //   - a Harbor job-output directory (trials are at
 //     <job>/<trial>/agent/trajectory.json — see harbor-framework/harbor
 //     src/harbor/agents/installed/swe_agent.py and adapters/kumo/README.md)
-// The command POSTs each trajectory to the Pisama backend's analyze
-// endpoint and renders a per-trajectory summary. Exits non-zero when any
+//
+// Two modes:
+//   - default: POSTs each trajectory to the Pisama backend's analyze
+//     endpoint (the full calibrated detector suite, plus --apply healing).
+//     Requires network access and PISAMA_API_KEY.
+//   - --local: runs the @pisama/detectors v1 pack (loop, repetition, cost,
+//     completion, hallucination, context, derailment) against each
+//     trajectory in-process. No network, no API key, no --apply — it's the
+//     same simplified subset @pisama/detectors documents itself as
+//     (see packages/detectors/README.md), not a replacement for the backend's
+//     calibrated suite.
+// Both modes render a per-trajectory summary and exit non-zero when any
 // high-severity detection fires so the command is CI-friendly.
 
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join, resolve, basename, relative } from 'node:path';
 import kleur from 'kleur';
+import { runDetectors, v1Detectors, type AgentTrace, type ToolEvent } from '@pisama/detectors';
+import type { DetectionResult as LocalDetectionResult } from '@pisama/detectors';
 
 export interface AnalyzeAtifOptions {
   path: string;
@@ -26,6 +38,8 @@ export interface AnalyzeAtifOptions {
   entityId?: string;
   // Either inline JSON ({"instance_url":"..."}) or a path to a .json file.
   credentials?: string;
+  // Run @pisama/detectors' v1 pack locally instead of calling the backend.
+  local?: boolean;
 }
 
 const DEFAULT_BASE = 'https://api.pisama.ai';
@@ -98,8 +112,53 @@ async function resolveApplyCredentials(
   return loadCredentials(opts.credentials);
 }
 
-function parseTrajectory(file: string, raw: string): { schema_version?: string } {
-  let trajectory: { schema_version?: string };
+// Minimal shape of an ATIF trajectory (schema_version ATIF-v1.0 through
+// v1.7). Only the fields the --local AgentTrace projection and the backend
+// POST body need are typed here; unknown fields pass through untouched.
+// Source of truth: backend/app/ingestion/atif_models.py in Pisama-AI/pisama.
+interface AtifToolCall {
+  tool_call_id?: string;
+  function_name?: string;
+  arguments?: unknown;
+}
+
+interface AtifObservationResult {
+  source_call_id?: string;
+  content?: unknown;
+}
+
+interface AtifStepMetrics {
+  prompt_tokens?: number;
+  completion_tokens?: number;
+  cost_usd?: number;
+}
+
+interface AtifStep {
+  step_id?: number;
+  timestamp?: string;
+  source?: string;
+  message?: string;
+  model_name?: string;
+  tool_calls?: AtifToolCall[];
+  observation?: { results?: AtifObservationResult[] };
+  metrics?: AtifStepMetrics;
+}
+
+interface AtifTrajectory {
+  schema_version?: string;
+  session_id?: string;
+  trajectory_id?: string;
+  agent?: { model_name?: string };
+  steps?: AtifStep[];
+  final_metrics?: {
+    total_prompt_tokens?: number;
+    total_completion_tokens?: number;
+    total_cost_usd?: number;
+  };
+}
+
+function parseTrajectory(file: string, raw: string): AtifTrajectory {
+  let trajectory: AtifTrajectory;
   try {
     trajectory = JSON.parse(raw);
   } catch (error) {
@@ -117,10 +176,146 @@ function parseTrajectory(file: string, raw: string): { schema_version?: string }
   return trajectory;
 }
 
+function toEpochMs(timestamp: string | undefined): number | undefined {
+  if (!timestamp) return undefined;
+  const ms = Date.parse(timestamp);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+function flattenToolCalls(steps: AtifStep[]): ToolEvent[] {
+  const toolCalls: ToolEvent[] = [];
+  for (const step of steps) {
+    const stepTime = toEpochMs(step.timestamp) ?? 0;
+    for (const call of step.tool_calls ?? []) {
+      const result = step.observation?.results?.find(
+        (r) => r.source_call_id === call.tool_call_id,
+      )?.content;
+      toolCalls.push({
+        toolName: call.function_name ?? 'unknown',
+        args: call.arguments,
+        result,
+        startTime: stepTime,
+      });
+    }
+  }
+  return toolCalls;
+}
+
+interface TokenTotals {
+  inputTokens: number;
+  outputTokens: number;
+  costUsd: number;
+}
+
+function sumStepMetrics(steps: AtifStep[]): TokenTotals {
+  return steps.reduce(
+    (acc, s) => ({
+      inputTokens: acc.inputTokens + (s.metrics?.prompt_tokens ?? 0),
+      outputTokens: acc.outputTokens + (s.metrics?.completion_tokens ?? 0),
+      costUsd: acc.costUsd + (s.metrics?.cost_usd ?? 0),
+    }),
+    { inputTokens: 0, outputTokens: 0, costUsd: 0 },
+  );
+}
+
+// final_metrics is the authoritative total; per-step `metrics` is only a
+// fallback for trajectories that omit it. Summing per-step metrics is cheap
+// (trajectories are step-bounded), so it's always computed rather than
+// gated behind an extra branch.
+function resolveTokenTotals(trajectory: AtifTrajectory, steps: AtifStep[]): TokenTotals {
+  const final = trajectory.final_metrics;
+  const fallback = sumStepMetrics(steps);
+  return {
+    inputTokens: final?.total_prompt_tokens ?? fallback.inputTokens,
+    outputTokens: final?.total_completion_tokens ?? fallback.outputTokens,
+    costUsd: final?.total_cost_usd ?? fallback.costUsd,
+  };
+}
+
+// Projects a multi-step ATIF trajectory down to the flat single-turn
+// AgentTrace shape @pisama/detectors' v1 pack understands: the first user
+// message as `prompt`, the last agent message as `completion`, every step's
+// tool_calls flattened (each result resolved from that step's `observation`
+// by tool_call_id) into `toolCalls`, and token/cost totals from
+// `final_metrics` (summed from per-step `metrics` when absent). This is a
+// real, lossy-on-purpose projection — it lets the loop/repetition/cost/
+// completion/hallucination/context/derailment detectors run over a
+// trajectory's shape; it does not reconstruct the full multi-step structure
+// the backend's ATIF-native detectors see.
+function atifTrajectoryToAgentTrace(trajectory: AtifTrajectory, fallbackId: string): AgentTrace {
+  const steps = trajectory.steps ?? [];
+  const tokens = resolveTokenTotals(trajectory, steps);
+
+  return {
+    traceId: trajectory.trajectory_id ?? trajectory.session_id ?? fallbackId,
+    startTime: toEpochMs(steps[0]?.timestamp) ?? 0,
+    endTime: toEpochMs(steps[steps.length - 1]?.timestamp),
+    model: trajectory.agent?.model_name ?? steps.find((s) => s.model_name)?.model_name,
+    prompt: steps.find((s) => s.source === 'user')?.message,
+    completion: [...steps].reverse().find((s) => s.source === 'agent' && s.message)?.message,
+    toolCalls: flattenToolCalls(steps),
+    inputTokens: tokens.inputTokens,
+    outputTokens: tokens.outputTokens,
+    costUsd: tokens.costUsd,
+  };
+}
+
+// Mirrors the backend's severity_from_confidence bands (backend/app/detection
+// /outcome/base.py), collapsed to the three buckets analyze-atif renders:
+// >=0.65 high, >=0.45 medium, else low.
+function localSeverityLabel(score: number): 'high' | 'medium' | 'low' {
+  if (score >= 65) return 'high';
+  if (score >= 45) return 'medium';
+  return 'low';
+}
+
+function localDetectionsToApiShape(results: LocalDetectionResult[]): Detection[] {
+  return results.map((r) => ({
+    category: r.detector,
+    confidence: r.severity / 100,
+    severity: localSeverityLabel(r.severity),
+    title: r.summary,
+    description: r.fix,
+  }));
+}
+
+function buildLocalResponse(
+  trajectory: AtifTrajectory,
+  trace: AgentTrace,
+  results: LocalDetectionResult[],
+): AnalyzeResponse {
+  return {
+    diagnosis: {
+      trace_id: trace.traceId,
+      has_failures: results.length > 0,
+      failure_count: results.length,
+      detection_status: 'completed',
+      all_detections: localDetectionsToApiShape(results),
+      detectors_run: v1Detectors.map((d) => d.name),
+      detectors_failed: {},
+    },
+    trace: {
+      trace_id: trace.traceId,
+      span_count: trace.toolCalls.length,
+      total_tokens: (trace.inputTokens ?? 0) + (trace.outputTokens ?? 0),
+      atif_schema_version: trajectory.schema_version ?? 'unknown',
+      atif_session_id: trajectory.session_id ?? null,
+      atif_trajectory_id: trajectory.trajectory_id ?? null,
+    },
+    healing: null,
+  };
+}
+
+function analyzeTrajectoryLocally(file: string, trajectory: AtifTrajectory): AnalyzeResponse {
+  const trace = atifTrajectoryToAgentTrace(trajectory, basename(file));
+  const results = runDetectors(trace);
+  return buildLocalResponse(trajectory, trace, results);
+}
+
 async function requestAnalysis(
   file: string,
   baseUrl: string,
-  trajectory: { schema_version?: string },
+  trajectory: AtifTrajectory,
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
 ): Promise<AnalyzeResponse> {
@@ -171,7 +366,9 @@ async function analyzeTrajectory(
   credentials: Record<string, unknown> | undefined,
 ): Promise<{ failureCount: number; highSeverity: boolean }> {
   const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
-  const data = await requestAnalysis(file, baseUrl, trajectory, opts, credentials);
+  const data = opts.local
+    ? analyzeTrajectoryLocally(file, trajectory)
+    : await requestAnalysis(file, baseUrl, trajectory, opts, credentials);
   const highSeverity = data.diagnosis.all_detections.some(
     (detection) => (detection.severity ?? '').toLowerCase() === 'high',
   );
@@ -183,6 +380,12 @@ async function analyzeTrajectory(
 }
 
 export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
+  if (opts.local && opts.apply) {
+    fail(
+      '--local runs detectors offline and cannot --apply fixes. --apply needs the ' +
+        'hosted API to run the unified auto-apply service.',
+    );
+  }
   const target = resolve(opts.path);
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
   const credentials = await resolveApplyCredentials(opts);
@@ -198,9 +401,13 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   }
   const targetIsDir = (await stat(target)).isDirectory();
   step(
-    `Analyzing ${kleur.bold(String(files.length))} trajector${
-      files.length === 1 ? 'y' : 'ies'
-    } against ${kleur.dim(baseUrl)}`,
+    opts.local
+      ? `Analyzing ${kleur.bold(String(files.length))} trajector${
+          files.length === 1 ? 'y' : 'ies'
+        } locally with ${kleur.dim('@pisama/detectors')} (offline, no API key)`
+      : `Analyzing ${kleur.bold(String(files.length))} trajector${
+          files.length === 1 ? 'y' : 'ies'
+        } against ${kleur.dim(baseUrl)}`,
   );
 
   let highSeverityFound = false;

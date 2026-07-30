@@ -95,6 +95,12 @@ program
     '--credentials <jsonOrPath>',
     'Credentials JSON for --apply. Either an inline JSON object or a path to a .json file.',
   )
+  .option(
+    '--local',
+    'Run the @pisama/detectors v1 pack (loop, repetition, cost, completion, hallucination, ' +
+      'context, derailment) in-process instead of calling the hosted API. No network, no ' +
+      'API key, no --apply — a simplified subset, not the full calibrated backend suite.',
+  )
   .action(
     async (
       path: string,
@@ -106,6 +112,7 @@ program
         framework?: string;
         entityId?: string;
         credentials?: string;
+        local?: boolean;
       },
     ) => {
       await analyzeAtif({
@@ -117,6 +124,7 @@ program
         framework: opts.framework,
         entityId: opts.entityId,
         credentials: opts.credentials,
+        local: opts.local,
       });
     },
   );

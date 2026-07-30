@@ -18,12 +18,12 @@ jobs:
     name: Build and verify artifact
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           persist-credentials: false
       - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           registry-url: https://registry.npmjs.org
@@ -104,7 +104,7 @@ jobs:
       contents: read
       id-token: write # Authenticate npm trusted publishing with OIDC.
     steps:
-      - uses: actions/setup-node@2028fbc5c25fe9cf00d9f06a71cc4710d4507903 # v6.0.0
+      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
         with:
           node-version: '24'
           package-manager-cache: false
@@ -161,9 +161,22 @@ jobs:
           done
           test "$published" = true
           test "$(npm view "@pisama/cli" "dist-tags.$DIST_TAG")" = "$VERSION"
-          test \
-            "$(npm view "@pisama/cli@$VERSION" dist.attestations.provenance.predicateType)" \
-            = "https://slsa.dev/provenance/v1"
+
+          # The attestations endpoint indexes separately from (and observed
+          # slower than) the base package publish above, so both attestation
+          # reads below get their own retry loop instead of a single check.
+          # 2026-07-30: this is what actually 404's when it races the base
+          # publish, first on this field and then on `npm audit signatures`.
+          provenance_ok=false
+          for attempt in {1..12}; do
+            if [[ "$(npm view "@pisama/cli@$VERSION" dist.attestations.provenance.predicateType 2>/dev/null || true)" == "https://slsa.dev/provenance/v1" ]]; then
+              provenance_ok=true
+              break
+            fi
+            echo "Waiting for @pisama/cli@$VERSION provenance attestation to reach npm ($attempt/12)"
+            sleep 5
+          done
+          test "$provenance_ok" = true
 
           install_dir=$(mktemp -d)
           trap 'rm -rf -- "$install_dir"' EXIT
@@ -171,4 +184,14 @@ jobs:
           test "$("$install_dir/node_modules/.bin/pisama" --version)" = "$VERSION"
           test "$("$install_dir/node_modules/.bin/pisama-ts" --version)" = "$VERSION"
           npm audit --omit=dev --audit-level=moderate --prefix "$install_dir"
-          npm audit signatures --prefix "$install_dir"
+
+          signatures_ok=false
+          for attempt in {1..12}; do
+            if npm audit signatures --prefix "$install_dir"; then
+              signatures_ok=true
+              break
+            fi
+            echo "Waiting for @pisama/cli@$VERSION attestations to reach npm audit signatures ($attempt/12)"
+            sleep 5
+          done
+          test "$signatures_ok" = true

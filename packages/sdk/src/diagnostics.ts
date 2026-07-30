@@ -14,7 +14,7 @@
 //   • model not actually wrapped (most common)
 //   • wrap is in a file that's never imported by the chat route
 //   • PISAMA_PROJECT_ID env var doesn't reach the server runtime
-//   • this server can't reach https://api.pisama.ai/api/v1/spans
+//   • the hosted ingest route /api/v1/spans is not currently served (404)
 
 import type { RedactMode } from './redact.js';
 
@@ -63,9 +63,9 @@ export function maybeStartSilenceWarning(
           "  • model isn't wrapped — use observe(model, opts) from @pisama/sdk\n" +
           "  • the wrap is in a file that isn't imported by your chat route\n" +
           "  • PISAMA_PROJECT_ID env var isn't reaching your server runtime\n" +
-          "  • this server can't reach https://api.pisama.ai/api/v1/spans\n" +
-          `Verify install by sending one chat message, then visit:\n` +
-          `  https://pisama.ai/live/${projectId}`,
+          '  • the hosted ingest route /api/v1/spans is not currently served (404)\n' +
+          `Set PISAMA_INGEST_URL to a deployment that serves this contract.\n` +
+          `  project: ${projectId}`,
       );
     }
   }, delayMs);

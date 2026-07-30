@@ -11,7 +11,12 @@ export interface InitOptions {
   dryRun: boolean;
 }
 
-const DASHBOARD_BASE = 'https://pisama.ai/live';
+// The dashboard is a single authenticated page. There is no project-scoped
+// route, so the project id must not be appended: /live/<projectId> and
+// /dashboard/<projectId> both resolve to nothing.
+const DASHBOARD_URL = 'https://pisama.ai/dashboard';
+
+const SDK_PACKAGE = '@pisama/sdk';
 
 export async function init(opts: InitOptions): Promise<void> {
   const root = resolve(opts.cwd);
@@ -39,21 +44,57 @@ export async function init(opts: InitOptions): Promise<void> {
     ok(`Wrapped model in ${kleur.bold(patched)} with observe().`);
   } else {
     warn('No streamText/generateText call site found. Add the wrapper manually:');
-    console.log(kleur.dim("\n  import { observe } from '@pisama/sdk';"));
+    console.log(kleur.dim(`\n  import { observe } from '${SDK_PACKAGE}';`));
     console.log(kleur.dim("  const model = observe(yourModel, { redact: 'metadata-only' });\n"));
   }
 
-  const dashboardUrl = `${DASHBOARD_BASE}/${projectId}`;
+  // The patched file (or the manual snippet above) imports the SDK, so the
+  // project needs it as a dependency. init never edits package.json, so tell
+  // the user how to install it instead of changing their manifest for them.
+  await printInstallInstruction(root, pkg);
+
   console.log('');
-  console.log(kleur.bold('  Live dashboard: ') + kleur.cyan().underline(dashboardUrl));
+  console.log(kleur.bold('  Dashboard: ') + kleur.cyan().underline(DASHBOARD_URL));
   console.log(kleur.dim('  Now run your dev server and hit your chat route once.'));
   console.log('');
 
   if (opts.open && !opts.dryRun) {
-    await open(dashboardUrl).catch(() => {
+    await open(DASHBOARD_URL).catch(() => {
       // Browser open is best-effort; never fail init on it.
     });
   }
+}
+
+async function printInstallInstruction(root: string, pkg: Record<string, unknown>): Promise<void> {
+  if (hasDep(pkg, SDK_PACKAGE)) {
+    ok(`${SDK_PACKAGE} is already a dependency.`);
+    return;
+  }
+
+  const command = `${await addCommand(root)} ${SDK_PACKAGE}`;
+  console.log('');
+  warn(`${SDK_PACKAGE} is not installed yet. The patched code will not build without it.`);
+  console.log(kleur.bold('  Install it: ') + kleur.cyan(command));
+}
+
+/** Pick the install command from whichever lockfile the project already uses. */
+async function addCommand(root: string): Promise<string> {
+  const lockfiles: Array<[string, string]> = [
+    ['pnpm-lock.yaml', 'pnpm add'],
+    ['yarn.lock', 'yarn add'],
+    ['bun.lockb', 'bun add'],
+    ['bun.lock', 'bun add'],
+  ];
+
+  for (const [file, command] of lockfiles) {
+    try {
+      await access(join(root, file));
+      return command;
+    } catch {
+      // Not this package manager; keep looking.
+    }
+  }
+  return 'npm i';
 }
 
 async function readPackageJson(root: string): Promise<Record<string, unknown>> {
