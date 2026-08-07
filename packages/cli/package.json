@@ -46,7 +46,7 @@
     "ts-morph": "^28.0.0"
   },
   "devDependencies": {
-    "@modelcontextprotocol/sdk": "1.29.0",
+    "@modelcontextprotocol/sdk": "1.30.0",
     "@types/node": "^22.0.0",
     "esbuild": "0.28.1",
     "tsx": "^4.19.0",
