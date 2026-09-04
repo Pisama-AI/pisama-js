@@ -20,7 +20,7 @@
 //     (see packages/detectors/README.md), not a replacement for the backend's
 //     calibrated suite.
 // Both modes render a per-trajectory summary and exit non-zero when any
-// high-severity detection fires so the command is CI-friendly.
+// critical- or high-severity detection fires so the command is CI-friendly.
 
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join, resolve, basename, relative } from 'node:path';
@@ -298,7 +298,10 @@ function buildLocalResponse(
     },
     trace: {
       trace_id: trace.traceId,
-      span_count: trace.toolCalls.length,
+      // ATIF steps are the actual imported span units. Tool calls are a
+      // lossy local-detector projection and can legitimately be empty for a
+      // multi-step trajectory, so they must not be presented as span count.
+      span_count: trajectory.steps?.length ?? 0,
       total_tokens: (trace.inputTokens ?? 0) + (trace.outputTokens ?? 0),
       atif_schema_version: trajectory.schema_version ?? 'unknown',
       atif_session_id: trajectory.session_id ?? null,
@@ -368,19 +371,22 @@ async function analyzeTrajectory(
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
   auth: PlatformAuth | undefined,
-): Promise<{ failureCount: number; highSeverity: boolean }> {
+): Promise<{ failureCount: number; blockingSeverity: boolean; applyFailed: boolean }> {
   const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
   const data = opts.local
     ? analyzeTrajectoryLocally(file, trajectory)
     : await requestAnalysis(file, baseUrl, trajectory, opts, credentials, auth!);
-  const highSeverity = data.diagnosis.all_detections.some(
-    (detection) => (detection.severity ?? '').toLowerCase() === 'high',
+  const blockingSeverity = data.diagnosis.all_detections.some((detection) =>
+    ['critical', 'high'].includes((detection.severity ?? '').toLowerCase()),
+  );
+  const applyFailed = Boolean(
+    opts.apply && (!data.healing || !data.healing.success || data.healing.rolled_back),
   );
   const label = targetIsDirectory ? relative(target, file) || basename(file) : basename(file);
 
   renderTrajectorySummary(label, data);
   if (opts.apply && data.healing) renderHealingSummary(data.healing);
-  return { failureCount: data.diagnosis.failure_count, highSeverity };
+  return { failureCount: data.diagnosis.failure_count, blockingSeverity, applyFailed };
 }
 
 async function authenticateAnalysis(
@@ -434,7 +440,8 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
         } against ${kleur.dim(baseUrl)}`,
   );
 
-  let highSeverityFound = false;
+  let blockingSeverityFound = false;
+  let applyFailureFound = false;
   let totalFailures = 0;
 
   for (const file of files) {
@@ -448,18 +455,27 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
       auth,
     );
     totalFailures += result.failureCount;
-    highSeverityFound ||= result.highSeverity;
+    blockingSeverityFound ||= result.blockingSeverity;
+    applyFailureFound ||= result.applyFailed;
   }
 
   console.log();
   console.log(
     kleur.bold(`Summary: ${files.length} trajectorie(s), ${totalFailures} total detection(s)`),
   );
-  if (highSeverityFound) {
-    console.log(kleur.red('✗ At least one high-severity detection fired. Exiting with code 1.'));
+  if (blockingSeverityFound) {
+    console.log(
+      kleur.red('✗ At least one critical/high-severity detection fired. Exiting with code 1.'),
+    );
     process.exit(1);
   }
-  console.log(kleur.green('✓ No high-severity failures.'));
+  if (applyFailureFound) {
+    console.log(
+      kleur.red('✗ A requested fix was missing, failed, or rolled back. Exiting with code 1.'),
+    );
+    process.exit(1);
+  }
+  console.log(kleur.green('✓ No critical/high-severity failures.'));
 }
 
 async function collectTrajectoryFiles(target: string): Promise<string[]> {
@@ -524,7 +540,7 @@ async function findTrajectoryFiles(root: string, maxDepth: number): Promise<stri
 type Detection = AnalyzeResponse['diagnosis']['all_detections'][number];
 
 function severityColor(severity: string): (value: string) => string {
-  if (severity === 'high') return kleur.red;
+  if (severity === 'critical' || severity === 'high') return kleur.red;
   if (severity === 'medium') return kleur.yellow;
   return kleur.cyan;
 }
@@ -567,7 +583,7 @@ function renderTrajectorySummary(label: string, data: AnalyzeResponse): void {
     `  ${kleur.yellow('!')} ${d.failure_count} detection(s) across ${d.detectors_run.length} detector(s)`,
   );
   const grouped = groupBySeverity(d.all_detections);
-  for (const severity of ['high', 'medium', 'low']) {
+  for (const severity of ['critical', 'high', 'medium', 'low']) {
     renderSeverityGroup(severity, grouped.get(severity) ?? []);
   }
 

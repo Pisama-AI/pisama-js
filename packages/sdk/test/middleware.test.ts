@@ -13,7 +13,7 @@ interface CapturedRequest {
   headers: Record<string, string>;
 }
 
-function captureExporter() {
+function captureExporter(maxBatchSize = 1) {
   const captured: CapturedRequest[] = [];
   const fetchImpl = (async (
     input: unknown,
@@ -37,7 +37,7 @@ function captureExporter() {
     endpoint: 'http://test/api/v1/traces/ingest',
     fetchImpl,
     flushIntervalMs: 5,
-    maxBatchSize: 1,
+    maxBatchSize,
   });
   return { captured, exporter };
 }
@@ -293,4 +293,100 @@ test('middleware fails closed when no API key or custom exporter is configured',
     if (originalKey === undefined) delete process.env.PISAMA_API_KEY;
     else process.env.PISAMA_API_KEY = originalKey;
   }
+});
+
+test('error telemetry applies each configured privacy mode before OTLP serialization', async () => {
+  const email = 'private.person@example.com';
+  const openAiKey = `sk-proj-${'x'.repeat(32)}_suffix`;
+  const githubKey = `github_pat_${'y'.repeat(32)}_suffix`;
+  const originalMessage = `failure for ${email} using ${openAiKey}`;
+  const originalName = `ProviderError-${githubKey}`;
+
+  for (const mode of ['standard', 'metadata-only', 'off'] as const) {
+    const bodies: unknown[] = [];
+    const exporter = new TraceExporter({
+      apiKey: 'pisama_error_privacy_test_key',
+      projectId: 'ws_error_privacy',
+      endpoint: 'https://api.test/api/v1/traces/ingest',
+      maxBatchSize: 32,
+      fetchImpl: (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+        if (String(input).endsWith('/api/v1/auth/token')) return tokenResponse();
+        bodies.push(JSON.parse(String(init.body)));
+        return Response.json({ accepted: 1 }, { status: 202 });
+      }) as typeof fetch,
+    });
+    const middleware = pisamaMiddleware({ exporter, redact: mode, eager: true }) as unknown as {
+      wrapGenerate: (args: {
+        doGenerate: () => Promise<never>;
+        params: { prompt: string };
+        model: { modelId: string };
+      }) => Promise<unknown>;
+    };
+    const providerError = new Error(originalMessage);
+    providerError.name = originalName;
+
+    await assert.rejects(() =>
+      middleware.wrapGenerate({
+        doGenerate: async () => {
+          throw providerError;
+        },
+        params: { prompt: `debug ${email}` },
+        model: { modelId: 'privacy-model' },
+      }),
+    );
+
+    assert.equal(bodies.length, 1);
+    const serialized = JSON.stringify(bodies[0]);
+    if (mode === 'off') {
+      assert.match(serialized, /private\.person@example\.com/);
+      assert.ok(serialized.includes(openAiKey));
+      assert.ok(serialized.includes(githubKey));
+    } else {
+      assert.doesNotMatch(serialized, /private\.person@example\.com/);
+      assert.ok(!serialized.includes(openAiKey));
+      assert.ok(!serialized.includes(githubKey));
+      if (mode === 'standard') {
+        assert.match(serialized, /\[email\]/);
+        assert.match(serialized, /\[openai-key\]/);
+        assert.match(serialized, /\[github-pat\]/);
+      } else {
+        assert.match(serialized, /\[redacted\]/);
+      }
+    }
+  }
+});
+
+test('error telemetry preserves a hostile thrown value without invoking unsafe fields', async () => {
+  const { captured, exporter } = captureExporter(32);
+  const hostile = {
+    get message(): never {
+      throw new Error('message getter must not escape');
+    },
+    name: 404,
+  };
+  const middleware = pisamaMiddleware({ exporter, redact: 'standard', eager: true }) as unknown as {
+    wrapGenerate: (args: {
+      doGenerate: () => Promise<never>;
+      params: { prompt: string };
+      model: { modelId: string };
+    }) => Promise<unknown>;
+  };
+
+  let caught: unknown;
+  try {
+    await middleware.wrapGenerate({
+      doGenerate: async () => {
+        throw hostile;
+      },
+      params: { prompt: 'Trigger the provider error.' },
+      model: { modelId: 'hostile-error-model' },
+    });
+  } catch (error) {
+    caught = error;
+  }
+
+  assert.equal(caught, hostile, 'telemetry must rethrow the original provider value');
+  assert.equal(captured.length, 1);
+  assert.equal(captured[0]!.body.events[0]!.error?.message, 'unknown');
+  assert.equal(captured[0]!.body.events[0]!.error?.name, undefined);
 });

@@ -1,0 +1,67 @@
+{
+  "name": "@whoopsie/sdk",
+  "version": "0.9.0",
+  "description": "Compatibility bridge from the retired @whoopsie/sdk name to @pisama/sdk.",
+  "type": "module",
+  "main": "./index.js",
+  "module": "./index.js",
+  "types": "./index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./index.d.ts",
+      "import": "./index.js"
+    }
+  },
+  "files": [
+    "index.js",
+    "index.d.ts",
+    "README.md",
+    "LICENSE"
+  ],
+  "sideEffects": false,
+  "scripts": {
+    "build": "node --check index.js",
+    "typecheck": "node --check index.js",
+    "test": "tsx --test test/bridge.test.ts",
+    "test:coverage": "tsx --test test/bridge.test.ts",
+    "prepack": "pnpm run build"
+  },
+  "peerDependencies": {
+    "@ai-sdk/provider": "^4.0.0",
+    "ai": "^7.0.0"
+  },
+  "peerDependenciesMeta": {
+    "@ai-sdk/provider": {
+      "optional": true
+    }
+  },
+  "dependencies": {
+    "@pisama/sdk": "workspace:0.10.2"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
+  },
+  "keywords": [
+    "ai",
+    "agent",
+    "observability",
+    "vercel",
+    "ai-sdk",
+    "failure-detection",
+    "tracing"
+  ],
+  "license": "MIT",
+  "homepage": "https://pisama.ai",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Pisama-AI/pisama-js",
+    "directory": "packages/whoopsie-sdk"
+  },
+  "bugs": {
+    "url": "https://github.com/Pisama-AI/pisama-js/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
+  }
+}

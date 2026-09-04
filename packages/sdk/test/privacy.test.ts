@@ -44,9 +44,11 @@ test('standard redaction removes supported secret and identity patterns', () => 
     '4111 1111 1111 1111',
     'eyJabcdefghijk.abcdefghijk.abcdefghijk',
     `sk-${'a'.repeat(24)}`,
+    `sk-proj-${'p'.repeat(32)}_suffix`,
     `sk-ant-${'b'.repeat(24)}`,
     'AKIA1234567890ABCDEF',
     `ghp_${'c'.repeat(36)}`,
+    `github_pat_${'d'.repeat(32)}_token`,
     'xoxb-1234567890-token',
   ].join(' ');
 
@@ -66,6 +68,7 @@ test('standard redaction removes supported secret and identity patterns', () => 
   ]) {
     assert.match(redacted, new RegExp(`\\${replacement}`));
   }
+  assert.doesNotMatch(redacted, /sk-proj-|github_pat_/);
 });
 
 test('aggressive and object redaction preserve structure without leaking values', () => {

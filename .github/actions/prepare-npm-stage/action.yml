@@ -1,0 +1,111 @@
+name: Prepare one npm staged-publish artifact
+description: Build, verify, pack, hash, and upload exactly one package artifact.
+
+inputs:
+  package-name:
+    required: true
+    description: Exact scoped npm package name.
+  package-dir:
+    required: true
+    description: Canonical repository directory for the package.
+  artifact-stem:
+    required: true
+    description: npm pack filename stem without version.
+  version:
+    required: true
+    description: Exact immutable package version.
+  expected-sha256:
+    required: true
+    description: Independently reviewed lowercase SHA-256 of the exact tarball.
+  git-tag:
+    required: true
+    description: Existing immutable tag selected by the dispatch.
+  tag-prefix:
+    required: true
+    description: Package-specific tag prefix.
+  artifact-name:
+    required: true
+    description: Unique Actions artifact name shared with the staging job.
+
+runs:
+  using: composite
+  steps:
+    - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
+    - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      with:
+        node-version: 22.14.0
+        package-manager-cache: false
+    - name: Verify immutable source identity
+      shell: bash
+      env:
+        PACKAGE_NAME: ${{ inputs.package-name }}
+        PACKAGE_DIR: ${{ inputs.package-dir }}
+        RELEASE_VERSION: ${{ inputs.version }}
+        RELEASE_TAG: ${{ inputs.git-tag }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+      run: |
+        set -euo pipefail
+        test "$RELEASE_TAG" = "$TAG_PREFIX$RELEASE_VERSION"
+        test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+        git merge-base --is-ancestor HEAD origin/main
+        node - "$PACKAGE_DIR/package.json" "$PACKAGE_NAME" "$RELEASE_VERSION" "$PACKAGE_DIR" <<'NODE'
+        const { readFileSync } = require('node:fs');
+        const [manifestPath, expectedName, expectedVersion, expectedDirectory] = process.argv.slice(2);
+        const manifest = JSON.parse(readFileSync(manifestPath, 'utf8'));
+        if (manifest.name !== expectedName || manifest.version !== expectedVersion) {
+          throw new Error(`manifest identity mismatch: ${manifest.name}@${manifest.version}`);
+        }
+        if (
+          manifest.repository?.url !== 'https://github.com/Pisama-AI/pisama-js' ||
+          manifest.repository?.directory !== expectedDirectory
+        ) {
+          throw new Error('manifest does not identify its exact public canonical source directory');
+        }
+        if (
+          manifest.publishConfig?.access !== 'public' ||
+          manifest.publishConfig?.registry !== 'https://registry.npmjs.org'
+        ) {
+          throw new Error('manifest must force public npm access through the official registry');
+        }
+        NODE
+    - name: Run canonical release gates
+      shell: bash
+      run: |
+        set -euo pipefail
+        pnpm install --frozen-lockfile
+        pnpm lint
+        pnpm format:check
+        pnpm typecheck
+        pnpm test:coverage
+        pnpm audit:production
+        pnpm audit:bundle-inputs
+        AUDIT_PACKED_CONSUMER=1 ./scripts/verify-packed-consumer.sh "$RUNNER_TEMP/all-release"
+    - name: Select and hash the one staged artifact
+      shell: bash
+      env:
+        ARTIFACT_STEM: ${{ inputs.artifact-stem }}
+        RELEASE_VERSION: ${{ inputs.version }}
+        EXPECTED_SHA256: ${{ inputs.expected-sha256 }}
+      run: |
+        set -euo pipefail
+        [[ "$EXPECTED_SHA256" =~ ^[0-9a-f]{64}$ ]]
+        source_artifact="$RUNNER_TEMP/all-release/$ARTIFACT_STEM-$RELEASE_VERSION.tgz"
+        test -f "$source_artifact"
+        mkdir -p "$RUNNER_TEMP/stage-target"
+        install -m 0644 "$source_artifact" "$RUNNER_TEMP/stage-target/"
+        (
+          cd "$RUNNER_TEMP/stage-target"
+          actual_sha256=$(sha256sum "$ARTIFACT_STEM-$RELEASE_VERSION.tgz" | awk '{print $1}')
+          test "$actual_sha256" = "$EXPECTED_SHA256"
+          sha256sum "$ARTIFACT_STEM-$RELEASE_VERSION.tgz" > SHA256SUMS
+          sha256sum --check SHA256SUMS
+        )
+        test "$(find "$RUNNER_TEMP/stage-target" -maxdepth 1 -name '*.tgz' -type f | wc -l | tr -d ' ')" = 1
+    - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+      with:
+        name: ${{ inputs.artifact-name }}
+        path: |
+          ${{ runner.temp }}/stage-target/*.tgz
+          ${{ runner.temp }}/stage-target/SHA256SUMS
+        if-no-files-found: error
+        retention-days: 30

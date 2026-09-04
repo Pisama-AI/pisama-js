@@ -293,3 +293,75 @@ test('SDK fails closed without an API key', async () => {
     else process.env.PISAMA_API_KEY = original;
   }
 });
+
+test('SDK bounds token exchange and eager flush latency even when fetch ignores abort', async () => {
+  const exporter = new TraceExporter({
+    apiKey: 'pisama_timeout_test_key',
+    endpoint: 'https://api.test/api/v1/traces/ingest',
+    timeoutMs: 20,
+    fetchImpl: (() => new Promise<Response>(() => {})) as typeof fetch,
+  });
+  const previousSilent = process.env.PISAMA_SILENT;
+  process.env.PISAMA_SILENT = '1';
+  try {
+    exporter.enqueue(event());
+    const started = Date.now();
+    await exporter.flush();
+    assert.ok(Date.now() - started < 1_000, 'flush must return after its configured budget');
+  } finally {
+    if (previousSilent === undefined) delete process.env.PISAMA_SILENT;
+    else process.env.PISAMA_SILENT = previousSilent;
+  }
+});
+
+test('SDK bounds a token response body that never finishes', async () => {
+  const exporter = new TraceExporter({
+    apiKey: 'pisama_timeout_test_key',
+    endpoint: 'https://api.test/api/v1/traces/ingest',
+    timeoutMs: 20,
+    fetchImpl: (async () =>
+      new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 200,
+        headers: { 'content-type': 'application/json' },
+      })) as typeof fetch,
+  });
+  const auth = exporter as unknown as { accessToken: () => Promise<string> };
+  const started = Date.now();
+  await assert.rejects(() => auth.accessToken(), /timed out after 20ms/);
+  assert.ok(Date.now() - started < 1_000, 'exchange must include token-body time in its budget');
+});
+
+test('SDK bounds an ingest response body that never finishes', async () => {
+  const exporter = new TraceExporter({
+    apiKey: 'pisama_timeout_test_key',
+    endpoint: 'https://api.test/api/v1/traces/ingest',
+    timeoutMs: 20,
+    fetchImpl: (async (input: RequestInfo | URL) => {
+      if (String(input).endsWith('/api/v1/auth/token')) {
+        return Response.json({ access_token: scopedToken('ingest', 1) });
+      }
+      return new Response(new ReadableStream<Uint8Array>({ start() {} }), {
+        status: 202,
+        headers: { 'content-type': 'application/json' },
+      });
+    }) as typeof fetch,
+  });
+  const sender = exporter as unknown as {
+    send: (body: string, requestId: string) => Promise<Response>;
+  };
+  const started = Date.now();
+  await assert.rejects(() => sender.send('{"batch":1}', 'request-1'), /timed out after 20ms/);
+  assert.ok(Date.now() - started < 1_000, 'send must include ingest-body time in its budget');
+});
+
+test('SDK validates its transport timeout', () => {
+  assert.throws(
+    () =>
+      new TraceExporter({
+        apiKey: 'pisama_timeout_test_key',
+        timeoutMs: 0,
+        fetchImpl: globalThis.fetch,
+      }),
+    /timeoutMs must be a positive finite number/,
+  );
+});

@@ -10,8 +10,7 @@
 // `{events:[...]}` to the removed anonymous spans route and read project traces, with
 // a project id copied from pisama.ai/install. That entire flow was removed
 // server-side in backend commit 517f69bc1 ("Pisama is authenticated-only
-// again"): both routes now 404, /install is a login wall, and /live/{projectId}
-// no longer exists. The command is therefore rebuilt on the authenticated
+// again"). The command is therefore rebuilt on the authenticated
 // contract: the raw API key is exchanged for narrowly scoped JWTs at
 // /api/v1/auth/token, the trace is sent as OTLP to /api/v1/traces/ingest with
 // an ingest token, and it is read back with a separate read token from

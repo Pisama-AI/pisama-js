@@ -43,5 +43,9 @@
   "homepage": "https://pisama.ai",
   "bugs": {
     "url": "https://github.com/Pisama-AI/pisama-js/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   }
 }

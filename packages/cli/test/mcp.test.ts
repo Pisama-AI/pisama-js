@@ -296,7 +296,7 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
       if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
         traceCalls += 1;
         assert.equal(url.searchParams.get('page'), '1');
-        assert.equal(url.searchParams.get('per_page'), '5');
+        assert.equal(url.searchParams.get('per_page'), '100');
         if (traceCalls === 1) {
           respond(response, 401, { detail: 'expired' });
           return;
@@ -325,6 +325,7 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
       }
       if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
         assert.equal(url.searchParams.get('trace_id'), traceId);
+        assert.equal(url.searchParams.get('page'), '1');
         respond(response, 200, {
           items: [
             {
@@ -394,7 +395,7 @@ test('mcp: get_trace uses exact authenticated trace, states, and detections rout
           session_id: 'session-detail',
           framework: 'langgraph',
           status: 'completed',
-          detection_status: 'complete',
+          detection_status: 'partial',
           total_tokens: 10,
           total_cost_cents: 1,
           created_at: '2026-09-04T12:00:00Z',
@@ -417,6 +418,8 @@ test('mcp: get_trace uses exact authenticated trace, states, and detections rout
             token_count: 10,
             latency_ms: 1000,
             created_at: '2026-09-04T12:00:00Z',
+            span_kind: 'internal',
+            span_status: 'ok',
           },
         ]);
         return;
@@ -440,22 +443,479 @@ test('mcp: get_trace uses exact authenticated trace, states, and detections rout
       );
       const result = response.result as {
         isError?: boolean;
+        content?: { text?: string }[];
         structuredContent?: {
           event?: {
+            framework?: string;
+            model?: string;
+            totalTokens?: number;
+            outputTokens?: number;
+            traceStatus?: string;
+            finishReason?: string;
+            detectionStatus?: string;
             prompt?: string;
             completion?: string;
             toolCalls?: unknown[];
+            stateMetadata?: Array<{
+              stateId?: string;
+              sequenceNumber?: number;
+              agentId?: string;
+              tokenCount?: number;
+              latencyMs?: number;
+              spanKind?: string;
+              spanStatus?: string;
+            }>;
             metadata?: unknown;
           };
+          visibleDetectionCount?: number;
         };
       };
       assert.equal(result.isError, false, JSON.stringify(response));
-      assert.equal(result.structuredContent?.event?.prompt, 'Diagnose this run.');
-      assert.equal(result.structuredContent?.event?.completion, 'The run looped.');
-      assert.deepEqual(result.structuredContent?.event?.toolCalls, []);
+      assert.ok(result.structuredContent);
+      assert.ok(result.structuredContent.event);
+      const event = result.structuredContent.event;
+      assert.equal(event.framework, 'langgraph');
+      assert.equal(event.model, undefined);
+      assert.equal(event.totalTokens, 10);
+      assert.equal(event.outputTokens, undefined);
+      assert.equal(event.traceStatus, 'completed');
+      assert.equal(event.finishReason, undefined);
+      assert.equal(event.detectionStatus, 'partial');
+      assert.equal(event.prompt, 'Diagnose this run.');
+      assert.equal(event.completion, 'The run looped.');
+      assert.deepEqual(event.toolCalls, []);
+      assert.deepEqual(event.stateMetadata, [
+        {
+          stateId: '33333333-3333-4333-8333-333333333333',
+          sequenceNumber: 0,
+          agentId: 'agent',
+          tokenCount: 10,
+          latencyMs: 1000,
+          createdAt: '2026-09-04T12:00:00Z',
+          spanKind: 'internal',
+          spanStatus: 'ok',
+        },
+      ]);
+      assert.equal(result.structuredContent.visibleDetectionCount, 0);
+      const text = result.content?.[0]?.text ?? '';
+      assert.match(text, /framework: langgraph/);
+      assert.match(text, /tokens: total=10/);
+      assert.match(text, /traceStatus: completed/);
+      assert.match(text, /detectionStatus: partial/);
+      assert.doesNotMatch(text, /^model:/m);
+      assert.doesNotMatch(text, /^finishReason:/m);
     },
   );
   assert.equal(seenPaths.length, 3);
+});
+
+test('mcp: recent failures scan later trace pages and omit hidden-only detections', async () => {
+  const hiddenTraceId = 'hidden-trace';
+  const visibleTraceId = 'visible-trace';
+  const tracePages: number[] = [];
+
+  await withHttpServer(
+    async (request, response) => {
+      const url = new URL(request.url ?? '/', 'http://test');
+      if (url.pathname === '/api/v1/auth/token') {
+        respond(response, 200, { access_token: jwt('read', 1) });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
+        const page = Number(url.searchParams.get('page'));
+        tracePages.push(page);
+        assert.equal(url.searchParams.get('per_page'), '100');
+        if (page === 1) {
+          respond(response, 200, {
+            traces: Array.from({ length: 100 }, (_, index) => ({
+              id: index === 0 ? hiddenTraceId : `clean-${index}`,
+              framework: 'langgraph',
+              status: 'completed',
+              detection_status: 'complete',
+              total_tokens: index,
+              created_at: '2026-09-04T12:00:00Z',
+              detection_count: index === 0 ? 1 : 0,
+            })),
+            total: 101,
+            page: 1,
+            per_page: 100,
+          });
+          return;
+        }
+        respond(response, 200, {
+          traces: [
+            {
+              id: visibleTraceId,
+              framework: 'crewai',
+              status: 'failed',
+              detection_status: 'complete',
+              total_tokens: 21,
+              created_at: '2026-09-04T11:00:00Z',
+              detection_count: 1,
+            },
+          ],
+          total: 101,
+          page: 2,
+          per_page: 100,
+        });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
+        const traceId = url.searchParams.get('trace_id');
+        assert.equal(url.searchParams.get('page'), '1');
+        if (traceId === hiddenTraceId) {
+          respond(response, 200, { items: [], total: 0, page: 1, per_page: 100 });
+        } else {
+          assert.equal(traceId, visibleTraceId);
+          respond(response, 200, {
+            items: [
+              {
+                detection_type: 'loop',
+                confidence: 90,
+                explanation: 'Visible loop.',
+              },
+            ],
+            total: 1,
+            page: 1,
+            per_page: 100,
+          });
+        }
+        return;
+      }
+      respond(response, 404, { detail: 'not found' });
+    },
+    async (baseUrl) => {
+      const response = await rpcCall(
+        {
+          id: 22,
+          method: 'tools/call',
+          params: { name: 'get_recent_failures', arguments: { limit: 1 } },
+        },
+        5000,
+        { apiKey: 'pisama_key', baseUrl },
+      );
+      const result = response.result as {
+        isError?: boolean;
+        content: { text: string }[];
+        structuredContent?: {
+          count?: number;
+          scannedTraceCount?: number;
+          totalTraceCount?: number;
+          scanComplete?: boolean;
+          resultsTruncated?: boolean;
+          events?: Array<{ event?: { traceId?: string }; hits?: unknown[] }>;
+        };
+      };
+      assert.equal(result.isError, false, JSON.stringify(response));
+      assert.equal(result.structuredContent?.count, 1);
+      assert.equal(result.structuredContent?.scannedTraceCount, 101);
+      assert.equal(result.structuredContent?.totalTraceCount, 101);
+      assert.equal(result.structuredContent?.scanComplete, true);
+      assert.equal(result.structuredContent?.resultsTruncated, false);
+      assert.equal(result.structuredContent?.events?.[0]?.event?.traceId, visibleTraceId);
+      assert.equal(result.structuredContent?.events?.[0]?.hits?.length, 1);
+      assert.doesNotMatch(result.content[0].text, /\(clean\)/);
+    },
+  );
+
+  assert.deepEqual(tracePages, [1, 2]);
+});
+
+test('mcp: a full trace page without total continues until a short page', async () => {
+  const visibleTraceId = 'visible-after-unknown-total';
+  const tracePages: number[] = [];
+  await withHttpServer(
+    async (request, response) => {
+      const url = new URL(request.url ?? '/', 'http://test');
+      if (url.pathname === '/api/v1/auth/token') {
+        respond(response, 200, { access_token: jwt('read', 1) });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
+        const page = Number(url.searchParams.get('page'));
+        tracePages.push(page);
+        if (page === 1) {
+          respond(response, 200, {
+            traces: Array.from({ length: 100 }, (_, index) => ({
+              id: `unknown-total-clean-${index}`,
+              status: 'completed',
+              detection_status: 'complete',
+              created_at: '2026-09-04T12:00:00Z',
+              detection_count: 0,
+            })),
+            page: 1,
+            per_page: 100,
+          });
+          return;
+        }
+        respond(response, 200, {
+          traces: [
+            {
+              id: visibleTraceId,
+              status: 'failed',
+              detection_status: 'complete',
+              created_at: '2026-09-04T11:00:00Z',
+              detection_count: 1,
+            },
+          ],
+          page: 2,
+          per_page: 100,
+        });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
+        respond(response, 200, {
+          items: [
+            {
+              detection_type: 'coordination',
+              confidence: 90,
+              explanation: 'Visible later-page failure.',
+            },
+          ],
+          page: 1,
+          per_page: 100,
+        });
+        return;
+      }
+      respond(response, 404, { detail: 'not found' });
+    },
+    async (baseUrl) => {
+      const response = await rpcCall(
+        {
+          id: 25,
+          method: 'tools/call',
+          params: { name: 'get_recent_failures', arguments: { limit: 1 } },
+        },
+        6000,
+        { apiKey: 'pisama_key', baseUrl },
+      );
+      const result = response.result as {
+        isError?: boolean;
+        structuredContent?: {
+          scannedTraceCount?: number;
+          totalTraceCount?: number;
+          scanComplete?: boolean;
+          events?: Array<{ event?: { traceId?: string } }>;
+        };
+      };
+      assert.equal(result.isError, false, JSON.stringify(response));
+      assert.equal(result.structuredContent?.scannedTraceCount, 101);
+      assert.equal(result.structuredContent?.totalTraceCount, 101);
+      assert.equal(result.structuredContent?.scanComplete, true);
+      assert.equal(result.structuredContent?.events?.[0]?.event?.traceId, visibleTraceId);
+    },
+  );
+  assert.deepEqual(tracePages, [1, 2]);
+});
+
+test('mcp: malformed trace and detection pages fail closed', async () => {
+  const cases: Array<{ name: string; tracePage: unknown; detectionPage?: unknown }> = [
+    {
+      name: 'non-array traces',
+      tracePage: { traces: null, total: 1 },
+    },
+    {
+      name: 'invalid trace total',
+      tracePage: { traces: [], total: '1' },
+    },
+    {
+      name: 'non-array detections',
+      tracePage: {
+        traces: [
+          {
+            id: 'malformed-detection-page',
+            status: 'failed',
+            detection_status: 'complete',
+            created_at: '2026-09-04T12:00:00Z',
+            detection_count: 1,
+          },
+        ],
+        total: 1,
+      },
+      detectionPage: { items: null, total: 1 },
+    },
+    {
+      name: 'invalid detection total',
+      tracePage: {
+        traces: [
+          {
+            id: 'invalid-detection-total',
+            status: 'failed',
+            detection_status: 'complete',
+            created_at: '2026-09-04T12:00:00Z',
+            detection_count: 1,
+          },
+        ],
+        total: 1,
+      },
+      detectionPage: { items: [], total: -1 },
+    },
+  ];
+
+  for (const entry of cases) {
+    await withHttpServer(
+      async (request, response) => {
+        const url = new URL(request.url ?? '/', 'http://test');
+        if (url.pathname === '/api/v1/auth/token') {
+          respond(response, 200, { access_token: jwt('read', 1) });
+          return;
+        }
+        if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
+          respond(response, 200, entry.tracePage);
+          return;
+        }
+        if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
+          respond(response, 200, entry.detectionPage);
+          return;
+        }
+        respond(response, 404, { detail: 'not found' });
+      },
+      async (baseUrl) => {
+        const response = await rpcCall(
+          {
+            id: 26,
+            method: 'tools/call',
+            params: { name: 'get_recent_failures', arguments: { limit: 1 } },
+          },
+          5000,
+          { apiKey: 'pisama_key', baseUrl },
+        );
+        const result = response.result as {
+          isError?: boolean;
+          content?: Array<{ text?: string }>;
+          structuredContent?: { error?: { code?: string } };
+        };
+        assert.equal(result.isError, true, `${entry.name}: ${JSON.stringify(response)}`);
+        assert.equal(result.structuredContent?.error?.code, 'upstream_error');
+        assert.match(result.content?.[0]?.text ?? '', /invalid response/i);
+      },
+    );
+  }
+});
+
+test('mcp: a trace with only filtered detections is never rendered as clean', async () => {
+  const traceId = 'hidden-only-trace';
+  await withHttpServer(
+    async (request, response) => {
+      const url = new URL(request.url ?? '/', 'http://test');
+      if (url.pathname === '/api/v1/auth/token') {
+        respond(response, 200, { access_token: jwt('read', 1) });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
+        respond(response, 200, {
+          traces: [
+            {
+              id: traceId,
+              framework: 'n8n',
+              status: 'completed',
+              detection_status: 'complete',
+              created_at: '2026-09-04T12:00:00Z',
+              detection_count: 2,
+            },
+          ],
+          total: 1,
+          page: 1,
+          per_page: 1,
+        });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
+        respond(response, 200, { items: [], total: 0, page: 1, per_page: 100 });
+        return;
+      }
+      respond(response, 404, { detail: 'not found' });
+    },
+    async (baseUrl) => {
+      const response = await rpcCall(
+        {
+          id: 23,
+          method: 'tools/call',
+          params: { name: 'get_recent_traces', arguments: { limit: 1 } },
+        },
+        5000,
+        { apiKey: 'pisama_key', baseUrl },
+      );
+      const result = response.result as { isError?: boolean; content: { text: string }[] };
+      assert.equal(result.isError, false, JSON.stringify(response));
+      assert.match(result.content[0].text, /\(no visible detector hits\)/);
+      assert.doesNotMatch(result.content[0].text, /\(clean\)/);
+    },
+  );
+});
+
+test('mcp: exact trace paginates visible detections and marks the response cap', async () => {
+  const traceId = '44444444-4444-4444-8444-444444444444';
+  const detectionPages: number[] = [];
+  await withHttpServer(
+    async (request, response) => {
+      const url = new URL(request.url ?? '/', 'http://test');
+      if (url.pathname === '/api/v1/auth/token') {
+        respond(response, 200, { access_token: jwt('read', 1) });
+        return;
+      }
+      if (url.pathname.endsWith(`/traces/${traceId}`)) {
+        respond(response, 200, {
+          id: traceId,
+          framework: 'openai-agents',
+          status: 'completed',
+          detection_status: 'complete',
+          created_at: '2026-09-04T12:00:00Z',
+          detection_count: 501,
+          state_count: 0,
+        });
+        return;
+      }
+      if (url.pathname.endsWith(`/traces/${traceId}/states`)) {
+        respond(response, 200, []);
+        return;
+      }
+      if (url.pathname.endsWith('/detections')) {
+        const page = Number(url.searchParams.get('page'));
+        detectionPages.push(page);
+        assert.equal(url.searchParams.get('per_page'), '100');
+        respond(response, 200, {
+          items: Array.from({ length: 100 }, (_, index) => ({
+            detection_type: `detector-${page}-${index}`,
+            confidence: 80,
+            explanation: `Detection ${page}-${index}`,
+          })),
+          total: 501,
+          page,
+          per_page: 100,
+        });
+        return;
+      }
+      respond(response, 404, { detail: 'not found' });
+    },
+    async (baseUrl) => {
+      const response = await rpcCall(
+        {
+          id: 24,
+          method: 'tools/call',
+          params: { name: 'get_trace', arguments: { traceId } },
+        },
+        8000,
+        { apiKey: 'pisama_key', baseUrl },
+      );
+      const result = response.result as {
+        isError?: boolean;
+        content: { text: string }[];
+        structuredContent?: {
+          hits?: unknown[];
+          visibleDetectionCount?: number;
+          hitsTruncated?: boolean;
+        };
+      };
+      assert.equal(result.isError, false, JSON.stringify(response));
+      assert.equal(result.structuredContent?.hits?.length, 500);
+      assert.equal(result.structuredContent?.visibleDetectionCount, 501);
+      assert.equal(result.structuredContent?.hitsTruncated, true);
+      assert.match(result.content[0].text, /visibleDetectorHits: 501 \(showing first 500\)/);
+    },
+  );
+
+  assert.deepEqual(detectionPages, [1, 2, 3, 4, 5]);
 });
 
 // ---------------------------------------------------------------------------
@@ -543,6 +1003,8 @@ test('mcp: prompts/get for investigate_recent_failures returns user message refe
     'body should reference get_recent_failures tool',
   );
   assert.ok(msg.content.text.includes('24'), 'default lookback of 24 hours should appear in body');
+  assert.match(msg.content.text, /bounded sample/);
+  assert.match(msg.content.text, /do not claim a tenant-wide total/);
 });
 
 test('mcp: prompts/get for investigate_recent_failures honors lookback_hours + framework args', async () => {
@@ -615,6 +1077,11 @@ test('mcp: prompts/get for daily_quality_report renders without tenant', async (
   assert.ok(text.includes('get_recent_traces'));
   assert.ok(text.includes('get_recent_failures'));
   assert.ok(text.includes('24 hours'));
+  assert.match(text, /sample recent activity/);
+  assert.match(text, /Proposed-fix coverage/);
+  assert.match(text, /not evidence that a fix was applied or healed/);
+  assert.doesNotMatch(text, /healing-success rate/i);
+  assert.doesNotMatch(text, /count overall detection volume/i);
 });
 
 test('mcp: tool call propagates errors when base url is unreachable', async () => {

@@ -10,7 +10,7 @@
   "scripts": {
     "build": "pnpm -r build",
     "typecheck": "pnpm build && pnpm -r typecheck",
-    "lint": "eslint packages/sdk/src packages/detectors/src packages/cli/src",
+    "lint": "eslint packages/sdk/src packages/detectors/src packages/cli/src packages/whoopsie-cli/src",
     "format:check": "prettier --check \"packages/**/*.{ts,tsx}\"",
     "test": "pnpm build && pnpm -r test",
     "test:coverage": "pnpm build && pnpm -r test:coverage",
@@ -19,7 +19,12 @@
   },
   "pnpm": {
     "overrides": {
-      "@hono/node-server": "2.0.11"
+      "@hono/node-server": "2.0.11",
+      "brace-expansion": "5.0.9",
+      "fast-uri": "3.1.6",
+      "hono": "4.12.34",
+      "ip-address": "10.3.1",
+      "qs": "6.16.0"
     }
   },
   "devDependencies": {

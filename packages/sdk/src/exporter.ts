@@ -12,10 +12,13 @@ export interface ExporterOptions {
   projectId?: string;
   flushIntervalMs?: number;
   maxBatchSize?: number;
+  /** Total transport budget for one flush, including token exchange and a 401 retry. */
+  timeoutMs?: number;
   fetchImpl?: typeof fetch;
 }
 
 const HOSTED_ENDPOINT = 'https://api.pisama.ai/api/v1/traces/ingest';
+const DEFAULT_TIMEOUT_MS = 10_000;
 
 interface IngestResponseBody {
   accepted?: number;
@@ -55,6 +58,14 @@ function defaultTokenEndpoint(endpoint: string): string {
   } catch {
     return '/api/v1/auth/token';
   }
+}
+
+function normaliseTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_TIMEOUT_MS;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new RangeError('timeoutMs must be a positive finite number');
+  }
+  return Math.max(1, Math.floor(timeout));
 }
 
 function encodeValue(value: string | number | boolean): OtlpAnyValue {
@@ -164,6 +175,7 @@ export class TraceExporter {
   private readonly projectId: string;
   private readonly flushIntervalMs: number;
   private readonly maxBatchSize: number;
+  private readonly timeoutMs: number;
   private readonly fetchImpl: typeof fetch;
   private jwt: string | undefined;
   private tokenExchange: Promise<string> | undefined;
@@ -179,6 +191,7 @@ export class TraceExporter {
       '@pisama/sdk';
     this.flushIntervalMs = opts.flushIntervalMs ?? 1000;
     this.maxBatchSize = opts.maxBatchSize ?? 32;
+    this.timeoutMs = normaliseTimeout(opts.timeoutMs);
     this.fetchImpl = opts.fetchImpl ?? globalThis.fetch.bind(globalThis);
   }
 
@@ -246,10 +259,10 @@ export class TraceExporter {
     return this.buffer.splice(0, this.buffer.length);
   }
 
-  private async accessToken(): Promise<string> {
+  private async accessToken(deadline = Date.now() + this.timeoutMs): Promise<string> {
     if (this.jwt) return this.jwt;
     if (this.tokenExchange) return this.tokenExchange;
-    this.tokenExchange = this.exchangeToken();
+    this.tokenExchange = this.exchangeToken(deadline);
     try {
       this.jwt = await this.tokenExchange;
       return this.jwt;
@@ -258,13 +271,17 @@ export class TraceExporter {
     }
   }
 
-  private async exchangeToken(): Promise<string> {
-    const res = await this.fetchImpl(this.tokenEndpoint, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json' },
-      body: JSON.stringify({ api_key: this.apiKey, scope: 'ingest' }),
-      redirect: 'error',
-    });
+  private async exchangeToken(deadline: number): Promise<string> {
+    const res = await this.fetchWithDeadline(
+      this.tokenEndpoint,
+      {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ api_key: this.apiKey, scope: 'ingest' }),
+        redirect: 'error',
+      },
+      deadline,
+    );
     if (!res.ok) {
       throw new Error(`API key exchange returned HTTP ${res.status}`);
     }
@@ -277,33 +294,78 @@ export class TraceExporter {
   }
 
   private async send(body: string, requestId: string): Promise<Response> {
-    const token = await this.accessToken();
-    let res = await this.sendOnce(body, requestId, token);
+    const deadline = Date.now() + this.timeoutMs;
+    const token = await this.accessToken(deadline);
+    let res = await this.sendOnce(body, requestId, token, deadline);
     if (res.status === 401) {
       // JWT expired mid-run. Invalidate only the token this request used: if a
       // concurrent flush already refreshed it, reuse the newer cached token.
       if (this.jwt === token) this.jwt = undefined;
-      res = await this.sendOnce(body, requestId, await this.accessToken());
+      res = await this.sendOnce(body, requestId, await this.accessToken(deadline), deadline);
     }
     return res;
   }
 
-  private sendOnce(body: string, requestId: string, token: string): Promise<Response> {
-    return this.fetchImpl(this.endpoint, {
-      method: 'POST',
-      headers: {
-        'content-type': 'application/json',
-        authorization: `Bearer ${token}`,
-        'x-request-id': requestId,
-        'x-pisama-project-id': this.projectId,
-        'x-pisama-client-id': getClientId(),
-        'x-pisama-sdk-version': SDK_VERSION,
-        'x-pisama-runtime': detectRuntime(),
+  private sendOnce(
+    body: string,
+    requestId: string,
+    token: string,
+    deadline: number,
+  ): Promise<Response> {
+    return this.fetchWithDeadline(
+      this.endpoint,
+      {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          authorization: `Bearer ${token}`,
+          'x-request-id': requestId,
+          'x-pisama-project-id': this.projectId,
+          'x-pisama-client-id': getClientId(),
+          'x-pisama-sdk-version': SDK_VERSION,
+          'x-pisama-runtime': detectRuntime(),
+        },
+        body,
+        keepalive: true,
+        redirect: 'error',
       },
-      body,
-      keepalive: true,
-      redirect: 'error',
+      deadline,
+    );
+  }
+
+  private async fetchWithDeadline(
+    input: RequestInfo | URL,
+    init: RequestInit,
+    deadline: number,
+  ): Promise<Response> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`Pisama export timed out after ${this.timeoutMs}ms`);
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller?.abort();
+        reject(new Error(`Pisama export timed out after ${this.timeoutMs}ms`));
+      }, remaining);
     });
+    try {
+      const request = (async () => {
+        const response = await this.fetchImpl(input, { ...init, signal: controller?.signal });
+        // Buffer the small JSON response while the same deadline and abort
+        // controller are still active. Resolving only at headers would let a
+        // peer hold response.json()/text() open forever after eager flush.
+        const bytes = await response.arrayBuffer();
+        return new Response(bytes.byteLength === 0 ? null : bytes, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      })();
+      return await Promise.race([request, timeout]);
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
   }
 
   private reportRejectedFlush(res: Response, droppedCount: number): void {

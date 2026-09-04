@@ -1,0 +1,73 @@
+name: Stage @whoopsie/detectors retirement on npm
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Exact @whoopsie/detectors retirement version already committed and tagged
+        required: true
+        type: string
+      expected_sha256:
+        description: Independently reviewed lowercase SHA-256 of whoopsie-detectors-<version>.tgz
+        required: true
+        type: string
+      git_tag:
+        description: Existing immutable tag (whoopsie-detectors-v<version>)
+        required: true
+        type: string
+      dist_tag:
+        description: Dist-tag applied only if the npm stage is later approved
+        required: true
+        default: migration
+        type: choice
+        options: [migration, latest]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-stage-whoopsie-detectors-${{ inputs.version }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Build and verify one immutable artifact
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.git_tag }}
+          fetch-depth: 0
+          persist-credentials: false
+      - uses: ./.github/actions/prepare-npm-stage
+        with:
+          package-name: '@whoopsie/detectors'
+          package-dir: packages/whoopsie-detectors
+          artifact-stem: whoopsie-detectors
+          version: ${{ inputs.version }}
+          expected-sha256: ${{ inputs.expected_sha256 }}
+          git-tag: ${{ inputs.git_tag }}
+          tag-prefix: whoopsie-detectors-v
+          artifact-name: npm-stage-whoopsie-detectors-${{ github.run_id }}
+
+  stage:
+    name: OIDC stage only (human 2FA approval remains separate)
+    needs: prepare
+    runs-on: ubuntu-latest
+    environment: npm-staging
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: refs/tags/${{ inputs.git_tag }}
+          persist-credentials: false
+      - uses: ./.github/actions/stage-npm-package
+        with:
+          package-name: '@whoopsie/detectors'
+          package-dir: packages/whoopsie-detectors
+          version: ${{ inputs.version }}
+          expected-sha256: ${{ inputs.expected_sha256 }}
+          dist-tag: ${{ inputs.dist_tag }}
+          artifact-name: npm-stage-whoopsie-detectors-${{ github.run_id }}

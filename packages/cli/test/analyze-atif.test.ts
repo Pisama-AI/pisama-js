@@ -89,6 +89,7 @@ test('analyze-atif --local runs @pisama/detectors on a real Harbor trajectory wi
   assert.match(out, /High token usage: 8832 tokens/);
   assert.match(out, /@pisama\/detectors/);
   assert.match(out, /2 total detection\(s\)/);
+  assert.match(out, /spans 10/);
   assert.ok(
     s.errs.every((l) => !/could not reach|HTTP \d/.test(l)),
     'local mode must never hit the network path',
@@ -279,7 +280,7 @@ test('analyze-atif (remote) happy path: posts the trajectory and exits 0 on no d
   const out = s.logs.join('\n');
   assert.match(out, /against https:\/\/test/);
   assert.match(out, /No detections/);
-  assert.match(out, /No high-severity failures/);
+  assert.match(out, /No critical\/high-severity failures/);
 });
 
 test('analyze-atif exchanges the raw key for a scoped JWT and retries exactly once on 401', async () => {
@@ -404,8 +405,41 @@ test('analyze-atif (remote) exits 1 when the backend returns a high-severity det
     s.restore();
   }
   assert.equal(s.exitCode, 1);
-  assert.ok(s.logs.some((l) => /At least one high-severity detection fired/.test(l)));
+  assert.ok(s.logs.some((l) => /At least one critical\/high-severity detection fired/.test(l)));
   assert.ok(s.logs.some((l) => /persona_drift/.test(l)));
+});
+
+test('analyze-atif (remote) renders a critical detection and exits 1', async () => {
+  const s = spy();
+  try {
+    await withMockFetch(
+      () =>
+        jsonResponse(
+          mockAnalyzeResponse({
+            detections: [
+              {
+                category: 'prompt_injection',
+                severity: 'critical',
+                confidence: 0.99,
+                title: 'critical injection',
+              },
+            ],
+          }),
+        ),
+      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+    );
+    assert.fail('expected process.exit');
+  } catch (error) {
+    assert.equal((error as Error).message, '__exit__');
+  } finally {
+    s.restore();
+  }
+
+  assert.equal(s.exitCode, 1);
+  const output = s.logs.join('\n');
+  assert.match(output, /CRITICAL/);
+  assert.match(output, /prompt_injection/);
+  assert.match(output, /At least one critical\/high-severity detection fired/);
 });
 
 test('analyze-atif (remote) fails clearly when the analyze endpoint is unreachable', async () => {
@@ -630,63 +664,103 @@ test('--apply renders a successful, non-rolled-back healing with an id-keyed suc
 test('--apply renders a rolled-back healing with an agent_id-keyed successor', async () => {
   const s = spy();
   try {
-    await withMockFetch(
-      () =>
-        jsonResponse(
-          mockAnalyzeResponse({
-            healing: {
-              success: true,
-              rolled_back: true,
-              successor_entity: { agent_id: 'agent-2' },
-            },
+    try {
+      await withMockFetch(
+        () =>
+          jsonResponse(
+            mockAnalyzeResponse({
+              healing: {
+                success: true,
+                rolled_back: true,
+                successor_entity: { agent_id: 'agent-2' },
+              },
+            }),
+          ),
+        () =>
+          analyzeAtif({
+            path: REAL_TRAJECTORY,
+            apply: true,
+            framework: 'n8n',
+            entityId: 'wf-1',
+            credentials: '{}',
+            apiKey: 'k',
+            baseUrl: 'https://test',
           }),
-        ),
-      () =>
-        analyzeAtif({
-          path: REAL_TRAJECTORY,
-          apply: true,
-          framework: 'n8n',
-          entityId: 'wf-1',
-          credentials: '{}',
-          apiKey: 'k',
-          baseUrl: 'https://test',
-        }),
-    );
-    assert.equal(s.exitCode, null);
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
   } finally {
     s.restore();
   }
+  assert.equal(s.exitCode, 1);
   const out = s.logs.join('\n');
   assert.match(out, /rolled back/);
   assert.match(out, /successor agent-2/);
+  assert.match(out, /requested fix was missing, failed, or rolled back/);
 });
 
 test('--apply renders a failed healing with its error', async () => {
   const s = spy();
   try {
-    await withMockFetch(
-      () =>
-        jsonResponse(
-          mockAnalyzeResponse({ healing: { success: false, error: 'workflow locked' } }),
-        ),
-      () =>
-        analyzeAtif({
-          path: REAL_TRAJECTORY,
-          apply: true,
-          framework: 'n8n',
-          entityId: 'wf-1',
-          credentials: '{}',
-          apiKey: 'k',
-          baseUrl: 'https://test',
-        }),
-    );
-    assert.equal(s.exitCode, null);
+    try {
+      await withMockFetch(
+        () =>
+          jsonResponse(
+            mockAnalyzeResponse({ healing: { success: false, error: 'workflow locked' } }),
+          ),
+        () =>
+          analyzeAtif({
+            path: REAL_TRAJECTORY,
+            apply: true,
+            framework: 'n8n',
+            entityId: 'wf-1',
+            credentials: '{}',
+            apiKey: 'k',
+            baseUrl: 'https://test',
+          }),
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
   } finally {
     s.restore();
   }
+  assert.equal(s.exitCode, 1);
   const out = s.logs.join('\n');
   assert.match(out, /apply failed/);
   assert.match(out, /workflow locked/);
+  assert.match(out, /requested fix was missing, failed, or rolled back/);
+});
+
+test('--apply exits 1 when the backend omits the healing result', async () => {
+  const s = spy();
+  try {
+    try {
+      await withMockFetch(
+        () => jsonResponse(mockAnalyzeResponse({ healing: null })),
+        () =>
+          analyzeAtif({
+            path: REAL_TRAJECTORY,
+            apply: true,
+            framework: 'n8n',
+            entityId: 'wf-1',
+            credentials: '{}',
+            apiKey: 'k',
+            baseUrl: 'https://test',
+          }),
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+  } finally {
+    s.restore();
+  }
+  assert.equal(s.exitCode, 1);
+  assert.match(s.logs.join('\n'), /requested fix was missing, failed, or rolled back/);
 });
 
 test('--apply is single-trajectory only', async () => {

@@ -4,12 +4,10 @@
  * Pure typed POST client. No detection logic runs in TS. Every call round-trips
  * to the Pisama backend, which owns the calibrated detectors.
  *
- * Backend endpoint reality at this prerelease stage: the backend does NOT yet
- * expose discrete `POST /api/v1/detect/{type}` routes for these multi-agent
- * detectors. The orchestrator is reachable via
- * `POST /api/v1/diagnose/why-failed`, which takes a full trace and returns all
- * supported detections. The public client exposes only categories that this
- * endpoint can return.
+ * The backend exposes one authenticated contract per supported multi-agent
+ * detector under `/api/v1/diagnose/multi-agent/{detector}`. Each accepts a raw
+ * span payload and returns only that detector's result, avoiding the full
+ * diagnosis pipeline's cross-category subsumption rules.
  */
 
 export interface MultiAgentClientOptions {
@@ -62,7 +60,7 @@ export class MultiAgentClient {
     this.projectId =
       opts.projectId ??
       (typeof process !== 'undefined' ? process.env.PISAMA_PROJECT_ID : undefined);
-    this.timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+    this.timeoutMs = normaliseTimeout(opts.timeoutMs);
     this.fetchImpl =
       opts.fetchImpl ??
       (typeof fetch !== 'undefined'
@@ -85,10 +83,11 @@ export class MultiAgentClient {
     const url = `${this.endpoint}${path.startsWith('/') ? '' : '/'}${path}`;
     const serializedBody = JSON.stringify(body);
     const requestId = createRequestId();
+    const deadline = Date.now() + this.timeoutMs;
 
     let res: Response;
     try {
-      res = await this.sendAuthenticated(url, serializedBody, requestId);
+      res = await this.sendAuthenticated(url, serializedBody, requestId, deadline);
     } catch (err) {
       if (err instanceof PisamaBackendError) throw err;
       throw new PisamaBackendError(
@@ -117,26 +116,37 @@ export class MultiAgentClient {
     return (await res.json()) as TResponse;
   }
 
-  private async sendAuthenticated(url: string, body: string, requestId: string): Promise<Response> {
+  private async sendAuthenticated(
+    url: string,
+    body: string,
+    requestId: string,
+    deadline: number,
+  ): Promise<Response> {
     const scope: TokenScope = 'full';
-    const token = await this.accessToken(scope);
-    let response = await this.sendOnce(url, body, requestId, token);
+    const token = await this.accessToken(scope, deadline);
+    let response = await this.sendOnce(url, body, requestId, token, deadline);
     if (response.status === 401) {
       // Invalidate only the JWT used by this request. A concurrent request may
       // already have installed a fresh JWT after seeing the same stale token.
       if (this.tokens.get(scope) === token) this.tokens.delete(scope);
-      response = await this.sendOnce(url, body, requestId, await this.accessToken(scope));
+      response = await this.sendOnce(
+        url,
+        body,
+        requestId,
+        await this.accessToken(scope, deadline),
+        deadline,
+      );
     }
     return response;
   }
 
-  private async accessToken(scope: TokenScope): Promise<string> {
+  private async accessToken(scope: TokenScope, deadline: number): Promise<string> {
     const cached = this.tokens.get(scope);
     if (cached) return cached;
     const active = this.exchanges.get(scope);
     if (active) return active;
 
-    const exchange = this.exchangeToken(scope);
+    const exchange = this.exchangeToken(scope, deadline);
     this.exchanges.set(scope, exchange);
     try {
       const token = await exchange;
@@ -147,16 +157,20 @@ export class MultiAgentClient {
     }
   }
 
-  private async exchangeToken(scope: TokenScope): Promise<string> {
-    const response = await this.fetchImpl(`${this.endpoint}/api/v1/auth/token`, {
-      method: 'POST',
-      headers: {
-        accept: 'application/json',
-        'content-type': 'application/json',
+  private async exchangeToken(scope: TokenScope, deadline: number): Promise<string> {
+    const response = await this.fetchWithDeadline(
+      `${this.endpoint}/api/v1/auth/token`,
+      {
+        method: 'POST',
+        headers: {
+          accept: 'application/json',
+          'content-type': 'application/json',
+        },
+        body: JSON.stringify({ api_key: this.apiKey, scope }),
+        redirect: 'error',
       },
-      body: JSON.stringify({ api_key: this.apiKey, scope }),
-      redirect: 'error',
-    });
+      deadline,
+    );
     if (!response.ok) {
       throw new PisamaBackendError(
         `pisama API-key exchange failed with HTTP ${response.status}`,
@@ -177,6 +191,7 @@ export class MultiAgentClient {
     body: string,
     requestId: string,
     token: string,
+    deadline: number,
   ): Promise<Response> {
     const headers: Record<string, string> = {
       accept: 'application/json',
@@ -186,20 +201,59 @@ export class MultiAgentClient {
     };
     if (this.projectId) headers['x-pisama-project-id'] = this.projectId;
 
-    const controller = typeof AbortController !== 'undefined' ? new AbortController() : null;
-    const timer = controller ? setTimeout(() => controller.abort(), this.timeoutMs) : null;
-    try {
-      return await this.fetchImpl(url, {
+    return this.fetchWithDeadline(
+      url,
+      {
         method: 'POST',
         headers,
         body,
-        signal: controller?.signal,
         redirect: 'error',
-      });
+      },
+      deadline,
+    );
+  }
+
+  private async fetchWithDeadline(
+    input: RequestInfo | URL,
+    init: RequestInit,
+    deadline: number,
+  ): Promise<Response> {
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) throw new Error(`request timed out after ${this.timeoutMs}ms`);
+
+    const controller = typeof AbortController !== 'undefined' ? new AbortController() : undefined;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const timeout = new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => {
+        controller?.abort();
+        reject(new Error(`request timed out after ${this.timeoutMs}ms`));
+      }, remaining);
+    });
+    try {
+      const request = (async () => {
+        const response = await this.fetchImpl(input, { ...init, signal: controller?.signal });
+        // Keep the transport deadline active until the body is buffered. A
+        // server that resolves headers but stalls JSON must not hang callers.
+        const bytes = await response.arrayBuffer();
+        return new Response(bytes.byteLength === 0 ? null : bytes, {
+          status: response.status,
+          statusText: response.statusText,
+          headers: response.headers,
+        });
+      })();
+      return await Promise.race([request, timeout]);
     } finally {
       if (timer) clearTimeout(timer);
     }
   }
+}
+
+function normaliseTimeout(value: number | undefined): number {
+  const timeout = value ?? DEFAULT_TIMEOUT_MS;
+  if (!Number.isFinite(timeout) || timeout <= 0) {
+    throw new RangeError('timeoutMs must be a positive finite number');
+  }
+  return Math.max(1, Math.floor(timeout));
 }
 
 function assertTokenScope(token: string, requestedScope: TokenScope): void {

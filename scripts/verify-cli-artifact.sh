@@ -3,18 +3,25 @@ set -euo pipefail
 
 artifact=${1:-}
 expected_version=${2:-}
+detectors_artifact=${3:-}
 max_tarball_bytes=${MAX_CLI_TARBALL_BYTES:-200000}
 
-if [[ -z "$artifact" || -z "$expected_version" ]]; then
-  echo "usage: $0 <cli-tarball> <expected-version>" >&2
+if [[ -z "$artifact" || -z "$expected_version" || -z "$detectors_artifact" ]]; then
+  echo "usage: $0 <cli-tarball> <expected-version> <detectors-tarball>" >&2
   exit 2
 fi
 if [[ ! -f "$artifact" ]]; then
   echo "CLI tarball not found: $artifact" >&2
   exit 2
 fi
+if [[ ! -f "$detectors_artifact" ]]; then
+  echo "Detectors tarball not found: $detectors_artifact" >&2
+  exit 2
+fi
 artifact_dir=$(cd -- "$(dirname -- "$artifact")" && pwd -P)
 artifact="$artifact_dir/$(basename -- "$artifact")"
+detectors_dir=$(cd -- "$(dirname -- "$detectors_artifact")" && pwd -P)
+detectors_artifact="$detectors_dir/$(basename -- "$detectors_artifact")"
 
 tarball_bytes=$(wc -c < "$artifact" | tr -d ' ')
 if (( tarball_bytes > max_tarball_bytes )); then
@@ -30,7 +37,8 @@ for required in \
   package/CHANGELOG.md \
   package/THIRD_PARTY_NOTICES.md \
   package/dist/bin.js \
-  package/dist/mcp.js
+  package/dist/mcp.js \
+  package/dist/platform-auth.js
 do
   if ! grep -qx "$required" <<< "$archive_entries"; then
     echo "CLI tarball is missing $required" >&2
@@ -39,7 +47,7 @@ do
 done
 
 if unexpected_entries=$(grep -Ev \
-  '^package/(package\.json|README\.md|LICENSE|CHANGELOG\.md|THIRD_PARTY_NOTICES\.md|dist/(analyze-atif|bin|init|mcp|patch|verify)\.(js|js\.map|d\.ts|d\.ts\.map))$' \
+  '^package/(package\.json|README\.md|LICENSE|CHANGELOG\.md|THIRD_PARTY_NOTICES\.md|dist/(analyze-atif|bin|init|mcp|patch|platform-auth|verify)\.(js|js\.map|d\.ts|d\.ts\.map))$' \
   <<< "$archive_entries")
 then
   echo "CLI tarball contains unexpected files:" >&2
@@ -49,9 +57,16 @@ fi
 
 install_dir=$(mktemp -d)
 consumer_dir=$(mktemp -d)
-consumer_cache=$(mktemp -d)
-trap 'rm -rf -- "$install_dir" "$consumer_dir" "$consumer_cache"' EXIT
+artifact_extract=$(mktemp -d)
+trap 'rm -rf -- "$install_dir" "$consumer_dir" "$artifact_extract"' EXIT
 
+tar -xzf "$artifact" -C "$artifact_extract"
+if grep -RIEq 'whoopsie[.]dev|pisama[.]ai/live|/api/v1/spans' "$artifact_extract/package"; then
+  echo 'CLI artifact retains a retired host or removed route reference' >&2
+  exit 1
+fi
+
+npm install --ignore-scripts --prefix "$install_dir" "$detectors_artifact"
 npm install --ignore-scripts --prefix "$install_dir" "$artifact"
 
 node --input-type=module - "$install_dir" "$expected_version" <<'NODE'
@@ -100,17 +115,11 @@ for command in pisama pisama-ts; do
   "$install_dir/node_modules/.bin/$command" --help >/dev/null
 done
 
-documented_version=$(
-  cd "$consumer_dir"
-  npm_config_cache="$consumer_cache" \
-    npx --yes --package="$artifact" -- pisama-ts --version
-)
+npm install --ignore-scripts --prefix "$consumer_dir" "$detectors_artifact"
+npm install --ignore-scripts --prefix "$consumer_dir" "$artifact"
+documented_version=$(npm exec --prefix "$consumer_dir" -- pisama-ts --version)
 test "$documented_version" = "$expected_version"
-(
-  cd "$consumer_dir"
-  npm_config_cache="$consumer_cache" \
-    npx --yes --package="$artifact" -- pisama-ts --help >/dev/null
-)
+npm exec --prefix "$consumer_dir" -- pisama-ts --help >/dev/null
 
 test -f "$install_dir/node_modules/@pisama/cli/THIRD_PARTY_NOTICES.md"
 

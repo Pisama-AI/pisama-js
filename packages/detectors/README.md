@@ -48,8 +48,8 @@ export const myDetector: Detector = {
 The `MultiAgentDetectors` namespace exposes typed TS clients for Pisama's
 multi-agent failure detectors. **No detection runs in TS**: every call
 round-trips to the Pisama backend, which owns the calibrated detector suite.
-The client exposes only operations that the current endpoint can return
-reliably.
+The client exposes only operations with a dedicated authenticated backend
+contract.
 
 | Operation      | Backend category | Status    |
 | -------------- | ---------------- | --------- |
@@ -82,6 +82,7 @@ await detectors.persona({
     persona_description: 'polite customer-support agent',
     allowed_actions: ['respond_to_user', 'lookup_order'],
   },
+  task: 'Help this customer understand the refund process.',
   output: "ugh fine, here's your refund or whatever.",
 });
 ```
@@ -93,14 +94,14 @@ key fails before any network request.
 
 #### Capability boundary
 
-The backend does NOT yet expose discrete `POST /api/v1/detect/{type}` routes
-for these detectors. Today's clients POST to `/api/v1/diagnose/why-failed`
-(the orchestrator entry point) and filter the returned `all_detections` by
-category. The endpoint returns `coordination` and `persona_drift`, so those
-are the only public client operations.
+Today's clients POST a raw, span-shaped trace to
+`/api/v1/diagnose/multi-agent/{detector}`. The backend runs exactly the
+requested calibrated detector, so the full-diagnosis pipeline's
+cross-category subsumption cannot turn a coordination fire into a false clean
+result. `coordination` and `persona_drift` are the only supported values.
 
 `delegation` and `consensus_collapse` are intentionally not exposed. The
-current endpoint cannot return their categories, and representing an
+dedicated contract does not support them, and representing an
 unsupported operation as `detected: false` would be indistinguishable from a
 clean detector result. These operations can be added when dedicated backend
 routes exist.

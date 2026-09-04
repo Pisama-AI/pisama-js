@@ -1,148 +1,73 @@
-name: Publish detectors to npm
+name: Stage @pisama/detectors on npm
 
-# detectors-v0.10.0-alpha.2 already points to a commit that predates artifact promotion.
-# Do not move or reuse it. The first release using this workflow must be alpha.3 or newer.
 on:
   workflow_dispatch:
-  push:
-    tags:
-      - 'detectors-v*'
+    inputs:
+      version:
+        description: Exact @pisama/detectors version already committed and tagged
+        required: true
+        type: string
+      expected_sha256:
+        description: Independently reviewed lowercase SHA-256 of pisama-detectors-<version>.tgz
+        required: true
+        type: string
+      git_tag:
+        description: Existing immutable tag (detectors-v<version>)
+        required: true
+        type: string
+      dist_tag:
+        description: Dist-tag applied only if the npm stage is later approved
+        required: true
+        default: next
+        type: choice
+        options: [next, latest]
 
 permissions:
   contents: read
 
+concurrency:
+  group: npm-stage-pisama-detectors-${{ inputs.version }}
+  cancel-in-progress: false
+
 jobs:
-  build:
+  prepare:
+    name: Build and verify one immutable artifact
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
+          ref: refs/tags/${{ inputs.git_tag }}
           fetch-depth: 0
           persist-credentials: false
-      - uses: pnpm/action-setup@0ebf47130e4866e96fce0953f49152a61190b271 # v6.0.9
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: ./.github/actions/prepare-npm-stage
         with:
-          node-version: '24'
-          registry-url: https://registry.npmjs.org
-          package-manager-cache: false
-      - run: pnpm install --frozen-lockfile
-      - name: Lint
-        run: pnpm lint
-      - name: Check formatting
-        run: pnpm format:check
-      - name: Type-check
-        run: pnpm typecheck
-      - name: Build
-        run: pnpm build
-      - name: Test with coverage gates
-        run: pnpm test:coverage
-      - name: Audit production dependencies
-        run: pnpm audit:production
-      - name: Verify tag matches package version
-        run: |
-          TAG_VERSION="${GITHUB_REF_NAME#detectors-v}"
-          PACKAGE_VERSION=$(node -p "require('./packages/detectors/package.json').version")
-          test "$TAG_VERSION" = "$PACKAGE_VERSION"
-      - name: Verify release commit belongs to main
-        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
-      - name: Pack publish artifact
-        run: |
-          mkdir -p "$RUNNER_TEMP/release"
-          pnpm --dir packages/detectors pack --pack-destination "$RUNNER_TEMP/release"
-      - name: Verify publish artifact
-        run: |
-          install_dir=$(mktemp -d)
-          npm install --ignore-scripts --prefix "$install_dir" "$RUNNER_TEMP"/release/pisama-detectors-*.tgz
-          test -f "$install_dir/node_modules/@pisama/detectors/dist/index.d.ts"
-          (
-            cd "$install_dir"
-            node --input-type=module - <<'NODE'
-          const detectors = await import('@pisama/detectors');
-          if (typeof detectors.runDetectors !== 'function' || !Array.isArray(detectors.v1Detectors)) {
-            throw new Error('packed @pisama/detectors public API is incomplete');
-          }
-          NODE
-          )
-      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
-        with:
-          name: package
-          path: ${{ runner.temp }}/release/*.tgz
+          package-name: '@pisama/detectors'
+          package-dir: packages/detectors
+          artifact-stem: pisama-detectors
+          version: ${{ inputs.version }}
+          expected-sha256: ${{ inputs.expected_sha256 }}
+          git-tag: ${{ inputs.git_tag }}
+          tag-prefix: detectors-v
+          artifact-name: npm-stage-pisama-detectors-${{ github.run_id }}
 
-  publish:
-    needs: build
+  stage:
+    name: OIDC stage only (human 2FA approval remains separate)
+    needs: prepare
     runs-on: ubuntu-latest
-    env:
-      HAS_NPM_TOKEN: ${{ secrets.NPM_TOKEN != '' }}
+    environment: npm-staging
     permissions:
       contents: read
       id-token: write
     steps:
-      - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          node-version: '24'
-          package-manager-cache: false
-      - uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
+          ref: refs/tags/${{ inputs.git_tag }}
+          persist-credentials: false
+      - uses: ./.github/actions/stage-npm-package
         with:
-          name: package
-          path: dist/
-      - name: Select npm dist-tag
-        id: dist
-        run: |
-          TAG_VERSION="${GITHUB_REF_NAME#detectors-v}"
-          if [[ "$TAG_VERSION" == *-* ]]; then
-            echo "tag=alpha" >> "$GITHUB_OUTPUT"
-          else
-            echo "tag=latest" >> "$GITHUB_OUTPUT"
-          fi
-      # PR #24 removed `registry-url` from this job's setup-node: with no token supplied,
-      # setup-node still writes the literal placeholder `XXXXX-XXXXX-XXXXX-XXXXX` as
-      # `_authToken`, so npm authenticated with garbage instead of attempting OIDC.
-      # That fix is kept. This step writes a real token and only when one is configured,
-      # so with no NPM_TOKEN secret it is skipped and the OIDC path is byte-for-byte
-      # unchanged. A classic "Publish" token will NOT work here: those still require an
-      # OTP (verified 2026-07-28, `npm dist-tag add` returned EOTP), and CI cannot answer
-      # one. Use a granular or automation token.
-      - name: Enable token auth when NPM_TOKEN is configured
-        if: env.HAS_NPM_TOKEN == 'true'
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: printf '//registry.npmjs.org/:_authToken=%s\n' "$NPM_TOKEN" >> "$HOME/.npmrc"
-      - name: Publish through npm trusted publishing
-        env:
-          NPM_CONFIG_LOGLEVEL: silly
-        run: >-
-          npm publish ./dist/pisama-detectors-*.tgz
-          --access public
-          --provenance
-          --tag "${{ steps.dist.outputs.tag }}"
-      - name: Verify public registry release
-        env:
-          DIST_TAG: ${{ steps.dist.outputs.tag }}
-        run: | # zizmor: ignore[adhoc-packages] Intentionally tests a fresh registry resolution.
-          VERSION="${GITHUB_REF_NAME#detectors-v}"
-          published=false
-          for attempt in {1..12}; do
-            if [[ "$(npm view "@pisama/detectors@$VERSION" version 2>/dev/null || true)" == "$VERSION" ]]; then
-              published=true
-              break
-            fi
-            echo "Waiting for @pisama/detectors@$VERSION to reach npm ($attempt/12)"
-            sleep 5
-          done
-          test "$published" = true
-          test "$(npm view "@pisama/detectors" "dist-tags.$DIST_TAG")" = "$VERSION"
-          test \
-            "$(npm view "@pisama/detectors@$VERSION" dist.attestations.provenance.predicateType)" \
-            = "https://slsa.dev/provenance/v1"
-
-          install_dir=$(mktemp -d)
-          trap 'rm -rf -- "$install_dir"' EXIT
-          npm install --ignore-scripts --prefix "$install_dir" "@pisama/detectors@$VERSION"
-          node -e "
-            const m = require('$install_dir/node_modules/@pisama/detectors/package.json');
-            for (const [d, spec] of Object.entries(m.dependencies || {})) {
-              if (String(spec).startsWith('workspace:')) {
-                throw new Error('published tarball leaked a workspace specifier: ' + d + '@' + spec);
-              }
-            }
-          "
+          package-name: '@pisama/detectors'
+          package-dir: packages/detectors
+          version: ${{ inputs.version }}
+          expected-sha256: ${{ inputs.expected_sha256 }}
+          dist-tag: ${{ inputs.dist_tag }}
+          artifact-name: npm-stage-pisama-detectors-${{ github.run_id }}

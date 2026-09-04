@@ -56,9 +56,8 @@ Patch release to confirm a clean publish/verification run (the prior release hit
   package manager your lockfile implies (`pnpm add`, `yarn add`, `bun add`, otherwise
   `npm i`), and is skipped when the dependency is already present. `init` still does not
   edit your `package.json`.
-- `init` no longer prints `https://pisama.ai/live/<projectId>`. That route does not exist:
-  it redirects to `/sign-in` and resolves to nothing after login. It now prints
-  `https://pisama.ai/dashboard`, which is a real page. The dashboard is not project-scoped,
+- `init` no longer prints the retired project-scoped live link. It now prints
+  `https://pisama.ai/dashboard`. The dashboard is not project-scoped,
   so the project id is no longer appended to the link; `init` still prints the id on its
   own line.
 
@@ -70,9 +69,8 @@ Patch release to confirm a clean publish/verification run (the prior release hit
   authenticates with an API key, resolves the tenant via `/api/v1/auth/me`, sends OTLP to
   `/api/v1/traces/ingest`, and reads back from `/api/v1/tenants/{tenant_id}/traces`. The
   previous flow returned 404 on every call.
-- `analyze-atif` accepts `--api-key` (or `PISAMA_API_KEY`) and sends it as a bearer token.
-  `/api/v1/atif/analyze` is authenticated, so this command previously returned 401 for every
-  user with no flag available to fix it.
+- `analyze-atif` introduced `--api-key` (or `PISAMA_API_KEY`). Its initial
+  raw-key transport was superseded by the scoped token exchange in 0.11.3.
 - `mcp` reports an actionable error when the trace-read endpoint returns 404 instead of an
   opaque upstream message.
 

@@ -31,15 +31,28 @@ interface TraceEvent {
   spanId?: string;
   startTime: number;
   endTime: number;
-  model: string;
+  framework?: string;
   prompt?: string;
   completion?: string;
   toolCalls: { toolCallId: string; toolName: string }[];
-  inputTokens?: number;
-  outputTokens?: number;
+  totalTokens?: number;
   costUsd?: number;
-  finishReason?: string;
+  traceStatus?: string;
+  detectionStatus?: string;
+  storedDetectionCount?: number;
+  stateMetadata: TraceStateMetadata[];
   metadata: Record<string, unknown>;
+}
+
+interface TraceStateMetadata {
+  stateId: string;
+  sequenceNumber: number;
+  agentId?: string;
+  tokenCount?: number;
+  latencyMs?: number;
+  createdAt?: string;
+  spanKind?: string;
+  spanStatus?: string;
 }
 
 interface DetectionResult {
@@ -54,12 +67,19 @@ interface DetectionResult {
 interface TraceWithHits {
   event: TraceEvent;
   hits: DetectionResult[];
+  visibleDetectionCount: number;
+  hitsTruncated: boolean;
 }
 
 interface TracesResponse {
   tenantId: string;
   count: number;
   events: TraceWithHits[];
+  scannedTraceCount: number;
+  totalTraceCount: number;
+  totalTraceCountKnown: boolean;
+  scanComplete: boolean;
+  resultsTruncated: boolean;
 }
 
 export interface McpOptions {
@@ -108,6 +128,11 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
     properties: {
       tenantId: { type: 'string' },
       count: { type: 'number' },
+      scannedTraceCount: { type: 'number' },
+      totalTraceCount: { type: 'number' },
+      totalTraceCountKnown: { type: 'boolean' },
+      scanComplete: { type: 'boolean' },
+      resultsTruncated: { type: 'boolean' },
       events: {
         type: 'array',
         items: { type: 'object', additionalProperties: true },
@@ -134,7 +159,7 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
         name: 'get_recent_failures',
         title: 'Get Recent Failures',
         description:
-          "List recent traces that fired at least one detector (loop, hallucination, cost spike, etc.). Use this when the user asks 'what's broken' or 'what failed today'.",
+          "List recent traces with at least one visible detector hit (loop, hallucination, cost spike, etc.). Use this when the user asks 'what's broken' or 'what failed today'.",
         inputSchema: {
           type: 'object',
           properties: {
@@ -312,6 +337,8 @@ interface PlatformState {
   token_count?: number | null;
   latency_ms?: number | null;
   created_at?: string | null;
+  span_kind?: string | null;
+  span_status?: string | null;
 }
 
 interface PlatformDetection {
@@ -326,12 +353,86 @@ interface PlatformDetection {
 
 interface TracePage {
   traces: PlatformTrace[];
-  total: number;
+  total?: number;
 }
 
 interface DetectionPage {
   items: PlatformDetection[];
+  total?: number;
+  page?: number;
+  per_page?: number;
 }
+
+interface DetectionBatch {
+  items: PlatformDetection[];
+  total: number;
+  truncated: boolean;
+}
+
+function invalidPlatformShape(message: string): never {
+  throw new PlatformResponseError(`Pisama API returned an invalid response: ${message}.`, 502);
+}
+
+function optionalCount(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): number | undefined {
+  const value = record[key];
+  if (value === undefined) return undefined;
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    invalidPlatformShape(`${label}.${key} must be a non-negative integer when present`);
+  }
+  return value;
+}
+
+function validateTracePage(value: unknown): TracePage {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invalidPlatformShape('trace page must be an object');
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record['traces'])) {
+    invalidPlatformShape('trace page traces must be an array');
+  }
+  const traces = record['traces'].map((trace, index) => {
+    if (typeof trace !== 'object' || trace === null || Array.isArray(trace)) {
+      invalidPlatformShape(`trace page traces[${index}] must be an object`);
+    }
+    const id = (trace as Record<string, unknown>)['id'];
+    if (typeof id !== 'string' || id.trim().length === 0) {
+      invalidPlatformShape(`trace page traces[${index}].id must be a non-empty string`);
+    }
+    return trace as PlatformTrace;
+  });
+  return { traces, total: optionalCount(record, 'total', 'trace page') };
+}
+
+function validateDetectionPage(value: unknown): DetectionPage {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invalidPlatformShape('detection page must be an object');
+  }
+  const record = value as Record<string, unknown>;
+  if (!Array.isArray(record['items'])) {
+    invalidPlatformShape('detection page items must be an array');
+  }
+  const items = record['items'].map((item, index) => {
+    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
+      invalidPlatformShape(`detection page items[${index}] must be an object`);
+    }
+    return item as PlatformDetection;
+  });
+  return {
+    items,
+    total: optionalCount(record, 'total', 'detection page'),
+    page: optionalCount(record, 'page', 'detection page'),
+    per_page: optionalCount(record, 'per_page', 'detection page'),
+  };
+}
+
+const TRACE_PAGE_SIZE = 100;
+const MAX_TRACE_SCAN = 1000;
+const DETECTION_PAGE_SIZE = 100;
+const MAX_DETECTIONS_PER_TRACE = 500;
 
 class PlatformResponseError extends Error {
   constructor(
@@ -365,26 +466,17 @@ function tenantApiUrl(baseUrl: string, tenantId: string, suffix: string): URL {
   );
 }
 
-async function fetchTraceRows(
+async function fetchTracePage(
   auth: PlatformAuth,
   baseUrl: string,
   tenantId: string,
-  limit: number,
-): Promise<PlatformTrace[]> {
-  const rows: PlatformTrace[] = [];
-  let page = 1;
-  while (rows.length < limit) {
-    const perPage = Math.min(100, limit - rows.length);
-    const url = tenantApiUrl(baseUrl, tenantId, 'traces');
-    url.searchParams.set('page', String(page));
-    url.searchParams.set('per_page', String(perPage));
-    const result = await platformJson<TracePage>(auth, url);
-    const batch = Array.isArray(result.traces) ? result.traces : [];
-    rows.push(...batch);
-    if (batch.length < perPage || rows.length >= result.total) break;
-    page += 1;
-  }
-  return rows.slice(0, limit);
+  page: number,
+  perPage: number,
+): Promise<TracePage> {
+  const url = tenantApiUrl(baseUrl, tenantId, 'traces');
+  url.searchParams.set('page', String(page));
+  url.searchParams.set('per_page', String(perPage));
+  return validateTracePage(await platformJson<unknown>(auth, url));
 }
 
 async function fetchDetections(
@@ -392,12 +484,38 @@ async function fetchDetections(
   baseUrl: string,
   tenantId: string,
   traceId: string,
-): Promise<PlatformDetection[]> {
-  const url = tenantApiUrl(baseUrl, tenantId, 'detections');
-  url.searchParams.set('trace_id', traceId);
-  url.searchParams.set('per_page', '100');
-  const result = await platformJson<DetectionPage>(auth, url);
-  return Array.isArray(result.items) ? result.items : [];
+): Promise<DetectionBatch> {
+  const items: PlatformDetection[] = [];
+  let page = 1;
+  let reportedTotal: number | undefined;
+
+  while (items.length < MAX_DETECTIONS_PER_TRACE) {
+    const perPage = Math.min(DETECTION_PAGE_SIZE, MAX_DETECTIONS_PER_TRACE - items.length);
+    const url = tenantApiUrl(baseUrl, tenantId, 'detections');
+    url.searchParams.set('trace_id', traceId);
+    url.searchParams.set('page', String(page));
+    url.searchParams.set('per_page', String(perPage));
+    const result = validateDetectionPage(await platformJson<unknown>(auth, url));
+    const batch = result.items;
+    if (typeof result.total === 'number' && Number.isFinite(result.total)) {
+      reportedTotal = Math.max(0, Math.floor(result.total));
+    }
+    items.push(...batch.slice(0, MAX_DETECTIONS_PER_TRACE - items.length));
+
+    if (batch.length < perPage || (reportedTotal !== undefined && items.length >= reportedTotal)) {
+      break;
+    }
+    page += 1;
+  }
+
+  const total = Math.max(items.length, reportedTotal ?? items.length);
+  return {
+    items,
+    total,
+    truncated:
+      total > items.length ||
+      (reportedTotal === undefined && items.length >= MAX_DETECTIONS_PER_TRACE),
+  };
 }
 
 async function adaptTraceBatch(
@@ -415,7 +533,7 @@ async function adaptTraceBatch(
           const detections =
             (row.detection_count ?? 0) > 0
               ? await fetchDetections(auth, baseUrl, tenantId, row.id)
-              : [];
+              : { items: [], total: 0, truncated: false };
           return adaptPlatformTrace(row, detections);
         }),
       )),
@@ -430,10 +548,58 @@ async function fetchRecentTraces(
   tenantId: string,
   opts: { limit: number; onlyFailures: boolean },
 ): Promise<TracesResponse> {
-  let rows = await fetchTraceRows(auth, baseUrl, tenantId, opts.limit);
-  if (opts.onlyFailures) rows = rows.filter((row) => (row.detection_count ?? 0) > 0);
-  const events = await adaptTraceBatch(auth, baseUrl, tenantId, rows);
-  return { tenantId, count: events.length, events };
+  const events: TraceWithHits[] = [];
+  const perPage = opts.onlyFailures ? TRACE_PAGE_SIZE : Math.min(TRACE_PAGE_SIZE, opts.limit);
+  let page = 1;
+  let scannedTraceCount = 0;
+  let totalTraceCount = 0;
+  let totalTraceCountKnown = false;
+  let scanComplete = false;
+  let resultsTruncated = false;
+
+  while (events.length < opts.limit && scannedTraceCount < MAX_TRACE_SCAN) {
+    const result = await fetchTracePage(auth, baseUrl, tenantId, page, perPage);
+    const rows = result.traces;
+    scannedTraceCount += rows.length;
+    totalTraceCount = Math.max(totalTraceCount, result.total ?? 0, scannedTraceCount);
+    if (result.total !== undefined) totalTraceCountKnown = true;
+
+    const candidates = opts.onlyFailures
+      ? rows.filter((row) => (row.detection_count ?? 0) > 0)
+      : rows;
+    const adapted = await adaptTraceBatch(auth, baseUrl, tenantId, candidates);
+    const visible = opts.onlyFailures ? adapted.filter((event) => event.hits.length > 0) : adapted;
+    const remaining = opts.limit - events.length;
+    events.push(...visible.slice(0, remaining));
+    if (visible.length > remaining) resultsTruncated = true;
+
+    const reachedSourceEnd =
+      result.total === undefined
+        ? rows.length < perPage
+        : rows.length === 0 || scannedTraceCount >= result.total;
+    if (reachedSourceEnd) {
+      scanComplete = true;
+      totalTraceCountKnown = true;
+      break;
+    }
+    if (events.length >= opts.limit) {
+      resultsTruncated = true;
+      break;
+    }
+    page += 1;
+  }
+
+  if (!scanComplete && scannedTraceCount >= MAX_TRACE_SCAN) resultsTruncated = true;
+  return {
+    tenantId,
+    count: events.length,
+    events,
+    scannedTraceCount,
+    totalTraceCount,
+    totalTraceCountKnown,
+    scanComplete,
+    resultsTruncated,
+  };
 }
 
 async function fetchTrace(
@@ -518,9 +684,36 @@ function parseTime(value: string | null | undefined): number {
   return Number.isNaN(parsed) ? 0 : parsed;
 }
 
+function adaptStateMetadata(state: PlatformState): TraceStateMetadata {
+  return {
+    stateId: state.id,
+    sequenceNumber: state.sequence_num,
+    agentId: state.agent_id ?? undefined,
+    tokenCount: state.token_count ?? undefined,
+    latencyMs: state.latency_ms ?? undefined,
+    createdAt: state.created_at ?? undefined,
+    spanKind: state.span_kind ?? undefined,
+    spanStatus: state.span_status ?? undefined,
+  };
+}
+
+function traceCostUsd(trace: PlatformTrace): number | undefined {
+  return typeof trace.total_cost_cents === 'number' ? trace.total_cost_cents / 100 : undefined;
+}
+
+function traceMetadata(trace: PlatformTrace, states: PlatformState[]): Record<string, unknown> {
+  return {
+    sessionId: trace.session_id ?? undefined,
+    stateCount: trace.state_count ?? states.length,
+    statesTruncated: typeof trace.state_count === 'number' && trace.state_count > states.length,
+    toolCallsAvailable: false,
+    ...(trace.detection_metadata ? { detectionMetadata: trace.detection_metadata } : {}),
+  };
+}
+
 function adaptPlatformTrace(
   trace: PlatformTrace,
-  detections: PlatformDetection[],
+  detections: DetectionBatch,
   states: PlatformState[] = [],
 ): TraceWithHits {
   const completion =
@@ -531,73 +724,127 @@ function adaptPlatformTrace(
       traceId: trace.id,
       startTime: parseTime(trace.created_at),
       endTime: parseTime(trace.completed_at ?? trace.created_at),
-      model: trace.framework ?? '?',
+      framework: trace.framework ?? undefined,
       prompt: stateValue(states, PROMPT_KEYS),
       completion: completion ?? undefined,
       toolCalls: [],
-      outputTokens: trace.total_tokens ?? undefined,
-      costUsd:
-        typeof trace.total_cost_cents === 'number' ? trace.total_cost_cents / 100 : undefined,
-      finishReason: trace.status ?? undefined,
-      metadata: {
-        sessionId: trace.session_id ?? undefined,
-        detectionStatus: trace.detection_status ?? undefined,
-        stateCount: trace.state_count ?? states.length,
-        toolCallsAvailable: false,
-        ...(trace.detection_metadata ? { detectionMetadata: trace.detection_metadata } : {}),
-      },
+      totalTokens: trace.total_tokens ?? undefined,
+      costUsd: traceCostUsd(trace),
+      traceStatus: trace.status ?? undefined,
+      detectionStatus: trace.detection_status ?? undefined,
+      storedDetectionCount: trace.detection_count ?? undefined,
+      stateMetadata: states.map(adaptStateMetadata),
+      metadata: traceMetadata(trace, states),
     },
-    hits: detections.map(adaptDetection),
+    hits: detections.items.map(adaptDetection),
+    visibleDetectionCount: detections.total,
+    hitsTruncated: detections.truncated,
   };
+}
+
+function formatHitSummary(trace: TraceWithHits): string {
+  if (trace.hits.length > 0) {
+    const summary = trace.hits.map((hit) => `${hit.detector}/${hit.severity}`).join(',');
+    return trace.hitsTruncated ? `${summary},… (${trace.visibleDetectionCount} visible)` : summary;
+  }
+  if ((trace.event.storedDetectionCount ?? 0) > 0) return '(no visible detector hits)';
+  if (trace.event.detectionStatus === 'complete' && trace.event.storedDetectionCount === 0) {
+    return '(clean)';
+  }
+  return trace.event.detectionStatus
+    ? `(detection ${trace.event.detectionStatus})`
+    : '(detection status unavailable)';
 }
 
 function formatList(data: TracesResponse, failuresOnly: boolean): string {
   if (data.events.length === 0) {
     return failuresOnly
-      ? `no failures in the sampled traces for tenant ${data.tenantId}.`
+      ? `no visible failures found in ${data.scannedTraceCount} scanned trace(s) for tenant ${data.tenantId}${data.scanComplete ? '.' : '; the bounded scan was incomplete.'}`
       : `no traces for tenant ${data.tenantId} yet.`;
   }
   const lines = data.events.map((e) => {
     const ago = relativeTime(e.event.startTime);
-    const tokens = (e.event.inputTokens ?? 0) + (e.event.outputTokens ?? 0) || '—';
-    const hits =
-      e.hits.length === 0 ? '(clean)' : e.hits.map((h) => `${h.detector}/${h.severity}`).join(',');
-    return `- ${e.event.traceId.slice(0, 8)} ${ago} ${e.event.model} ${tokens}t ${hits}`;
+    const tokens = e.event.totalTokens ?? '—';
+    const framework = e.event.framework ?? 'unknown-framework';
+    return `- ${e.event.traceId.slice(0, 8)} ${ago} ${framework} ${tokens}t ${formatHitSummary(e)}`;
   });
   const header = failuresOnly
-    ? `${data.events.length} recent failure(s) for tenant ${data.tenantId}:`
-    : `${data.events.length} recent trace(s) for tenant ${data.tenantId}:`;
-  return `${header}\n${lines.join('\n')}`;
+    ? `${data.events.length} recent visible failure(s) returned for tenant ${data.tenantId}:`
+    : `${data.events.length} recent trace(s) returned for tenant ${data.tenantId}:`;
+  const coverage = data.scanComplete
+    ? `Scanned all ${data.totalTraceCount} available trace(s).`
+    : data.totalTraceCountKnown
+      ? `Scanned ${data.scannedTraceCount} of ${data.totalTraceCount} available trace(s); results are bounded.`
+      : `Scanned ${data.scannedTraceCount} trace(s); the source total is unavailable and results are bounded.`;
+  return `${header}\n${lines.join('\n')}\n${coverage}`;
 }
 
-function formatTrace(t: TraceWithHits): string {
+function formatTraceHeader(t: TraceWithHits): string[] {
+  return [
+    `traceId: ${t.event.traceId}`,
+    `when: ${new Date(t.event.startTime).toISOString()}`,
+    `framework: ${t.event.framework ?? '?'}`,
+    `tokens: total=${t.event.totalTokens ?? '?'} cost=$${t.event.costUsd ?? '?'}`,
+    `traceStatus: ${t.event.traceStatus ?? '?'}`,
+    `detectionStatus: ${t.event.detectionStatus ?? '?'}`,
+    `visibleDetectorHits: ${t.visibleDetectionCount}${t.hitsTruncated ? ` (showing first ${t.hits.length})` : ''}`,
+  ];
+}
+
+function formatTraceContent(event: TraceEvent): string[] {
   const out: string[] = [];
-  out.push(`traceId: ${t.event.traceId}`);
-  out.push(`when: ${new Date(t.event.startTime).toISOString()}`);
-  out.push(`model: ${t.event.model}`);
-  out.push(
-    `tokens: in=${t.event.inputTokens ?? '?'} out=${t.event.outputTokens ?? '?'} cost=$${t.event.costUsd ?? '?'}`,
-  );
-  out.push(`finishReason: ${t.event.finishReason ?? '?'}`);
-  if (t.event.prompt) {
-    out.push(`\nprompt:\n${truncate(t.event.prompt, 1000)}`);
+  if (event.prompt) {
+    out.push(`\nprompt:\n${truncate(event.prompt, 1000)}`);
   }
-  if (t.event.completion) {
-    out.push(`\ncompletion:\n${truncate(t.event.completion, 1000)}`);
+  if (event.completion) {
+    out.push(`\ncompletion:\n${truncate(event.completion, 1000)}`);
   }
-  if (t.event.toolCalls.length > 0) {
-    out.push(`\ntool calls (${t.event.toolCalls.length}):`);
-    for (const tc of t.event.toolCalls) {
+  if (event.toolCalls.length > 0) {
+    out.push(`\ntool calls (${event.toolCalls.length}):`);
+    for (const tc of event.toolCalls) {
       out.push(`  - ${tc.toolName} (${tc.toolCallId})`);
     }
   }
+  return out;
+}
+
+function formatStateMetadata(states: TraceStateMetadata[]): string[] {
+  const out: string[] = [];
+  if (states.length > 0) {
+    out.push(`\nstate metadata (${states.length}):`);
+    for (const state of states) {
+      const agent = state.agentId ? ` agent=${state.agentId}` : '';
+      const tokens = state.tokenCount === undefined ? '' : ` tokens=${state.tokenCount}`;
+      const latency = state.latencyMs === undefined ? '' : ` latencyMs=${state.latencyMs}`;
+      out.push(
+        `  - sequence=${state.sequenceNumber} id=${state.stateId}${agent}${tokens}${latency}`,
+      );
+    }
+  }
+  return out;
+}
+
+function formatDetectionHits(t: TraceWithHits): string[] {
+  const out: string[] = [];
   if (t.hits.length > 0) {
     out.push(`\ndetector hits:`);
     for (const h of t.hits) {
       out.push(`  - ${h.detector} (severity ${h.severity}): ${h.summary}`);
       if (h.fix) out.push(`    fix: ${h.fix}`);
     }
+  } else if ((t.event.storedDetectionCount ?? 0) > 0) {
+    out.push('\nNo detector hits are visible under the current detection-list filters.');
   }
+  return out;
+}
+
+function formatTrace(t: TraceWithHits): string {
+  const out = [
+    ...formatTraceHeader(t),
+    ...formatTraceContent(t.event),
+    ...formatStateMetadata(t.event.stateMetadata),
+    ...formatDetectionHits(t),
+  ];
   return out.join('\n');
 }
 
@@ -741,7 +988,7 @@ export function buildPromptMessages(name: string, args: Record<string, string>):
       `2. Filter the returned list to events from the last ${lookback} hours.\n` +
       '3. Group hits by detector name. Count occurrences and surface the top three patterns.\n' +
       '4. For the top pattern, call `get_trace` on a representative traceId and read the `fix` field on the detector hit.\n' +
-      '5. Reply with: total failures in the window, top three detector patterns with counts, and one recommended action.';
+      '5. Reply with: visible failures returned in the window, top three detector patterns with counts, and one recommended action. State that the tool is a bounded sample whenever `scanComplete` is false; do not claim a tenant-wide total.';
     return {
       description: 'Recent-failures investigation runbook.',
       messages: [{ role: 'user', content: { type: 'text', text: body } }],
@@ -791,11 +1038,11 @@ export function buildPromptMessages(name: string, args: Record<string, string>):
     const body =
       `Build a Pisama daily quality report for the last 24 hours.${tenantClause}\n\n` +
       'Steps:\n' +
-      '1. Call `get_recent_traces` with limit 200 to count overall detection volume.\n' +
-      '2. Call `get_recent_failures` with limit 200. Filter both lists to events from the last 24 hours.\n' +
+      '1. Call `get_recent_traces` with limit 200 to sample recent activity. Treat `count` as rows returned, not tenant-wide volume, and report scan coverage.\n' +
+      '2. Call `get_recent_failures` with limit 200. Filter both returned samples to events from the last 24 hours and disclose when `scanComplete` is false.\n' +
       '3. Group failures by detector. Surface the top three issues by count.\n' +
-      '4. Compute healing-success rate: count traces where any detector hit has a non-empty `fix` field versus total failures.\n' +
-      '5. Reply with four sections: Volume, Top three issues, Healing-success rate, One action for the day. Keep it under 200 words for a morning standup.';
+      '4. Compute proposed-fix coverage: count returned failures where any visible detector hit has a non-empty `fix` field. A proposal is not evidence that a fix was applied or healed the run.\n' +
+      '5. Reply with four sections: Sampled volume, Top three issues, Proposed-fix coverage, One action for the day. Keep it under 200 words for a morning standup.';
     return {
       description: 'Morning-standup quality summary.',
       messages: [{ role: 'user', content: { type: 'text', text: body } }],

@@ -73,7 +73,7 @@ program
 program
   .command('analyze-atif')
   .description(
-    "Analyze a Harbor ATIF trajectory (or directory of trajectories) with Pisama's detectors. Exits non-zero on any high-severity finding so it works in CI.",
+    "Analyze a Harbor ATIF trajectory (or directory of trajectories) with Pisama's detectors. Exits non-zero on any critical/high-severity finding so it works in CI.",
   )
   .argument('<path>', 'Path to an ATIF .json file or a directory of them')
   .option('-p, --project-id <id>', 'Optional Pisama project id for correlation')

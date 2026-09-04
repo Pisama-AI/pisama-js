@@ -58,7 +58,7 @@ test('TanStack Start: observe() captures errors', async () => {
     assert.ok(captured.length > 0);
     const ev = captured[0]!.body.events[0] as Record<string, unknown>;
     assert.equal(ev.projectId, 'ws_tanstack_test_err');
-    assert.ok((ev.error as { message?: string })?.message?.includes('simulated'));
+    assert.equal((ev.error as { message?: string })?.message, '[redacted]');
   } finally {
     restore();
     delete process.env.PISAMA_PROJECT_ID;
