@@ -5,6 +5,7 @@ import { MockLanguageModelV3, simulateReadableStream } from 'ai/test';
 import { pisamaMiddleware } from '../src/middleware.js';
 import { TraceExporter } from '../src/exporter.js';
 import type { TraceEvent } from '../src/types.js';
+import { decodeEvents, tokenResponse } from './otlp-helpers.js';
 
 interface CapturedRequest {
   url: string;
@@ -18,9 +19,11 @@ function captureExporter() {
     input: unknown,
     init?: { headers?: Record<string, string>; body?: string },
   ) => {
+    if (String(input).endsWith('/api/v1/auth/token')) return tokenResponse();
+    const body = JSON.parse(init?.body ?? '{}');
     captured.push({
       url: String(input),
-      body: JSON.parse(init?.body ?? '{}'),
+      body: { events: decodeEvents(body) },
       headers: init?.headers ?? {},
     });
     return new Response(JSON.stringify({ accepted: 1 }), {
@@ -29,8 +32,9 @@ function captureExporter() {
     });
   }) as typeof fetch;
   const exporter = new TraceExporter({
+    apiKey: 'pisama_middleware_test_key',
     projectId: 'ws_test',
-    endpoint: 'http://test/api/v1/spans',
+    endpoint: 'http://test/api/v1/traces/ingest',
     fetchImpl,
     flushIntervalMs: 5,
     maxBatchSize: 1,
@@ -80,6 +84,8 @@ test('generateText: TraceEvent captured with text + tool calls + tokens', async 
   const ev = events[0]!;
 
   assert.equal(ev.projectId, 'ws_test');
+  assert.match(ev.traceId, /^[0-9a-f]{32}$/);
+  assert.match(ev.spanId, /^[0-9a-f]{16}$/);
   assert.equal(ev.model, 'test-model');
   assert.equal(ev.completion, 'Hello world');
   assert.equal(ev.inputTokens, 8);
@@ -231,7 +237,7 @@ test('redact: standard mode strips emails from completion', async () => {
   assert.doesNotMatch(ev.completion ?? '', /hello@example\.com/);
 });
 
-test('disabled middleware (no projectId) is a passthrough no-op', async () => {
+test('explicitly disabled middleware is a passthrough no-op', async () => {
   const { captured, exporter } = captureExporter();
 
   const model = new MockLanguageModelV3({
@@ -254,4 +260,37 @@ test('disabled middleware (no projectId) is a passthrough no-op', async () => {
 
   assert.equal(result.text, 'passthrough');
   assert.equal(captured.length, 0, 'exporter should not have been called');
+});
+
+test('middleware fails closed when no API key or custom exporter is configured', async () => {
+  const originalKey = process.env.PISAMA_API_KEY;
+  delete process.env.PISAMA_API_KEY;
+  let fetchCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    fetchCalls++;
+    return new Response();
+  }) as typeof fetch;
+  try {
+    const model = new MockLanguageModelV3({
+      modelId: 'no-key-model',
+      doGenerate: async () => ({
+        content: [{ type: 'text', text: 'passthrough' }],
+        finishReason: 'stop',
+        usage: { inputTokens: { total: 1 }, outputTokens: { total: 1 } },
+        warnings: [],
+      }),
+    });
+    const wrapped = wrapLanguageModel({
+      model,
+      middleware: pisamaMiddleware({ projectId: 'service-without-key' }),
+    });
+    const result = await generateText({ model: wrapped, prompt: 'Hi.' });
+    assert.equal(result.text, 'passthrough');
+    assert.equal(fetchCalls, 0);
+  } finally {
+    globalThis.fetch = originalFetch;
+    if (originalKey === undefined) delete process.env.PISAMA_API_KEY;
+    else process.env.PISAMA_API_KEY = originalKey;
+  }
 });

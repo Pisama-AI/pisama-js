@@ -25,8 +25,10 @@
 import { readFile, readdir, stat } from 'node:fs/promises';
 import { join, resolve, basename, relative } from 'node:path';
 import kleur from 'kleur';
+import { nanoid } from 'nanoid';
 import { runDetectors, v1Detectors, type AgentTrace, type ToolEvent } from '@pisama/detectors';
 import type { DetectionResult as LocalDetectionResult } from '@pisama/detectors';
+import { PlatformAuth, type TokenScope } from './platform-auth.js';
 
 export interface AnalyzeAtifOptions {
   path: string;
@@ -318,34 +320,35 @@ async function requestAnalysis(
   trajectory: AtifTrajectory,
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
+  auth: PlatformAuth,
 ): Promise<AnalyzeResponse> {
-  const apiKey = opts.apiKey ?? process.env.PISAMA_API_KEY;
+  const scope: TokenScope = opts.apply ? 'full' : 'read';
+  const requestId = `atif-${nanoid()}`;
+  const body = JSON.stringify({
+    trajectory,
+    ...(opts.projectId ? { project_id: opts.projectId } : {}),
+    ...(opts.apply
+      ? {
+          apply_fix: true,
+          framework: opts.framework,
+          entity_id: opts.entityId,
+          credentials: credentials ?? {},
+        }
+      : {}),
+  });
   let response: Response;
   try {
-    response = await fetch(`${baseUrl}/api/v1/atif/analyze`, {
+    response = await auth.fetch(scope, `${baseUrl}/api/v1/atif/analyze`, {
       method: 'POST',
       headers: {
         'content-type': 'application/json',
-        // /api/v1/atif/analyze is HTTPBearer-protected. Without this the command
-        // 401s for every user and there was no flag to fix it from their side.
-        ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}),
+        'x-request-id': requestId,
       },
-      body: JSON.stringify({
-        trajectory,
-        ...(opts.projectId ? { project_id: opts.projectId } : {}),
-        ...(opts.apply
-          ? {
-              apply_fix: true,
-              framework: opts.framework,
-              entity_id: opts.entityId,
-              credentials: credentials ?? {},
-            }
-          : {}),
-      }),
+      body,
     });
   } catch (error) {
     fail(
-      `${basename(file)}: could not reach ${baseUrl}/api/v1/atif/analyze\n` +
+      `${basename(file)}: authenticated analyze request failed\n` +
         `  ${kleur.dim((error as Error).message)}`,
     );
   }
@@ -364,11 +367,12 @@ async function analyzeTrajectory(
   baseUrl: string,
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
+  auth: PlatformAuth | undefined,
 ): Promise<{ failureCount: number; highSeverity: boolean }> {
   const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
   const data = opts.local
     ? analyzeTrajectoryLocally(file, trajectory)
-    : await requestAnalysis(file, baseUrl, trajectory, opts, credentials);
+    : await requestAnalysis(file, baseUrl, trajectory, opts, credentials, auth!);
   const highSeverity = data.diagnosis.all_detections.some(
     (detection) => (detection.severity ?? '').toLowerCase() === 'high',
   );
@@ -377,6 +381,25 @@ async function analyzeTrajectory(
   renderTrajectorySummary(label, data);
   if (opts.apply && data.healing) renderHealingSummary(data.healing);
   return { failureCount: data.diagnosis.failure_count, highSeverity };
+}
+
+async function authenticateAnalysis(
+  opts: AnalyzeAtifOptions,
+  baseUrl: string,
+): Promise<PlatformAuth | undefined> {
+  if (opts.local) return undefined;
+  const apiKey = opts.apiKey ?? process.env.PISAMA_API_KEY;
+  if (!apiKey) {
+    fail('Hosted analysis requires --api-key or PISAMA_API_KEY. Use --local for no network.');
+  }
+  const auth = new PlatformAuth(baseUrl, apiKey);
+  const scope: TokenScope = opts.apply ? 'full' : 'read';
+  try {
+    await auth.identity(scope);
+  } catch (error) {
+    fail(`Could not authenticate for ${scope}-scoped ATIF analysis: ${(error as Error).message}`);
+  }
+  return auth;
 }
 
 export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
@@ -399,6 +422,7 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
       `--apply is single-trajectory only; ${files.length} files matched. Pass a single .json file.`,
     );
   }
+  const auth = await authenticateAnalysis(opts, baseUrl);
   const targetIsDir = (await stat(target)).isDirectory();
   step(
     opts.local
@@ -414,7 +438,15 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   let totalFailures = 0;
 
   for (const file of files) {
-    const result = await analyzeTrajectory(file, target, targetIsDir, baseUrl, opts, credentials);
+    const result = await analyzeTrajectory(
+      file,
+      target,
+      targetIsDir,
+      baseUrl,
+      opts,
+      credentials,
+      auth,
+    );
     totalFailures += result.failureCount;
     highSeverityFound ||= result.highSeverity;
   }

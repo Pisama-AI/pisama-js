@@ -11,6 +11,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { TraceExporter } from '../src/exporter.js';
 import type { TraceEvent } from '../src/types.js';
+import { tokenResponse } from './otlp-helpers.js';
 
 function fakeEvent(traceId: string): TraceEvent {
   return {
@@ -51,7 +52,7 @@ function spyConsole(): ConsoleSpy {
   return s;
 }
 
-const TEST_ENDPOINT = 'https://api.example.test/ingest';
+const TEST_ENDPOINT = 'https://api.example.test/api/v1/traces/ingest';
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -59,9 +60,13 @@ function escapeRegExp(value: string): string {
 
 function exporterReturning(status: number, endpoint = TEST_ENDPOINT) {
   return new TraceExporter({
+    apiKey: 'pisama_rejected_test_key',
     projectId: 'ws_rejected_test',
     endpoint,
-    fetchImpl: (async () => new Response('', { status })) as unknown as typeof fetch,
+    fetchImpl: (async (input: RequestInfo | URL) =>
+      String(input).endsWith('/api/v1/auth/token')
+        ? tokenResponse()
+        : new Response('', { status })) as unknown as typeof fetch,
   });
 }
 
@@ -88,7 +93,7 @@ test('a 404 flush warns and names the endpoint instead of failing silently', asy
   }
 });
 
-test('a 401 flush warns that credentials are missing', async () => {
+test('a 401 flush points at API-key scope configuration', async () => {
   const spy = spyConsole();
   try {
     const exporter = exporterReturning(401);
@@ -97,7 +102,7 @@ test('a 401 flush warns that credentials are missing', async () => {
 
     const warned = spy.warns.join('\n');
     assert.ok(warned.includes('401'), `expected the status in the warning, got: ${warned}`);
-    assert.ok(/credential/i.test(warned), `expected a credentials hint, got: ${warned}`);
+    assert.ok(/PISAMA_API_KEY|ingest scope/i.test(warned), `expected an auth hint, got: ${warned}`);
   } finally {
     spy.restore();
   }

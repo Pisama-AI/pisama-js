@@ -225,13 +225,31 @@ function jsonResponse(body: unknown, status = 200): Response {
   });
 }
 
+function testJwt(scope: string, suffix = '1'): string {
+  const claims = Buffer.from(
+    JSON.stringify({ tenant_id: 'tenant-atif-test', scope }),
+    'utf8',
+  ).toString('base64url');
+  return `test.${claims}.token-${scope}-${suffix}`;
+}
+
 function withMockFetch<T>(
   handler: (url: string, init: RequestInit | undefined) => Response | Promise<Response>,
   fn: () => Promise<T>,
+  onToken?: (body: { api_key?: string; scope?: string }, init: RequestInit | undefined) => void,
 ): Promise<T> {
   const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown, init?: RequestInit) =>
-    handler(String(input), init)) as typeof fetch;
+  let tokenIndex = 0;
+  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
+    const url = String(input);
+    if (url.endsWith('/api/v1/auth/token')) {
+      const body = JSON.parse(String(init?.body ?? '{}')) as { api_key?: string; scope?: string };
+      onToken?.(body, init);
+      tokenIndex += 1;
+      return jsonResponse({ access_token: testJwt(body.scope ?? 'full', String(tokenIndex)) });
+    }
+    return handler(url, init);
+  }) as typeof fetch;
   return fn().finally(() => {
     globalThis.fetch = originalFetch;
   });
@@ -246,7 +264,7 @@ test('analyze-atif (remote) happy path: posts the trajectory and exits 0 on no d
       (url, init) => {
         assert.equal(url, 'https://test/api/v1/atif/analyze');
         capturedBody = JSON.parse(String(init?.body ?? '{}'));
-        capturedAuth = (init?.headers as Record<string, string>)?.authorization;
+        capturedAuth = new Headers(init?.headers).get('authorization') ?? undefined;
         return jsonResponse(mockAnalyzeResponse({}));
       },
       () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k-1', baseUrl: 'https://test/' }),
@@ -255,12 +273,114 @@ test('analyze-atif (remote) happy path: posts the trajectory and exits 0 on no d
   } finally {
     s.restore();
   }
-  assert.equal(capturedAuth, 'Bearer k-1');
+  assert.match(capturedAuth ?? '', /^Bearer test\..+\.token-read-1$/);
+  assert.notEqual(capturedAuth, 'Bearer k-1');
   assert.ok((capturedBody?.trajectory as { schema_version?: string })?.schema_version);
   const out = s.logs.join('\n');
   assert.match(out, /against https:\/\/test/);
   assert.match(out, /No detections/);
   assert.match(out, /No high-severity failures/);
+});
+
+test('analyze-atif exchanges the raw key for a scoped JWT and retries exactly once on 401', async () => {
+  const rawKey = 'pisama_raw_secret_never_bearer';
+  const tokenBodies: { api_key?: string; scope?: string }[] = [];
+  const analyzeRequests: {
+    authorization: string | null;
+    requestId: string | null;
+    body: string;
+  }[] = [];
+  const s = spy();
+  try {
+    await withMockFetch(
+      (_url, init) => {
+        const headers = new Headers(init?.headers);
+        analyzeRequests.push({
+          authorization: headers.get('authorization'),
+          requestId: headers.get('x-request-id'),
+          body: String(init?.body),
+        });
+        return analyzeRequests.length === 1
+          ? new Response('expired', { status: 401 })
+          : jsonResponse(mockAnalyzeResponse({}));
+      },
+      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: rawKey, baseUrl: 'https://test' }),
+      (body) => tokenBodies.push(body),
+    );
+  } finally {
+    s.restore();
+  }
+
+  assert.deepEqual(tokenBodies, [
+    { api_key: rawKey, scope: 'read' },
+    { api_key: rawKey, scope: 'read' },
+  ]);
+  assert.equal(analyzeRequests.length, 2);
+  for (const request of analyzeRequests) {
+    assert.match(request.authorization ?? '', /^Bearer test\..+\.token-read-/);
+    assert.notEqual(request.authorization, `Bearer ${rawKey}`);
+  }
+  assert.equal(analyzeRequests[0].requestId, analyzeRequests[1].requestId);
+  assert.equal(analyzeRequests[0].body, analyzeRequests[1].body);
+  assert.ok(!s.logs.join('\n').includes(rawKey));
+  assert.ok(!s.errs.join('\n').includes(rawKey));
+});
+
+test('analyze-atif stops after the single authenticated retry on a persistent 401', async () => {
+  let analyzeCalls = 0;
+  let tokenCalls = 0;
+  const s = spy();
+  try {
+    await withMockFetch(
+      () => {
+        analyzeCalls += 1;
+        return new Response('unauthorized', { status: 401 });
+      },
+      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'secret', baseUrl: 'https://test' }),
+      () => {
+        tokenCalls += 1;
+      },
+    );
+    assert.fail('expected process.exit');
+  } catch (error) {
+    assert.equal((error as Error).message, '__exit__');
+  } finally {
+    s.restore();
+  }
+  assert.equal(tokenCalls, 2);
+  assert.equal(analyzeCalls, 2);
+  assert.ok(s.errs.some((line) => /HTTP 401/.test(line)));
+});
+
+test('analyze-atif requests full scope for --apply and never uses credentials as auth', async () => {
+  const scopes: string[] = [];
+  let authorization: string | null = null;
+  const s = spy();
+  try {
+    await withMockFetch(
+      (_url, init) => {
+        authorization = new Headers(init?.headers).get('authorization');
+        return jsonResponse(mockAnalyzeResponse({ healing: { success: true } }));
+      },
+      () =>
+        analyzeAtif({
+          path: REAL_TRAJECTORY,
+          apply: true,
+          framework: 'n8n',
+          entityId: 'workflow-1',
+          credentials: '{"api_key":"framework-secret"}',
+          apiKey: 'pisama-secret',
+          baseUrl: 'https://test',
+        }),
+      (body) => scopes.push(body.scope ?? ''),
+    );
+  } finally {
+    s.restore();
+  }
+  assert.deepEqual(scopes, ['full']);
+  assert.match(authorization ?? '', /^Bearer test\..+\.token-full-1$/);
+  assert.notEqual(authorization, 'Bearer pisama-secret');
+  assert.notEqual(authorization, 'Bearer framework-secret');
 });
 
 test('analyze-atif (remote) exits 1 when the backend returns a high-severity detection', async () => {
@@ -304,7 +424,7 @@ test('analyze-atif (remote) fails clearly when the analyze endpoint is unreachab
     s.restore();
   }
   assert.equal(s.exitCode, 1);
-  assert.ok(s.errs.some((l) => /could not reach https:\/\/test\/api\/v1\/atif\/analyze/.test(l)));
+  assert.ok(s.errs.some((l) => /authenticated analyze request failed/.test(l)));
 });
 
 test('analyze-atif (remote) fails on a non-ok HTTP status and surfaces the response body', async () => {

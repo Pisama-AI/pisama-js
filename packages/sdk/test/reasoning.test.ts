@@ -30,7 +30,7 @@ interface CapturedTrace {
 }
 
 function firstEvent(captured: { length: number; [i: number]: unknown }[]): CapturedTrace {
-  // The middleware POSTs to /api/v1/spans with body { events: [{ ... }] }.
+  // The shared capture decodes the OTLP span back into a TraceEvent-shaped view.
   const body = (captured as unknown as { body: { events: CapturedTrace[] } }[])[0]!.body;
   return body.events[0]!;
 }

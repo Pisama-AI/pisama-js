@@ -33,18 +33,18 @@ program
 program
   .command('mcp')
   .description(
-    "Run an MCP server over stdio so any MCP-compatible AI assistant can read your project's failures.",
+    'Run an authenticated MCP server over stdio so an MCP-compatible AI assistant can read your tenant traces.',
   )
-  .option('-p, --project-id <id>', 'Pisama project id (defaults to PISAMA_PROJECT_ID env var)')
+  .option('--api-key <key>', 'Pisama API key (defaults to PISAMA_API_KEY)')
   .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
-  .action(async (opts: { projectId?: string; baseUrl?: string }) => {
-    const projectId = opts.projectId ?? process.env.PISAMA_PROJECT_ID;
-    if (!projectId) {
-      console.error('no project id. Pass --project-id or set PISAMA_PROJECT_ID.');
+  .action(async (opts: { apiKey?: string; baseUrl?: string }) => {
+    const apiKey = opts.apiKey ?? process.env.PISAMA_API_KEY;
+    if (!apiKey) {
+      console.error('no API key. Pass --api-key or set PISAMA_API_KEY.');
       process.exit(1);
     }
     await startMcpServer({
-      projectId,
+      apiKey,
       baseUrl: opts.baseUrl,
       serverVersion: version,
     });

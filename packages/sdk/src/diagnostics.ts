@@ -13,8 +13,8 @@
 // The 30s warning is the load-bearing one. It catches:
 //   • model not actually wrapped (most common)
 //   • wrap is in a file that's never imported by the chat route
-//   • PISAMA_PROJECT_ID env var doesn't reach the server runtime
-//   • the hosted ingest route /api/v1/spans is not currently served (404)
+//   • PISAMA_API_KEY env var doesn't reach the server runtime
+//   • the authenticated ingest route is blocked or unavailable
 
 import type { RedactMode } from './redact.js';
 
@@ -62,9 +62,9 @@ export function maybeStartSilenceWarning(
         '[pisama] No events fired in 30s. Common causes:\n' +
           "  • model isn't wrapped — use observe(model, opts) from @pisama/sdk\n" +
           "  • the wrap is in a file that isn't imported by your chat route\n" +
-          "  • PISAMA_PROJECT_ID env var isn't reaching your server runtime\n" +
-          '  • the hosted ingest route /api/v1/spans is not currently served (404)\n' +
-          `Set PISAMA_INGEST_URL to a deployment that serves this contract.\n` +
+          "  • PISAMA_API_KEY isn't reaching your server runtime\n" +
+          '  • API egress is blocked or /api/v1/traces/ingest is unavailable\n' +
+          `Check PISAMA_API_KEY and PISAMA_INGEST_URL.\n` +
           `  project: ${projectId}`,
       );
     }

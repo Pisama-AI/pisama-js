@@ -1,19 +1,22 @@
 ## @pisama/detectors
 
-TypeScript-native failure detectors for AI agent traces. Pure functions, zero runtime dependencies, no LLM calls.
+TypeScript-native failure detectors for AI agent traces. The local detector
+functions are pure, have zero runtime dependencies, and make no network or LLM
+calls. The separately documented `MultiAgentDetectors` namespace is an
+authenticated client for Pisama's hosted detector service.
 
 ```ts
-import { runDetectors, v1Detectors } from "@pisama/detectors";
+import { runDetectors, v1Detectors } from '@pisama/detectors';
 
 const hits = runDetectors({
-  traceId: "t1",
+  traceId: 't1',
   startTime: 0,
   toolCalls: [
-    { toolName: "search", startTime: 0 },
-    { toolName: "search", startTime: 1 },
-    { toolName: "search", startTime: 2 },
-    { toolName: "search", startTime: 3 },
-    { toolName: "search", startTime: 4 },
+    { toolName: 'search', startTime: 0 },
+    { toolName: 'search', startTime: 1 },
+    { toolName: 'search', startTime: 2 },
+    { toolName: 'search', startTime: 3 },
+    { toolName: 'search', startTime: 4 },
   ],
 });
 // hits[0]: { detector: "loop", detected: true, severity: 50, ... }
@@ -29,11 +32,11 @@ The v1 pack ports a subset of the [Pisama](https://pisama.ai) detector library t
 ### Adding a detector
 
 ```ts
-import type { Detector } from "@pisama/detectors";
+import type { Detector } from '@pisama/detectors';
 
 export const myDetector: Detector = {
-  name: "my_detector",
-  description: "what it catches",
+  name: 'my_detector',
+  description: 'what it catches',
   detect(trace) {
     // return { detector, detected, severity, summary, fix?, evidence? }
   },
@@ -48,13 +51,13 @@ round-trips to the Pisama backend, which owns the calibrated detector suite.
 The client exposes only operations that the current endpoint can return
 reliably.
 
-| Operation | Backend category | Status |
-|---|---|---|
-| `coordination` | `coordination` | Available |
-| `persona` | `persona_drift` | Available |
+| Operation      | Backend category | Status    |
+| -------------- | ---------------- | --------- |
+| `coordination` | `coordination`   | Available |
+| `persona`      | `persona_drift`  | Available |
 
 ```ts
-import { createMultiAgentDetectors } from "@pisama/detectors";
+import { createMultiAgentDetectors } from '@pisama/detectors';
 
 const detectors = createMultiAgentDetectors({
   endpoint: process.env.PISAMA_ENDPOINT, // defaults to https://api.pisama.ai
@@ -64,10 +67,10 @@ const detectors = createMultiAgentDetectors({
 
 // Coordination: agent message stream
 const coord = await detectors.coordination({
-  agent_ids: ["planner", "executor"],
+  agent_ids: ['planner', 'executor'],
   messages: [
-    { sender: "planner", recipient: "executor", content: "do X" },
-    { sender: "executor", recipient: "planner", content: "doing Y instead" },
+    { sender: 'planner', recipient: 'executor', content: 'do X' },
+    { sender: 'executor', recipient: 'planner', content: 'doing Y instead' },
   ],
 });
 if (coord.detected) console.warn(coord.title, coord.suggestedFix);
@@ -75,13 +78,18 @@ if (coord.detected) console.warn(coord.title, coord.suggestedFix);
 // Persona drift
 await detectors.persona({
   agent: {
-    id: "support-bot",
-    persona_description: "polite customer-support agent",
-    allowed_actions: ["respond_to_user", "lookup_order"],
+    id: 'support-bot',
+    persona_description: 'polite customer-support agent',
+    allowed_actions: ['respond_to_user', 'lookup_order'],
   },
   output: "ugh fine, here's your refund or whatever.",
 });
 ```
+
+The client exchanges `apiKey` at `POST /api/v1/auth/token` for the full-scoped
+JWT required by the diagnose service. It caches that JWT and refreshes it once
+after a 401. The raw API key is never used as a bearer credential, and a missing
+key fails before any network request.
 
 #### Capability boundary
 

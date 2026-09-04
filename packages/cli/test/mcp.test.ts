@@ -2,6 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawn } from 'node:child_process';
 import { readFileSync } from 'node:fs';
+import { createServer, type IncomingMessage, type ServerResponse } from 'node:http';
+import type { AddressInfo } from 'node:net';
 import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 
@@ -26,10 +28,13 @@ interface RpcExchange {
 async function rpcExchange(
   request: { id: number; method: string; params?: unknown },
   timeoutMs = 4000,
+  options: { apiKey?: string; baseUrl?: string } = {},
 ): Promise<RpcExchange> {
-  const child = spawn(process.execPath, [binPath, 'mcp', '--project-id', 'ws_mcp_test'], {
+  const args = [binPath, 'mcp'];
+  if (options.baseUrl) args.push('--base-url', options.baseUrl);
+  const child = spawn(process.execPath, args, {
     stdio: ['pipe', 'pipe', 'pipe'],
-    env: { ...process.env, PISAMA_PROJECT_ID: 'ws_mcp_test' },
+    env: { ...process.env, PISAMA_API_KEY: options.apiKey ?? 'pisama_mcp_test_key' },
   });
 
   const initMessage = {
@@ -108,8 +113,47 @@ async function rpcExchange(
 async function rpcCall(
   request: { id: number; method: string; params?: unknown },
   timeoutMs = 4000,
+  options: { apiKey?: string; baseUrl?: string } = {},
 ): Promise<JsonRpcResponse> {
-  return (await rpcExchange(request, timeoutMs)).response;
+  return (await rpcExchange(request, timeoutMs, options)).response;
+}
+
+function jwt(scope: string, suffix: number): string {
+  const claims = Buffer.from(JSON.stringify({ tenant_id: 'tenant-mcp-1', scope }), 'utf8').toString(
+    'base64url',
+  );
+  return `test.${claims}.token-${suffix}`;
+}
+
+async function requestBody(request: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  for await (const chunk of request) chunks.push(Buffer.from(chunk));
+  return Buffer.concat(chunks).toString('utf8');
+}
+
+function respond(response: ServerResponse, status: number, body: unknown): void {
+  response.writeHead(status, { 'content-type': 'application/json' });
+  response.end(JSON.stringify(body));
+}
+
+async function withHttpServer<T>(
+  handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>,
+  run: (baseUrl: string) => Promise<T>,
+): Promise<T> {
+  const server = createServer((request, response) => {
+    void Promise.resolve(handler(request, response)).catch((error) => {
+      respond(response, 500, { error: String(error) });
+    });
+  });
+  await new Promise<void>((resolveP) => server.listen(0, '127.0.0.1', resolveP));
+  const address = server.address() as AddressInfo;
+  try {
+    return await run(`http://127.0.0.1:${address.port}`);
+  } finally {
+    await new Promise<void>((resolveP, reject) =>
+      server.close((error) => (error ? reject(error) : resolveP())),
+    );
+  }
 }
 
 interface ToolDef {
@@ -224,6 +268,194 @@ test('mcp: missing traceId returns isError with structured error payload', async
     result.structuredContent.error?.message?.includes('traceId'),
     `expected error.message to mention traceId, got ${result.structuredContent.error?.message}`,
   );
+});
+
+test('mcp: executable exchanges the raw key and reads current tenant routes with one 401 retry', async () => {
+  const rawKey = 'pisama_mcp_raw_secret';
+  const traceId = '11111111-1111-4111-8111-111111111111';
+  let tokenCalls = 0;
+  let traceCalls = 0;
+  const protectedHeaders: Array<string | undefined> = [];
+
+  await withHttpServer(
+    async (request, response) => {
+      const url = new URL(request.url ?? '/', 'http://test');
+      if (url.pathname === '/api/v1/auth/token') {
+        tokenCalls += 1;
+        assert.equal(request.headers.authorization, undefined);
+        assert.deepEqual(JSON.parse(await requestBody(request)), {
+          api_key: rawKey,
+          scope: 'read',
+        });
+        respond(response, 200, { access_token: jwt('read', tokenCalls) });
+        return;
+      }
+
+      protectedHeaders.push(request.headers.authorization);
+      assert.notEqual(request.headers.authorization, `Bearer ${rawKey}`);
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
+        traceCalls += 1;
+        assert.equal(url.searchParams.get('page'), '1');
+        assert.equal(url.searchParams.get('per_page'), '5');
+        if (traceCalls === 1) {
+          respond(response, 401, { detail: 'expired' });
+          return;
+        }
+        respond(response, 200, {
+          traces: [
+            {
+              id: traceId,
+              session_id: 'session-1',
+              framework: 'vercel-ai-sdk',
+              status: 'completed',
+              detection_status: 'complete',
+              total_tokens: 42,
+              total_cost_cents: 3,
+              created_at: '2026-09-04T12:00:00Z',
+              completed_at: '2026-09-04T12:00:01Z',
+              detection_count: 1,
+              state_count: 1,
+            },
+          ],
+          total: 1,
+          page: 1,
+          per_page: 5,
+        });
+        return;
+      }
+      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
+        assert.equal(url.searchParams.get('trace_id'), traceId);
+        respond(response, 200, {
+          items: [
+            {
+              detection_type: 'loop',
+              confidence: 80,
+              details: { repeated: 4 },
+              explanation: 'Repeated the same tool.',
+              suggested_fix: 'Bound retries.',
+            },
+          ],
+          total: 1,
+          page: 1,
+          per_page: 100,
+        });
+        return;
+      }
+      respond(response, 404, { detail: 'not found' });
+    },
+    async (baseUrl) => {
+      const response = await rpcCall(
+        {
+          id: 20,
+          method: 'tools/call',
+          params: { name: 'get_recent_failures', arguments: { limit: 5 } },
+        },
+        5000,
+        { apiKey: rawKey, baseUrl },
+      );
+      assert.equal(response.error, undefined, JSON.stringify(response));
+      const result = response.result as {
+        isError?: boolean;
+        content: { text: string }[];
+        structuredContent?: {
+          tenantId?: string;
+          events?: Array<{ event?: { traceId?: string }; hits?: Array<{ detector?: string }> }>;
+        };
+      };
+      assert.equal(result.isError, false);
+      assert.equal(result.structuredContent?.tenantId, 'tenant-mcp-1');
+      assert.equal(result.structuredContent?.events?.[0]?.event?.traceId, traceId);
+      assert.equal(result.structuredContent?.events?.[0]?.hits?.[0]?.detector, 'loop');
+      assert.match(result.content[0].text, /loop\/8/);
+    },
+  );
+
+  assert.equal(tokenCalls, 2, 'initial exchange plus exactly one 401 re-exchange');
+  assert.equal(traceCalls, 2, 'protected request retries exactly once');
+  assert.ok(protectedHeaders.every((header) => header?.startsWith('Bearer test.')));
+});
+
+test('mcp: get_trace uses exact authenticated trace, states, and detections routes', async () => {
+  const traceId = '22222222-2222-4222-8222-222222222222';
+  const seenPaths: string[] = [];
+  await withHttpServer(
+    async (request, response) => {
+      const url = new URL(request.url ?? '/', 'http://test');
+      if (url.pathname === '/api/v1/auth/token') {
+        const body = JSON.parse(await requestBody(request)) as { scope?: string };
+        respond(response, 200, { access_token: jwt(body.scope ?? 'read', 1) });
+        return;
+      }
+      seenPaths.push(`${url.pathname}${url.search}`);
+      assert.match(request.headers.authorization ?? '', /^Bearer test\./);
+      if (url.pathname.endsWith(`/traces/${traceId}`)) {
+        respond(response, 200, {
+          id: traceId,
+          session_id: 'session-detail',
+          framework: 'langgraph',
+          status: 'completed',
+          detection_status: 'complete',
+          total_tokens: 10,
+          total_cost_cents: 1,
+          created_at: '2026-09-04T12:00:00Z',
+          completed_at: '2026-09-04T12:00:01Z',
+          detection_count: 1,
+          state_count: 1,
+        });
+        return;
+      }
+      if (url.pathname.endsWith(`/traces/${traceId}/states`)) {
+        assert.equal(url.searchParams.get('full_state'), 'true');
+        assert.equal(url.searchParams.get('limit'), '2000');
+        respond(response, 200, [
+          {
+            id: '33333333-3333-4333-8333-333333333333',
+            sequence_num: 0,
+            agent_id: 'agent',
+            state_delta: { _prompt: 'Diagnose this run.' },
+            response_redacted: 'The run looped.',
+            token_count: 10,
+            latency_ms: 1000,
+            created_at: '2026-09-04T12:00:00Z',
+          },
+        ]);
+        return;
+      }
+      if (url.pathname.endsWith('/detections')) {
+        assert.equal(url.searchParams.get('trace_id'), traceId);
+        respond(response, 200, { items: [], total: 0, page: 1, per_page: 100 });
+        return;
+      }
+      respond(response, 404, { detail: 'not found' });
+    },
+    async (baseUrl) => {
+      const response = await rpcCall(
+        {
+          id: 21,
+          method: 'tools/call',
+          params: { name: 'get_trace', arguments: { traceId } },
+        },
+        5000,
+        { apiKey: 'pisama_key', baseUrl },
+      );
+      const result = response.result as {
+        isError?: boolean;
+        structuredContent?: {
+          event?: {
+            prompt?: string;
+            completion?: string;
+            toolCalls?: unknown[];
+            metadata?: unknown;
+          };
+        };
+      };
+      assert.equal(result.isError, false, JSON.stringify(response));
+      assert.equal(result.structuredContent?.event?.prompt, 'Diagnose this run.');
+      assert.equal(result.structuredContent?.event?.completion, 'The run looped.');
+      assert.deepEqual(result.structuredContent?.event?.toolCalls, []);
+    },
+  );
+  assert.equal(seenPaths.length, 3);
 });
 
 // ---------------------------------------------------------------------------
@@ -388,11 +620,10 @@ test('mcp: prompts/get for daily_quality_report renders without tenant', async (
 test('mcp: tool call propagates errors when base url is unreachable', async () => {
   // Override base-url to a non-routable address; fetch should fail and the
   // tool call should return isError:true with a text payload.
-  const child = spawn(
-    process.execPath,
-    [binPath, 'mcp', '--project-id', 'ws_mcp_test', '--base-url', 'http://127.0.0.1:1'],
-    { stdio: ['pipe', 'pipe', 'pipe'] },
-  );
+  const child = spawn(process.execPath, [binPath, 'mcp', '--base-url', 'http://127.0.0.1:1'], {
+    stdio: ['pipe', 'pipe', 'pipe'],
+    env: { ...process.env, PISAMA_API_KEY: 'pisama_mcp_test_key' },
+  });
   const init = {
     jsonrpc: '2.0',
     id: 0,

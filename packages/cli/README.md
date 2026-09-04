@@ -11,7 +11,7 @@ a global install.
 | `pisama-ts init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
 | `pisama-ts verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
 | `pisama-ts analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API (or none, with `--local`) |
-| `pisama-ts mcp`          | Expose Pisama failures to an MCP client  | Reads project trace data from the configured API           |
+| `pisama-ts mcp`          | Expose Pisama failures to an MCP client  | Reads authenticated tenant trace data from the configured API |
 
 The `pisama` and `pisama-ts` commands are equivalent starting in version
 0.10.3. The registry-backed examples use `pisama-ts` so they also work with
@@ -41,10 +41,13 @@ Run this inside your Next.js and Vercel AI SDK project. The CLI:
 1. Detects `ai` + `next` in `package.json`.
 2. Uses the TypeScript AST to patch the first `streamText` or `generateText`
    call so its model is wrapped with `observe(model)` from `@pisama/sdk`.
-3. Writes `PISAMA_PROJECT_ID` to `.env.local`.
-4. Prints the command to install `@pisama/sdk` when it is missing. The CLI does not
+3. Writes an optional `PISAMA_PROJECT_ID` service label to `.env.local`.
+4. Checks for `PISAMA_API_KEY` and points to the API-key settings page when it
+   is missing. The CLI never invents or persists this secret; configure it in
+   the server runtime.
+5. Prints the command to install `@pisama/sdk` when it is missing. The CLI does not
    edit your `package.json`, so run that command yourself before building.
-5. Opens `https://pisama.ai/dashboard`.
+6. Opens `https://pisama.ai/dashboard`.
 
 Hit your chat route once. The first failure your agent throws will show up live.
 
@@ -60,26 +63,29 @@ Flags:
 npx --yes --package=@pisama/cli@latest -- pisama-ts verify
 ```
 
-Posts a generated verification trace to Pisama's ingest API and waits for it
-to surface on `/live/<projectId>`. Use this after installation to prove the
-full round trip works independently of the SDK instrumentation. If `verify`
-succeeds but your real chat produces no traces, check that the model is
-wrapped in a code path your application actually imports.
+Exchanges `PISAMA_API_KEY` for narrowly scoped access tokens, posts a generated
+OTLP JSON trace to Pisama's authenticated ingest API, and waits for it to
+surface through the tenant read API. Tokens are cached by scope and exchanged
+at most once again after a 401; the raw key is never sent as bearer auth. Use
+this after installation to prove the full round trip independently of SDK
+instrumentation. If `verify` succeeds but your real chat produces no traces,
+check that the model is wrapped in a code path your application actually
+imports.
 
-Project ID resolution order:
+API-key resolution order:
 
-1. `--project-id`
-2. `PISAMA_PROJECT_ID`
-3. `.env.local` in `--cwd`
+1. `--api-key`
+2. `PISAMA_API_KEY`
 
 Flags:
 
 - `--cwd <path>`: project root for reading `.env.local` (default: cwd)
-- `-p, --project-id <id>`: override the resolved project id
+- `--api-key <key>`: override `PISAMA_API_KEY` (prefer the environment to avoid shell history)
 - `--base-url <url>`: point at a self-hosted Pisama API (default `https://api.pisama.ai`)
 - `--timeout-ms <ms>`: how long to wait for the trace to surface (default 15000)
 
-Exit code is 0 on success, 1 on any failure (no project id, ingest 5xx, network error, or trace didn't land within the timeout).
+Exit code is 0 on success, 1 on any failure (missing/rejected key, insufficient
+scope, ingest 5xx, network error, or trace not landing within the timeout).
 
 ### `pisama-ts analyze-atif`
 
@@ -97,6 +103,9 @@ version in both modes below. It prints detector evidence and exits with code
 - **Default**: sends each trajectory to Pisama's `/api/v1/atif/analyze`
   endpoint, which runs the full calibrated backend detector suite (and
   supports `--apply` healing). Requires network access and `PISAMA_API_KEY`.
+  The key is exchanged for a read-scoped JWT, or a full-scoped JWT when you
+  explicitly pass `--apply`; it is never sent as bearer auth. A 401 causes at
+  most one token re-exchange and exact request retry.
 - **`--local`**: runs `@pisama/detectors`' v1 pack (loop, repetition, cost,
   completion, hallucination, context, derailment) in-process. No network
   call, no API key, and no `--apply` — it's a simplified subset of the
@@ -134,11 +143,18 @@ machine entirely, at the cost of the backend's full calibrated suite.
 ### `pisama-ts mcp`
 
 Runs an MCP server over stdio so any MCP-compatible AI assistant can read your
-project's failures inline. The server exposes three read-only tools:
+tenant's failures inline. The server exchanges `PISAMA_API_KEY` for a
+read-scoped JWT and uses the authenticated tenant API. The raw key is never a
+bearer token, and each protected request re-exchanges at most once after a
+401. The server exposes three read-only tools:
 
 - `get_recent_failures(limit?)`: recent traces that fired any detector
 - `get_recent_traces(limit?)`: recent traces, regardless of failure status
-- `get_trace(traceId)`: full prompt, completion, tool calls, detector hits for one trace
+- `get_trace(traceId)`: available prompt/completion state, trace metadata, and detector hits
+
+The current tenant state response does not expose stored tool-call objects;
+`get_trace` therefore reports `toolCalls: []` and
+`metadata.toolCallsAvailable: false` instead of inventing data.
 
 It also exposes four reusable MCP prompts:
 
@@ -157,7 +173,7 @@ Add this to your MCP client's server config (path varies by client: consult your
     "pisama": {
       "command": "npx",
       "args": ["--yes", "--package=@pisama/cli@latest", "--", "pisama-ts", "mcp"],
-      "env": { "PISAMA_PROJECT_ID": "ws_yourprojectid" }
+      "env": { "PISAMA_API_KEY": "pisama_your_server_side_key" }
     }
   }
 }
@@ -165,11 +181,11 @@ Add this to your MCP client's server config (path varies by client: consult your
 
 Then ask your assistant something like, "What did my AI agent break in the
 last hour?" The assistant can call `get_recent_failures` and answer with data
-from your Pisama project.
+from your Pisama tenant.
 
 Flags:
 
-- `-p, --project-id <id>`: overrides the `PISAMA_PROJECT_ID` env var
+- `--api-key <key>`: overrides `PISAMA_API_KEY` (prefer the environment to avoid shell history)
 - `--base-url <url>`: point at a self-hosted Pisama API (default `https://api.pisama.ai`)
 
 ## Trust and privacy

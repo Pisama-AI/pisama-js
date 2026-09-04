@@ -4,7 +4,8 @@
  * We mock fetch and assert:
  *   - request shape (method, path, headers, body)
  *   - typed result is returned with the right category
- *   - auth headers are injected when apiKey + projectId are set
+ *   - the raw API key is exchanged for a full-scoped JWT and never used as bearer auth
+ *   - a 401 causes exactly one token refresh with an identical request body/id
  *   - 4xx and 5xx surface as PisamaBackendError with status
  *   - network errors surface as PisamaBackendError
  *   - input validation rejects malformed inputs
@@ -41,6 +42,14 @@ interface CapturedRequest {
   method: string | undefined;
   headers: Record<string, string>;
   body: unknown;
+  rawBody: string | null;
+  redirect: RequestRedirect | undefined;
+}
+
+function scopedToken(scope: string, sequence: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ scope })).toString('base64url');
+  return `${header}.${payload}.test-${sequence}`;
 }
 
 function makeFetchMock(
@@ -48,20 +57,29 @@ function makeFetchMock(
     status: number;
     body: unknown;
   },
-): { fetch: typeof fetch; calls: CapturedRequest[] } {
+): { fetch: typeof fetch; calls: CapturedRequest[]; authCalls: CapturedRequest[] } {
   const calls: CapturedRequest[] = [];
+  const authCalls: CapturedRequest[] = [];
   const fn = async (url: string | URL, init?: RequestInit): Promise<Response> => {
     const headers: Record<string, string> = {};
     const initHeaders = (init?.headers ?? {}) as Record<string, string>;
     for (const k of Object.keys(initHeaders)) {
       headers[k.toLowerCase()] = initHeaders[k]!;
     }
+    const rawBody = typeof init?.body === 'string' ? init.body : null;
     const captured: CapturedRequest = {
       url: String(url),
       method: init?.method,
       headers,
-      body: init?.body ? JSON.parse(init.body as string) : null,
+      body: rawBody ? JSON.parse(rawBody) : null,
+      rawBody,
+      redirect: init?.redirect,
     };
+    if (captured.url.endsWith('/api/v1/auth/token')) {
+      authCalls.push(captured);
+      const scope = (captured.body as { scope?: string } | null)?.scope ?? 'unknown';
+      return Response.json({ access_token: scopedToken(scope, authCalls.length) });
+    }
     calls.push(captured);
     const { status, body } = responder(captured);
     return new Response(JSON.stringify(body), {
@@ -69,7 +87,7 @@ function makeFetchMock(
       headers: { 'content-type': 'application/json' },
     });
   };
-  return { fetch: fn as unknown as typeof fetch, calls };
+  return { fetch: fn as unknown as typeof fetch, calls, authCalls };
 }
 
 const baseResponse = (detections: unknown[] = []) => ({
@@ -109,6 +127,7 @@ test('coordination: posts to /diagnose/why-failed with typed input and returns t
 
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
+    apiKey: 'pisama_coordination_test_key',
     fetchImpl: fetch,
   });
 
@@ -150,6 +169,7 @@ test('coordination: returns stub when backend returns no matching detection', as
   }));
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
+    apiKey: 'pisama_empty_test_key',
     fetchImpl: fetch,
   });
   const result = await det.coordination({
@@ -198,6 +218,7 @@ test('persona: posts agent persona + output, maps persona_drift category', async
 
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
+    apiKey: 'pisama_persona_test_key',
     fetchImpl: fetch,
   });
   const input: PersonaInput = {
@@ -240,14 +261,15 @@ test('public API omits detector operations that the backend cannot surface', () 
 
 // ---- auth & errors ----
 
-test('auth headers: bearer token + project id injected when configured', async () => {
-  const { fetch, calls } = makeFetchMock(() => ({
+test('auth exchanges the raw key for a full JWT and preserves the project label', async () => {
+  const { fetch, calls, authCalls } = makeFetchMock(() => ({
     status: 200,
     body: baseResponse([]),
   }));
+  const rawKey = 'pisama_raw_test_key';
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
-    apiKey: 'sk-test-123',
+    apiKey: rawKey,
     projectId: 'proj-abc',
     fetchImpl: fetch,
   });
@@ -255,8 +277,188 @@ test('auth headers: bearer token + project id injected when configured', async (
     agent_ids: ['a'],
     messages: [{ sender: 'a', content: 'hi' }],
   });
-  assert.equal(calls[0]!.headers['authorization'], 'Bearer sk-test-123');
+  assert.equal(authCalls.length, 1);
+  assert.deepEqual(authCalls[0]!.body, { api_key: rawKey, scope: 'full' });
+  assert.equal(authCalls[0]!.headers['authorization'], undefined);
+  assert.equal(calls[0]!.headers['authorization'], `Bearer ${scopedToken('full', 1)}`);
+  assert.notEqual(calls[0]!.headers['authorization'], `Bearer ${rawKey}`);
   assert.equal(calls[0]!.headers['x-pisama-project-id'], 'proj-abc');
+  assert.match(calls[0]!.headers['x-request-id']!, /^pisama-detect-/);
+  assert.equal(authCalls[0]!.redirect, 'error');
+  assert.equal(calls[0]!.redirect, 'error');
+});
+
+test('auth retries exactly once on 401 with a fresh JWT and identical request', async () => {
+  let attempt = 0;
+  const { fetch, calls, authCalls } = makeFetchMock(() => ({
+    status: attempt++ === 0 ? 401 : 200,
+    body: attempt === 1 ? { detail: 'expired' } : baseResponse([]),
+  }));
+  const rawKey = 'pisama_retry_test_key';
+  const det = createMultiAgentDetectors({
+    endpoint: 'http://mock.local',
+    apiKey: rawKey,
+    fetchImpl: fetch,
+  });
+
+  await det.coordination({ agent_ids: ['a'], messages: [] });
+
+  assert.equal(authCalls.length, 2);
+  assert.equal(calls.length, 2);
+  assert.equal(calls[0]!.headers['authorization'], `Bearer ${scopedToken('full', 1)}`);
+  assert.equal(calls[1]!.headers['authorization'], `Bearer ${scopedToken('full', 2)}`);
+  assert.equal(calls[0]!.rawBody, calls[1]!.rawBody);
+  assert.equal(calls[0]!.headers['x-request-id'], calls[1]!.headers['x-request-id']);
+  assert.ok(calls.every((call) => call.headers['authorization'] !== `Bearer ${rawKey}`));
+});
+
+test('auth stops after one refresh when the diagnose route keeps returning 401', async () => {
+  const { fetch, calls, authCalls } = makeFetchMock(() => ({
+    status: 401,
+    body: { detail: 'still expired' },
+  }));
+  const det = createMultiAgentDetectors({
+    endpoint: 'http://mock.local',
+    apiKey: 'pisama_persistent_401_key',
+    fetchImpl: fetch,
+  });
+
+  await assert.rejects(
+    () => det.coordination({ agent_ids: ['a'], messages: [] }),
+    (error: unknown) => error instanceof PisamaBackendError && error.status === 401,
+  );
+  assert.equal(authCalls.length, 2);
+  assert.equal(calls.length, 2);
+});
+
+test('auth token is cached across detector operations', async () => {
+  const { fetch, authCalls } = makeFetchMock(() => ({
+    status: 200,
+    body: baseResponse([]),
+  }));
+  const det = createMultiAgentDetectors({
+    endpoint: 'http://mock.local',
+    apiKey: 'pisama_cache_test_key',
+    fetchImpl: fetch,
+  });
+
+  await det.coordination({ agent_ids: ['a'], messages: [] });
+  await det.persona({
+    agent: { id: 'a', persona_description: 'tester', allowed_actions: [] },
+    output: 'hello',
+  });
+
+  assert.equal(authCalls.length, 1);
+});
+
+test('auth rejects missing, unknown, and insufficient token scopes before diagnosis', async () => {
+  for (const scope of ['', 'admin', 'read']) {
+    let calls = 0;
+    const det = createMultiAgentDetectors({
+      endpoint: 'http://mock.local',
+      apiKey: 'pisama_scope_test_key',
+      fetchImpl: (async (input: RequestInfo | URL) => {
+        if (String(input).endsWith('/api/v1/auth/token')) {
+          return Response.json({ access_token: scopedToken(scope, 1) });
+        }
+        calls++;
+        return Response.json(baseResponse([]));
+      }) as typeof fetch,
+    });
+
+    await assert.rejects(
+      () => det.coordination({ agent_ids: ['a'], messages: [] }),
+      /scope|scoped/i,
+    );
+    assert.equal(calls, 0);
+  }
+});
+
+test('concurrent 401s share one refresh and cannot evict the fresh token', async () => {
+  let tokenCalls = 0;
+  let initialCalls = 0;
+  let releaseInitial!: () => void;
+  const bothInitialStarted = new Promise<void>((resolve) => {
+    releaseInitial = resolve;
+  });
+  const protectedTokens: string[] = [];
+  const fetchImpl = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    if (String(input).endsWith('/api/v1/auth/token')) {
+      tokenCalls++;
+      return Response.json({ access_token: scopedToken('full', tokenCalls) });
+    }
+    const authorization = new Headers(init.headers).get('authorization') ?? '';
+    protectedTokens.push(authorization);
+    if (authorization === `Bearer ${scopedToken('full', 1)}`) {
+      initialCalls++;
+      if (initialCalls === 2) releaseInitial();
+      await bothInitialStarted;
+      return Response.json({ detail: 'expired' }, { status: 401 });
+    }
+    return Response.json(baseResponse([]));
+  }) as typeof fetch;
+  const det = createMultiAgentDetectors({
+    endpoint: 'http://mock.local',
+    apiKey: 'pisama_concurrent_test_key',
+    fetchImpl,
+  });
+
+  await Promise.all([
+    det.coordination({ agent_ids: ['a'], messages: [] }),
+    det.persona({
+      agent: { id: 'a', persona_description: 'tester', allowed_actions: [] },
+      output: 'hello',
+    }),
+  ]);
+
+  assert.equal(tokenCalls, 2);
+  assert.deepEqual(protectedTokens, [
+    `Bearer ${scopedToken('full', 1)}`,
+    `Bearer ${scopedToken('full', 1)}`,
+    `Bearer ${scopedToken('full', 2)}`,
+    `Bearer ${scopedToken('full', 2)}`,
+  ]);
+});
+
+test('rejected API-key exchange surfaces its status without a diagnose request', async () => {
+  let requestCount = 0;
+  const det = createMultiAgentDetectors({
+    endpoint: 'http://mock.local',
+    apiKey: 'pisama_rejected_test_key',
+    fetchImpl: (async () => {
+      requestCount += 1;
+      return Response.json({ detail: 'invalid key' }, { status: 401 });
+    }) as unknown as typeof fetch,
+  });
+
+  await assert.rejects(
+    () => det.coordination({ agent_ids: ['a'], messages: [] }),
+    (error: unknown) => {
+      assert.ok(error instanceof PisamaBackendError);
+      assert.equal(error.status, 401);
+      assert.deepEqual(error.body, { detail: 'invalid key' });
+      return true;
+    },
+  );
+  assert.equal(requestCount, 1);
+});
+
+test('missing API key fails closed before any network request', async () => {
+  let requestCount = 0;
+  const det = createMultiAgentDetectors({
+    endpoint: 'http://mock.local',
+    apiKey: '',
+    fetchImpl: (async () => {
+      requestCount += 1;
+      return Response.json({});
+    }) as unknown as typeof fetch,
+  });
+
+  await assert.rejects(
+    () => det.coordination({ agent_ids: ['a'], messages: [] }),
+    /PISAMA_API_KEY or apiKey is required; no network request was made/,
+  );
+  assert.equal(requestCount, 0);
 });
 
 test('error: 4xx surfaces as PisamaBackendError with status', async () => {
@@ -266,6 +468,7 @@ test('error: 4xx surfaces as PisamaBackendError with status', async () => {
   }));
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
+    apiKey: 'pisama_4xx_test_key',
     fetchImpl: fetch,
   });
   await assert.rejects(
@@ -288,6 +491,7 @@ test('error: 5xx surfaces as PisamaBackendError', async () => {
   }));
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
+    apiKey: 'pisama_5xx_test_key',
     fetchImpl: fetch,
   });
   await assert.rejects(
@@ -306,6 +510,7 @@ test('error: network failure surfaces as PisamaBackendError without status', asy
   }) as unknown as typeof fetch;
   const det = createMultiAgentDetectors({
     endpoint: 'http://mock.local',
+    apiKey: 'pisama_network_test_key',
     fetchImpl: failingFetch,
   });
   await assert.rejects(

@@ -1,12 +1,14 @@
-// Pisama MCP server. Runs over stdio. Hand it a project ID via
-// --project-id or PISAMA_PROJECT_ID and it exposes three tools:
+// Pisama MCP server. Runs over stdio. Hand it a Pisama API key via
+// --api-key or PISAMA_API_KEY and it exposes three read-only tools:
 //
 //   get_recent_failures   list the most recent traces that fired any detector
 //   get_recent_traces     list the most recent traces (with or without hits)
 //   get_trace             fetch one specific trace by traceId
 //
 // Wire it into any MCP-compatible AI assistant's server config and the
-// AI can answer "what did my agent break this morning?" against real data.
+// AI can answer "what did my agent break this morning?" against real,
+// authenticated tenant data. Raw API keys are only sent to /auth/token; all
+// trace and detection reads use a read-scoped JWT.
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
 import {
@@ -15,6 +17,7 @@ import {
   ListPromptsRequestSchema,
   ListToolsRequestSchema,
 } from '@modelcontextprotocol/sdk/types.js';
+import { PlatformAuth, PlatformAuthError } from './platform-auth.js';
 
 const DEFAULT_BASE = 'https://api.pisama.ai';
 
@@ -25,7 +28,7 @@ interface ToolCallArgs {
 
 interface TraceEvent {
   traceId: string;
-  spanId: string;
+  spanId?: string;
   startTime: number;
   endTime: number;
   model: string;
@@ -54,22 +57,30 @@ interface TraceWithHits {
 }
 
 interface TracesResponse {
-  projectId: string;
+  tenantId: string;
   count: number;
   events: TraceWithHits[];
 }
 
 export interface McpOptions {
-  projectId: string;
+  apiKey: string;
   serverVersion: string;
   baseUrl?: string;
   fetchImpl?: typeof fetch;
 }
 
 export async function startMcpServer(opts: McpOptions): Promise<void> {
-  const baseUrl = opts.baseUrl ?? DEFAULT_BASE;
+  const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
   const fetchImpl = opts.fetchImpl ?? fetch;
-  const projectId = opts.projectId;
+  const auth = new PlatformAuth(baseUrl, opts.apiKey, fetchImpl);
+  let tenantIdentity: Promise<string> | undefined;
+  const getTenantId = (): Promise<string> => {
+    tenantIdentity ??= auth.identity('read').then((claims) => claims.tenantId);
+    return tenantIdentity.catch((error) => {
+      tenantIdentity = undefined;
+      throw error;
+    });
+  };
 
   const server = new Server(
     { name: 'pisama', version: opts.serverVersion },
@@ -88,14 +99,14 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
   //   - title              human-friendly label
   //   - outputSchema       JSON Schema for structuredContent
   //   - annotations        readOnly/destructive/idempotent/openWorld hints
-  // All three Pisama tools are pure reads against the public API, so we mark
+  // All three Pisama tools are pure reads against the authenticated API, so we mark
   // them readOnlyHint: true, destructiveHint: false, idempotentHint: true.
   // openWorldHint: true because we call out to api.pisama.ai (a remote service
   // that can return new traces between calls).
   const traceListSchema = {
     type: 'object' as const,
     properties: {
-      projectId: { type: 'string' },
+      tenantId: { type: 'string' },
       count: { type: 'number' },
       events: {
         type: 'array',
@@ -171,7 +182,7 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
         name: 'get_trace',
         title: 'Get Trace',
         description:
-          'Fetch one specific trace by its traceId. Returns full prompt, completion, tool calls, and any detector hits.',
+          'Fetch one trace by traceId. Returns available prompt and completion text, state metadata, and detector hits.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -215,7 +226,7 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
       switch (request.params.name) {
         case 'get_recent_failures': {
           const limit = clampLimit(args.limit, 20);
-          const data = await fetchTraces(fetchImpl, baseUrl, projectId, {
+          const data = await fetchRecentTraces(auth, baseUrl, await getTenantId(), {
             limit,
             onlyFailures: true,
           });
@@ -227,7 +238,7 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
         }
         case 'get_recent_traces': {
           const limit = clampLimit(args.limit, 20);
-          const data = await fetchTraces(fetchImpl, baseUrl, projectId, {
+          const data = await fetchRecentTraces(auth, baseUrl, await getTenantId(), {
             limit,
             onlyFailures: false,
           });
@@ -242,18 +253,7 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
           if (!traceId) {
             return buildErrorResult('validation_error', 'traceId is required');
           }
-          const data = await fetchTraces(fetchImpl, baseUrl, projectId, {
-            limit: 200,
-            onlyFailures: false,
-          });
-          const match = data.events.find((e) => e.event.traceId === traceId);
-          if (!match) {
-            return buildErrorResult(
-              'not_found',
-              `no trace ${traceId} in the recent buffer (max 200). It may have aged out.`,
-              { traceId },
-            );
-          }
+          const match = await fetchTrace(auth, baseUrl, await getTenantId(), traceId);
           return {
             content: [{ type: 'text', text: formatTrace(match) }],
             structuredContent: match as unknown as Record<string, unknown>,
@@ -267,7 +267,15 @@ export async function startMcpServer(opts: McpOptions): Promise<void> {
       }
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      return buildErrorResult('upstream_error', message);
+      const code =
+        err instanceof PlatformAuthError
+          ? 'auth_error'
+          : err instanceof PlatformResponseError && [401, 403].includes(err.status)
+            ? 'auth_error'
+            : err instanceof PlatformResponseError && err.status === 404
+              ? 'not_found'
+              : 'upstream_error';
+      return buildErrorResult(code, message);
     }
   });
 
@@ -280,111 +288,274 @@ function clampLimit(n: number | undefined, fallback: number): number {
   return Math.min(Math.floor(n), 200);
 }
 
-async function fetchTraces(
-  fetchImpl: typeof fetch,
-  baseUrl: string,
-  projectId: string,
-  opts: { limit: number; onlyFailures: boolean },
-): Promise<TracesResponse> {
-  // Anonymous shared-secret read endpoint. The project_id in the URL IS the
-  // auth — the backend resolves it to the owning tenant (claimed or not) and
-  // returns recent traces. See ~/pisama/backend/app/api/v1/projects.py.
-  // Filtering by `only=failures` is done client-side after the response
-  // since this endpoint doesn't accept it (yet).
-  const url = new URL(`/api/v1/projects/${encodeURIComponent(projectId)}/traces`, baseUrl);
-  url.searchParams.set('limit', String(opts.limit));
-  const res = await fetchImpl(url.toString(), {
-    headers: { 'x-pisama-project-id': projectId },
-  });
-  if (res.status === 404) {
-    throw new Error(
-      `pisama ${baseUrl} returned 404 from /api/v1/projects/${projectId}/traces. ` +
-        'This CLI version targets the authenticated tenant-scoped API — the anonymous ' +
-        'project-id-only flow is no longer served. Pass --api-key (or set PISAMA_API_KEY) ' +
-        'to use the authenticated contract.',
-    );
-  }
-  if (!res.ok) {
-    throw new Error(`pisama ${baseUrl} returned ${res.status}`);
-  }
-  const raw = (await res.json()) as AnonymousTracesResponse;
-  return adaptAnonymousResponse(projectId, raw, opts.onlyFailures);
-}
-
-interface AnonymousTrace {
-  trace_id: string;
+interface PlatformTrace {
+  id: string;
   session_id?: string | null;
   framework?: string | null;
   status?: string | null;
   detection_status?: string | null;
   total_tokens?: number | null;
+  total_cost_cents?: number | null;
   created_at?: string | null;
   completed_at?: string | null;
-  detections: AnonymousDetection[];
+  state_count?: number | null;
+  detection_count?: number | null;
+  detection_metadata?: Record<string, unknown> | null;
 }
 
-interface AnonymousDetection {
-  type?: string | null;
-  confidence?: number | null;
-  details?: unknown;
+interface PlatformState {
+  id: string;
+  sequence_num: number;
+  agent_id?: string | null;
+  state_delta?: Record<string, unknown> | null;
+  response_redacted?: string | null;
+  token_count?: number | null;
+  latency_ms?: number | null;
   created_at?: string | null;
 }
 
-interface AnonymousTracesResponse {
-  traces: AnonymousTrace[];
+interface PlatformDetection {
+  detection_type?: string | null;
+  confidence?: number | null;
+  details?: Record<string, unknown> | null;
+  explanation?: string | null;
+  suggested_action?: string | null;
+  suggested_fix?: string | null;
+  created_at?: string | null;
 }
 
-function adaptAnonymousResponse(
-  projectId: string,
-  raw: AnonymousTracesResponse,
-  onlyFailures: boolean,
-): TracesResponse {
-  const traces = raw.traces ?? [];
-  let events: TraceWithHits[] = traces.map((t) => {
-    const createdAtMs = t.created_at ? Date.parse(t.created_at) : 0;
-    const completedAtMs = t.completed_at ? Date.parse(t.completed_at) : createdAtMs;
-    const hits: DetectionResult[] = (t.detections ?? []).map((d) => ({
-      detector: d.type ?? 'unknown',
-      detected: true,
-      severity:
-        typeof d.confidence === 'number'
-          ? Math.max(0, Math.min(10, Math.round(d.confidence * 10)))
-          : 5,
-      summary:
-        typeof d.details === 'string'
-          ? d.details
-          : d.details
-            ? JSON.stringify(d.details).slice(0, 400)
-            : `${d.type ?? 'unknown'} detection`,
-    }));
-    const event: TraceEvent = {
-      traceId: t.trace_id,
-      // Anonymous endpoint doesn't expose span ids; reuse traceId so the
-      // formatter has a non-empty string. Cursor/Claude Code never use this
-      // field directly, they pass the traceId back into get_trace.
-      spanId: t.trace_id,
-      startTime: createdAtMs,
-      endTime: completedAtMs,
-      model: t.framework ?? '?',
-      toolCalls: [],
-      inputTokens: undefined,
-      outputTokens: t.total_tokens ?? undefined,
-      finishReason: t.status ?? undefined,
-      metadata: { sessionId: t.session_id ?? undefined },
-    };
-    return { event, hits };
-  });
-  if (onlyFailures) {
-    events = events.filter((e) => e.hits.length > 0);
+interface TracePage {
+  traces: PlatformTrace[];
+  total: number;
+}
+
+interface DetectionPage {
+  items: PlatformDetection[];
+}
+
+class PlatformResponseError extends Error {
+  constructor(
+    message: string,
+    readonly status: number,
+  ) {
+    super(message);
+    this.name = 'PlatformResponseError';
   }
-  return { projectId, count: events.length, events };
+}
+
+async function platformJson<T>(auth: PlatformAuth, url: URL): Promise<T> {
+  const response = await auth.fetch('read', url);
+  if (!response.ok) {
+    throw new PlatformResponseError(
+      `Pisama API returned HTTP ${response.status}.`,
+      response.status,
+    );
+  }
+  try {
+    return (await response.json()) as T;
+  } catch {
+    throw new PlatformResponseError('Pisama API returned invalid JSON.', response.status);
+  }
+}
+
+function tenantApiUrl(baseUrl: string, tenantId: string, suffix: string): URL {
+  return new URL(
+    `/api/v1/tenants/${encodeURIComponent(tenantId)}/${suffix.replace(/^\//, '')}`,
+    `${baseUrl}/`,
+  );
+}
+
+async function fetchTraceRows(
+  auth: PlatformAuth,
+  baseUrl: string,
+  tenantId: string,
+  limit: number,
+): Promise<PlatformTrace[]> {
+  const rows: PlatformTrace[] = [];
+  let page = 1;
+  while (rows.length < limit) {
+    const perPage = Math.min(100, limit - rows.length);
+    const url = tenantApiUrl(baseUrl, tenantId, 'traces');
+    url.searchParams.set('page', String(page));
+    url.searchParams.set('per_page', String(perPage));
+    const result = await platformJson<TracePage>(auth, url);
+    const batch = Array.isArray(result.traces) ? result.traces : [];
+    rows.push(...batch);
+    if (batch.length < perPage || rows.length >= result.total) break;
+    page += 1;
+  }
+  return rows.slice(0, limit);
+}
+
+async function fetchDetections(
+  auth: PlatformAuth,
+  baseUrl: string,
+  tenantId: string,
+  traceId: string,
+): Promise<PlatformDetection[]> {
+  const url = tenantApiUrl(baseUrl, tenantId, 'detections');
+  url.searchParams.set('trace_id', traceId);
+  url.searchParams.set('per_page', '100');
+  const result = await platformJson<DetectionPage>(auth, url);
+  return Array.isArray(result.items) ? result.items : [];
+}
+
+async function adaptTraceBatch(
+  auth: PlatformAuth,
+  baseUrl: string,
+  tenantId: string,
+  rows: PlatformTrace[],
+): Promise<TraceWithHits[]> {
+  const output: TraceWithHits[] = [];
+  for (let offset = 0; offset < rows.length; offset += 8) {
+    const batch = rows.slice(offset, offset + 8);
+    output.push(
+      ...(await Promise.all(
+        batch.map(async (row) => {
+          const detections =
+            (row.detection_count ?? 0) > 0
+              ? await fetchDetections(auth, baseUrl, tenantId, row.id)
+              : [];
+          return adaptPlatformTrace(row, detections);
+        }),
+      )),
+    );
+  }
+  return output;
+}
+
+async function fetchRecentTraces(
+  auth: PlatformAuth,
+  baseUrl: string,
+  tenantId: string,
+  opts: { limit: number; onlyFailures: boolean },
+): Promise<TracesResponse> {
+  let rows = await fetchTraceRows(auth, baseUrl, tenantId, opts.limit);
+  if (opts.onlyFailures) rows = rows.filter((row) => (row.detection_count ?? 0) > 0);
+  const events = await adaptTraceBatch(auth, baseUrl, tenantId, rows);
+  return { tenantId, count: events.length, events };
+}
+
+async function fetchTrace(
+  auth: PlatformAuth,
+  baseUrl: string,
+  tenantId: string,
+  traceId: string,
+): Promise<TraceWithHits> {
+  const traceUrl = tenantApiUrl(baseUrl, tenantId, `traces/${encodeURIComponent(traceId)}`);
+  const trace = await platformJson<PlatformTrace>(auth, traceUrl);
+  const statesUrl = tenantApiUrl(baseUrl, tenantId, `traces/${encodeURIComponent(traceId)}/states`);
+  statesUrl.searchParams.set('full_state', 'true');
+  statesUrl.searchParams.set('limit', '2000');
+  const [states, detections] = await Promise.all([
+    platformJson<PlatformState[]>(auth, statesUrl),
+    fetchDetections(auth, baseUrl, tenantId, traceId),
+  ]);
+  return adaptPlatformTrace(trace, detections, Array.isArray(states) ? states : []);
+}
+
+const PROMPT_KEYS = [
+  '_prompt',
+  'prompt',
+  'input',
+  'user_input',
+  'query',
+  'task',
+  'question',
+  'messages',
+  'content',
+] as const;
+const COMPLETION_KEYS = ['completion', 'output', 'response'] as const;
+
+function readableValue(value: unknown): string | undefined {
+  if (typeof value === 'string') return value;
+  if (value === undefined || value === null) return undefined;
+  try {
+    return JSON.stringify(value);
+  } catch {
+    return String(value);
+  }
+}
+
+function stateValue(
+  states: PlatformState[],
+  keys: readonly string[],
+  reverse = false,
+): string | undefined {
+  const ordered = reverse ? [...states].reverse() : states;
+  for (const state of ordered) {
+    for (const key of keys) {
+      const value = readableValue(state.state_delta?.[key]);
+      if (value) return value;
+    }
+  }
+  return undefined;
+}
+
+function adaptDetection(detection: PlatformDetection): DetectionResult {
+  const detector = detection.detection_type ?? 'unknown';
+  const details = detection.details ?? undefined;
+  const summary =
+    detection.explanation ?? readableValue(details)?.slice(0, 400) ?? `${detector} detection`;
+  return {
+    detector,
+    detected: true,
+    severity:
+      typeof detection.confidence === 'number'
+        ? Math.max(0, Math.min(10, Math.round(detection.confidence / 10)))
+        : 5,
+    summary,
+    ...(detection.suggested_fix || detection.suggested_action
+      ? { fix: detection.suggested_fix ?? detection.suggested_action ?? undefined }
+      : {}),
+    ...(details ? { evidence: details } : {}),
+  };
+}
+
+function parseTime(value: string | null | undefined): number {
+  if (!value) return 0;
+  const parsed = Date.parse(value);
+  return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+function adaptPlatformTrace(
+  trace: PlatformTrace,
+  detections: PlatformDetection[],
+  states: PlatformState[] = [],
+): TraceWithHits {
+  const completion =
+    [...states].reverse().find((state) => state.response_redacted)?.response_redacted ??
+    stateValue(states, COMPLETION_KEYS, true);
+  return {
+    event: {
+      traceId: trace.id,
+      startTime: parseTime(trace.created_at),
+      endTime: parseTime(trace.completed_at ?? trace.created_at),
+      model: trace.framework ?? '?',
+      prompt: stateValue(states, PROMPT_KEYS),
+      completion: completion ?? undefined,
+      toolCalls: [],
+      outputTokens: trace.total_tokens ?? undefined,
+      costUsd:
+        typeof trace.total_cost_cents === 'number' ? trace.total_cost_cents / 100 : undefined,
+      finishReason: trace.status ?? undefined,
+      metadata: {
+        sessionId: trace.session_id ?? undefined,
+        detectionStatus: trace.detection_status ?? undefined,
+        stateCount: trace.state_count ?? states.length,
+        toolCallsAvailable: false,
+        ...(trace.detection_metadata ? { detectionMetadata: trace.detection_metadata } : {}),
+      },
+    },
+    hits: detections.map(adaptDetection),
+  };
 }
 
 function formatList(data: TracesResponse, failuresOnly: boolean): string {
   if (data.events.length === 0) {
     return failuresOnly
-      ? `no failures in the last 200 traces for ${data.projectId}.`
-      : `no traces for ${data.projectId} yet.`;
+      ? `no failures in the sampled traces for tenant ${data.tenantId}.`
+      : `no traces for tenant ${data.tenantId} yet.`;
   }
   const lines = data.events.map((e) => {
     const ago = relativeTime(e.event.startTime);
@@ -394,8 +565,8 @@ function formatList(data: TracesResponse, failuresOnly: boolean): string {
     return `- ${e.event.traceId.slice(0, 8)} ${ago} ${e.event.model} ${tokens}t ${hits}`;
   });
   const header = failuresOnly
-    ? `${data.events.length} recent failure(s) for ${data.projectId}:`
-    : `${data.events.length} recent trace(s) for ${data.projectId}:`;
+    ? `${data.events.length} recent failure(s) for tenant ${data.tenantId}:`
+    : `${data.events.length} recent trace(s) for tenant ${data.tenantId}:`;
   return `${header}\n${lines.join('\n')}`;
 }
 
@@ -539,7 +710,7 @@ export const PROMPTS: PromptDef[] = [
       {
         name: 'tenant',
         description:
-          'Optional tenant identifier override. Defaults to the project the server is bound to.',
+          'Optional tenant label for the report. Data access remains bound to the authenticated tenant.',
         required: false,
       },
     ],
@@ -586,7 +757,7 @@ export function buildPromptMessages(name: string, args: Record<string, string>):
       `Explain Pisama trace ${traceId} in plain English.\n\n` +
       'Steps:\n' +
       `1. Call \`get_trace\` with \`traceId="${traceId}"\`.\n` +
-      '2. Walk the prompt, completion, and tool calls in order. Note what the agent attempted at each step.\n' +
+      '2. Walk the available prompt, completion, and state metadata. Note what the agent attempted.\n' +
       '3. Read the `detector hits` block. For each hit, note the detector name, severity, and summary.\n' +
       '4. Reply with a short narrative: what the agent tried to do, where it failed, and which Pisama detector caught it.';
     return {
@@ -604,7 +775,7 @@ export function buildPromptMessages(name: string, args: Record<string, string>):
       `Evaluate Pisama's proposed fix for failure ${failureId}.\n\n` +
       'Steps:\n' +
       '1. Call `get_recent_failures` with a generous limit to locate the failure in the buffer.\n' +
-      `2. Call \`get_trace\` with \`traceId="${failureId}"\` to load the prompt, completion, and detector hits.\n` +
+      `2. Call \`get_trace\` with \`traceId="${failureId}"\` to load available state and detector hits.\n` +
       '3. For each detector hit on the trace, read the `fix` field Pisama produced. Compare the top two candidate fixes.\n' +
       '4. List the trade-offs: blast radius, rollback cost, whether the fix patches the symptom or the root cause.\n' +
       "5. Recommend one of three actions: apply the fix, refine it (state what's missing), or skip (explain why).";

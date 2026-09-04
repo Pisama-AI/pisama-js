@@ -11,9 +11,8 @@ export interface InitOptions {
   dryRun: boolean;
 }
 
-// The dashboard is a single authenticated page. There is no project-scoped
-// route, so the project id must not be appended: /live/<projectId> and
-// /dashboard/<projectId> both resolve to nothing.
+// The dashboard is a single authenticated page. It is not project-scoped, so
+// the project id must never be appended to this URL.
 const DASHBOARD_URL = 'https://pisama.ai/dashboard';
 
 const SDK_PACKAGE = '@pisama/sdk';
@@ -52,6 +51,7 @@ export async function init(opts: InitOptions): Promise<void> {
   // project needs it as a dependency. init never edits package.json, so tell
   // the user how to install it instead of changing their manifest for them.
   await printInstallInstruction(root, pkg);
+  await printApiKeyInstruction(root);
 
   console.log('');
   console.log(kleur.bold('  Dashboard: ') + kleur.cyan().underline(DASHBOARD_URL));
@@ -63,6 +63,28 @@ export async function init(opts: InitOptions): Promise<void> {
       // Browser open is best-effort; never fail init on it.
     });
   }
+}
+
+async function printApiKeyInstruction(root: string): Promise<void> {
+  if (process.env.PISAMA_API_KEY) {
+    ok('PISAMA_API_KEY is available in this process.');
+    return;
+  }
+  try {
+    const raw = await readFile(join(root, '.env.local'), 'utf8');
+    if (/^PISAMA_API_KEY=\S+/m.test(raw)) {
+      ok('PISAMA_API_KEY is configured in .env.local.');
+      return;
+    }
+  } catch {
+    // No env file yet; the project-id step will create it when not a dry run.
+  }
+  warn('Authenticated trace delivery requires a server-side PISAMA_API_KEY.');
+  console.log(
+    kleur.dim(
+      '  Create one at https://pisama.ai/settings/api-keys and add it to your server environment.',
+    ),
+  );
 }
 
 async function printInstallInstruction(root: string, pkg: Record<string, unknown>): Promise<void> {

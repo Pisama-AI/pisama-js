@@ -111,6 +111,23 @@ test('init tells the user to install @pisama/sdk', async () => {
   }
 });
 
+test('init tells the user to configure the server-side API key without writing one', async () => {
+  const root = await makeFixture();
+  const original = process.env.PISAMA_API_KEY;
+  delete process.env.PISAMA_API_KEY;
+  try {
+    const output = await initCapturingOutput(root);
+    const env = await readFile(join(root, '.env.local'), 'utf8');
+    assert.match(output, /server-side PISAMA_API_KEY/);
+    assert.match(output, /settings\/api-keys/);
+    assert.doesNotMatch(env, /^PISAMA_API_KEY=/m, 'init must never invent or persist a secret');
+  } finally {
+    if (original === undefined) delete process.env.PISAMA_API_KEY;
+    else process.env.PISAMA_API_KEY = original;
+    await rm(root, { recursive: true, force: true });
+  }
+});
+
 test('init uses the package manager the project already has a lockfile for', async () => {
   const root = await makeFixture();
   try {

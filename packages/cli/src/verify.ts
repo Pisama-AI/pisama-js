@@ -7,17 +7,19 @@
 // works even when the SDK is misinstalled or absent.
 //
 // This command previously used the anonymous project-scoped flow: it POSTed
-// `{events:[...]}` to /api/v1/spans and read /api/v1/projects/{id}/traces, with
+// `{events:[...]}` to the removed anonymous spans route and read project traces, with
 // a project id copied from pisama.ai/install. That entire flow was removed
 // server-side in backend commit 517f69bc1 ("Pisama is authenticated-only
 // again"): both routes now 404, /install is a login wall, and /live/{projectId}
 // no longer exists. The command is therefore rebuilt on the authenticated
-// contract: an API key resolves a tenant via /api/v1/auth/me, the trace is sent
-// as OTLP to /api/v1/traces/ingest, and it is read back from
+// contract: the raw API key is exchanged for narrowly scoped JWTs at
+// /api/v1/auth/token, the trace is sent as OTLP to /api/v1/traces/ingest with
+// an ingest token, and it is read back with a separate read token from
 // /api/v1/tenants/{tenant_id}/traces.
 
 import { randomBytes } from 'node:crypto';
 import kleur from 'kleur';
+import { PlatformAuth, PlatformAuthError } from './platform-auth.js';
 
 export interface VerifyOptions {
   cwd: string;
@@ -43,10 +45,10 @@ export async function verify(opts: VerifyOptions): Promise<void> {
         `  Create one at ${kleur.cyan(`${dashboardBaseUrl}/settings/api-keys`)}`,
     );
   }
-  const auth = { authorization: `Bearer ${apiKey}` };
+  const auth = new PlatformAuth(baseUrl, apiKey);
 
   step('Resolving tenant from API key...');
-  const tenantId = await resolveTenant(baseUrl, auth, healthUrl);
+  const tenantId = await resolveTenant(auth, baseUrl, dashboardBaseUrl, healthUrl);
   ok(`Tenant: ${kleur.bold(tenantId)}`);
 
   const traceId = randomBytes(16).toString('hex');
@@ -83,41 +85,13 @@ export async function verify(opts: VerifyOptions): Promise<void> {
   };
 
   step(`Sending synthetic trace via ${kleur.dim(baseUrl + '/api/v1/traces/ingest')}...`);
-  let postRes: Response;
-  try {
-    postRes = await fetch(`${baseUrl}/api/v1/traces/ingest`, {
-      method: 'POST',
-      headers: { 'content-type': 'application/json', ...auth },
-      body: JSON.stringify(payload),
-    });
-  } catch (err) {
-    fail(
-      `Could not reach ${baseUrl}/api/v1/traces/ingest.\n` +
-        `  ${kleur.dim((err as Error)?.message ?? String(err))}\n` +
-        `  Either this machine cannot reach the configured API,\n` +
-        `  or the API is unavailable. Check ${healthUrl}`,
-    );
-  }
-
-  if (postRes.status === 401 || postRes.status === 403) {
-    fail(
-      `Ingest rejected the API key (HTTP ${postRes.status}).\n` +
-        `  Check the key is current at ${kleur.cyan(`${dashboardBaseUrl}/settings/api-keys`)}`,
-    );
-  }
-  if (postRes.status === 404) {
-    fail(
-      `Ingest endpoint not found at ${baseUrl}/api/v1/traces/ingest.\n` +
-        '  This CLI version targets the authenticated ingest contract. If you are\n' +
-        '  pointing at a self-hosted deployment, it may predate that route.\n' +
-        `  Check ${healthUrl}, or upgrade the deployment.`,
-    );
-  }
-  if (!postRes.ok && postRes.status !== 207) {
-    fail(
-      `Ingest returned HTTP ${postRes.status}. Aborting.\n  If this persists, check ${healthUrl}`,
-    );
-  }
+  const requestId = `pisama-cli-${randomBytes(12).toString('hex')}`;
+  const postRes = await postTrace(auth, baseUrl, healthUrl, {
+    method: 'POST',
+    headers: { 'content-type': 'application/json', 'x-request-id': requestId },
+    body: JSON.stringify(payload),
+  });
+  assertIngestAccepted(postRes, baseUrl, dashboardBaseUrl, healthUrl);
   ok(`Ingest accepted (HTTP ${postRes.status}).`);
 
   step('Waiting for the trace to surface...');
@@ -138,41 +112,92 @@ export async function verify(opts: VerifyOptions): Promise<void> {
   console.log(`\n  Dashboard: ${kleur.cyan(`${dashboardBaseUrl}/dashboard`)}\n`);
 }
 
+async function resolveTenant(
+  auth: PlatformAuth,
+  baseUrl: string,
+  dashboardBaseUrl: string,
+  healthUrl: string,
+): Promise<string> {
+  try {
+    return (await auth.identity('read')).tenantId;
+  } catch (error) {
+    const authError = error as PlatformAuthError;
+    if (authError.status === 401 || authError.status === 403) {
+      fail(
+        `API key rejected or missing read scope (HTTP ${authError.status}).\n` +
+          `  Check the key is current at ${kleur.cyan(`${dashboardBaseUrl}/settings/api-keys`)}`,
+      );
+    }
+    fail(
+      `Could not exchange the API key at ${baseUrl}/api/v1/auth/token.\n` +
+        `  ${kleur.dim(authError.message ?? String(error))}\n` +
+        `  Check ${healthUrl}`,
+    );
+  }
+}
+
+async function postTrace(
+  auth: PlatformAuth,
+  baseUrl: string,
+  healthUrl: string,
+  init: RequestInit,
+): Promise<Response> {
+  try {
+    return await auth.fetch('ingest', `${baseUrl}/api/v1/traces/ingest`, {
+      ...init,
+      method: 'POST',
+    });
+  } catch (err) {
+    if (err instanceof PlatformAuthError) {
+      fail(
+        `Could not exchange the API key for ingest access.\n` +
+          `  ${kleur.dim(err.message)}\n` +
+          `  Check PISAMA_API_KEY and ${healthUrl}`,
+      );
+    }
+    fail(
+      `Could not reach ${baseUrl}/api/v1/traces/ingest.\n` +
+        `  ${kleur.dim((err as Error)?.message ?? String(err))}\n` +
+        `  Either this machine cannot reach the configured API,\n` +
+        `  or the API is unavailable. Check ${healthUrl}`,
+    );
+  }
+}
+
+function assertIngestAccepted(
+  postRes: Response,
+  baseUrl: string,
+  dashboardBaseUrl: string,
+  healthUrl: string,
+): void {
+  if (postRes.status === 401 || postRes.status === 403) {
+    fail(
+      `Ingest rejected the scoped access token (HTTP ${postRes.status}) after one re-exchange.\n` +
+        `  Check the key and ingest scope at ${kleur.cyan(`${dashboardBaseUrl}/settings/api-keys`)}`,
+    );
+  }
+  if (postRes.status === 404) {
+    fail(
+      `Ingest endpoint not found at ${baseUrl}/api/v1/traces/ingest.\n` +
+        '  This CLI version targets the authenticated ingest contract. If you are\n' +
+        '  pointing at a self-hosted deployment, it may predate that route.\n' +
+        `  Check ${healthUrl}, or upgrade the deployment.`,
+    );
+  }
+  if (!postRes.ok && postRes.status !== 207) {
+    fail(
+      `Ingest returned HTTP ${postRes.status}. Aborting.\n  If this persists, check ${healthUrl}`,
+    );
+  }
+}
+
 function attr(key: string, value: string) {
   return { key, value: { stringValue: value } };
 }
 
-async function resolveTenant(
-  baseUrl: string,
-  auth: Record<string, string>,
-  healthUrl: string,
-): Promise<string> {
-  let res: Response;
-  try {
-    res = await fetch(`${baseUrl}/api/v1/auth/me`, { headers: auth });
-  } catch (err) {
-    fail(
-      `Could not reach ${baseUrl}/api/v1/auth/me.\n` +
-        `  ${kleur.dim((err as Error)?.message ?? String(err))}\n` +
-        `  Check ${healthUrl}`,
-    );
-  }
-  if (res.status === 401 || res.status === 403) {
-    fail(`API key rejected (HTTP ${res.status}). Check the key is current and not revoked.`);
-  }
-  if (!res.ok) {
-    fail(`Could not resolve tenant: HTTP ${res.status} from /api/v1/auth/me.`);
-  }
-  const body = (await res.json()) as { tenant_id?: string };
-  if (!body?.tenant_id) {
-    fail('/api/v1/auth/me returned no tenant_id. This key may not be a tenant-scoped key.');
-  }
-  return body.tenant_id;
-}
-
 async function pollForTrace(
   baseUrl: string,
-  auth: Record<string, string>,
+  auth: PlatformAuth,
   tenantId: string,
   traceId: string,
   timeoutMs: number,
@@ -180,22 +205,28 @@ async function pollForTrace(
   const deadline = Date.now() + timeoutMs;
   const url = `${baseUrl}/api/v1/tenants/${encodeURIComponent(tenantId)}/traces?per_page=50`;
   while (Date.now() < deadline) {
+    let res: Response;
     try {
-      const res = await fetch(url, { headers: auth });
-      if (res.ok) {
-        const data = (await res.json()) as {
-          traces?: Array<{ trace_id?: string; session_id?: string }>;
-          items?: Array<{ trace_id?: string; session_id?: string }>;
-        };
-        const rows = data.traces ?? data.items ?? [];
-        if (rows.some((t) => t?.trace_id === traceId || t?.session_id === traceId)) {
-          return true;
-        }
-      }
+      res = await auth.fetch('read', url);
     } catch {
       // transient — try again
+      await new Promise((resolve) => setTimeout(resolve, 750));
+      continue;
     }
-    await new Promise((r) => setTimeout(r, 750));
+    if (res.status === 401 || res.status === 403) {
+      fail(`Trace readback rejected the read-scoped access token (HTTP ${res.status}).`);
+    }
+    if (res.ok) {
+      const data = (await res.json()) as {
+        traces?: Array<{ trace_id?: string; session_id?: string }>;
+        items?: Array<{ trace_id?: string; session_id?: string }>;
+      };
+      const rows = data.traces ?? data.items ?? [];
+      if (rows.some((trace) => trace?.trace_id === traceId || trace?.session_id === traceId)) {
+        return true;
+      }
+    }
+    await new Promise((resolve) => setTimeout(resolve, 750));
   }
   return false;
 }

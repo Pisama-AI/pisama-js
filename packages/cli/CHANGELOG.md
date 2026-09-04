@@ -2,6 +2,25 @@
 
 All notable changes to `@pisama/cli` are documented here.
 
+## [0.11.3] - 2026-09-04
+
+### Fixed
+
+- `verify` now exchanges the raw API key for separate read- and ingest-scoped
+  JWTs instead of sending the key as bearer auth. Tokens are cached and
+  re-exchanged at most once after a 401.
+- `verify` derives the tenant from the scoped JWT rather than calling the
+  dashboard-only `/api/v1/auth/me`, and preserves one `X-Request-ID` and OTLP
+  body across an ingest retry.
+- `init` tells users to configure `PISAMA_API_KEY` server-side without writing
+  or displaying the secret.
+- `analyze-atif` exchanges the raw key for a read-scoped JWT, or a full-scoped
+  JWT for explicit `--apply`, and re-exchanges at most once after a 401.
+- `mcp` replaces the removed anonymous project route with authenticated,
+  read-scoped tenant trace, state, and detection reads. Its configuration now
+  requires `PISAMA_API_KEY`; no project id is treated as an authentication
+  secret.
+
 ## 0.11.2
 
 Patch release to exercise the retried attestation checks in `publish-cli.yml`'s "Verify public registry release" step (see repo history): the previous two releases published correctly but the CI run itself failed on an unretried read against npm's attestations endpoint.
@@ -56,8 +75,6 @@ Patch release to confirm a clean publish/verification run (the prior release hit
   user with no flag available to fix it.
 - `mcp` reports an actionable error when the trace-read endpoint returns 404 instead of an
   opaque upstream message.
-
-## [Unreleased]
 
 ## [0.10.3] - 2026-07-26
 
