@@ -106,7 +106,12 @@ version in both modes below. It prints detector evidence and exits with code
   supports `--apply` healing). Requires network access and `PISAMA_API_KEY`.
   The key is exchanged for a read-scoped JWT, or a full-scoped JWT when you
   explicitly pass `--apply`; it is never sent as bearer auth. A 401 causes at
-  most one token re-exchange and exact request retry.
+  most one token re-exchange and exact request retry. Hosted inputs must carry
+  a non-empty `session_id` or `trajectory_id`; the command derives the same
+  deterministic trace ID as the backend and rejects a response whose trace,
+  schema, session, trajectory, or unresolved-topology identity does not match
+  the submitted source. Anonymous ATIF documents remain available in
+  `--local` mode.
 - **`--local`**: runs `@pisama/detectors`' v1 pack (loop, repetition, cost,
   completion, hallucination, context, derailment) in-process. No network
   call, no API key, and no `--apply` — it's a simplified subset of the

@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import { createHash } from 'node:crypto';
 import {
   chmodSync,
   readFileSync,
@@ -79,7 +80,7 @@ function withNoNetwork<T>(fn: () => Promise<T>): Promise<T> {
 function minimalTrajectory(overrides: Record<string, unknown> = {}): Record<string, unknown> {
   return {
     schema_version: 'ATIF-v1.7',
-    session_id: 'continuation-test',
+    session_id: 'NORMALIZED_SESSION_ID',
     agent: { name: 'test', model_name: 'test-model' },
     steps: [],
     ...overrides,
@@ -269,7 +270,7 @@ test('analyze-atif --local follows the committed Harbor continuation in run orde
   assert.ok(output.indexOf('trajectory.json') < output.indexOf('trajectory.cont-1.json'));
   assert.match(output, /trajectory\.json[\s\S]*No detections/);
   assert.match(output, /trajectory\.cont-1\.json[\s\S]*High token usage: 8832 tokens/);
-  assert.match(output, /Summary: 2 trajectorie\(s\), 1 total detection\(s\)/);
+  assert.match(output, /Summary: 2 trajectories, 1 total detection\(s\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -285,6 +286,10 @@ interface MockDiagnosisDetection {
   description?: string;
 }
 
+function mockTraceId(identity: string): string {
+  return createHash('sha256').update(identity, 'utf8').digest('hex').slice(0, 32);
+}
+
 function mockAnalyzeResponse(overrides: {
   detections?: MockDiagnosisDetection[];
   detectionStatus?: string;
@@ -293,7 +298,12 @@ function mockAnalyzeResponse(overrides: {
   topologyComplete?: boolean;
   unresolvedTrajectoryRefs?: string[];
   healing?: Record<string, unknown> | null;
+  traceId?: string;
+  schemaVersion?: string;
+  sessionId?: string | null;
+  trajectoryId?: string | null;
 }): Record<string, unknown> {
+  const traceId = overrides.traceId ?? mockTraceId('NORMALIZED_SESSION_ID');
   const detections = (overrides.detections ?? []).map((detection, index) => ({
     category: detection.category ?? `detector_${index}`,
     detected: true,
@@ -304,7 +314,7 @@ function mockAnalyzeResponse(overrides: {
   }));
   return {
     diagnosis: {
-      trace_id: 'trace-1',
+      trace_id: traceId,
       has_failures: detections.length > 0,
       failure_count: detections.length,
       detection_status: overrides.detectionStatus ?? 'complete',
@@ -313,12 +323,13 @@ function mockAnalyzeResponse(overrides: {
       detectors_failed: overrides.detectorsFailed ?? {},
     },
     trace: {
-      trace_id: 'trace-1',
+      trace_id: traceId,
       span_count: 3,
       total_tokens: 100,
-      atif_schema_version: 'ATIF-v1.7',
-      atif_session_id: 'sess-1',
-      atif_trajectory_id: null,
+      atif_schema_version: overrides.schemaVersion ?? 'ATIF-v1.7',
+      atif_session_id:
+        overrides.sessionId === undefined ? 'NORMALIZED_SESSION_ID' : overrides.sessionId,
+      atif_trajectory_id: overrides.trajectoryId ?? null,
       topology_complete: overrides.topologyComplete ?? true,
       unresolved_trajectory_refs: overrides.unresolvedTrajectoryRefs ?? [],
     },
@@ -389,6 +400,82 @@ test('analyze-atif (remote) happy path: posts the trajectory and exits 0 on no d
   assert.match(out, /against https:\/\/test/);
   assert.match(out, /No detections/);
   assert.match(out, /No critical\/high-severity failures/);
+});
+
+test('analyze-atif (remote) binds response identity for continuations and trajectory-only documents', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-identity-'));
+  try {
+    writeFileSync(
+      join(dir, 'continuation.json'),
+      JSON.stringify(minimalTrajectory({ session_id: 'logical-run-cont-12' })),
+    );
+    writeFileSync(
+      join(dir, 'trajectory-only.json'),
+      JSON.stringify(minimalTrajectory({ session_id: null, trajectory_id: 'document-9' })),
+    );
+
+    const s = spy();
+    try {
+      await withMockFetch(
+        (_url, init) => {
+          const body = JSON.parse(String(init?.body)) as {
+            trajectory: {
+              schema_version: string;
+              session_id?: string | null;
+              trajectory_id?: string;
+            };
+          };
+          const trajectory = body.trajectory;
+          const identity = trajectory.session_id
+            ? trajectory.session_id.replace(/-cont-\d+$/, '')
+            : trajectory.trajectory_id!;
+          return jsonResponse(
+            mockAnalyzeResponse({
+              traceId: mockTraceId(identity),
+              schemaVersion: trajectory.schema_version,
+              sessionId: trajectory.session_id ?? null,
+              trajectoryId: trajectory.trajectory_id ?? null,
+            }),
+          );
+        },
+        () => analyzeAtif({ path: dir, apiKey: 'key', baseUrl: 'https://test' }),
+      );
+      assert.equal(s.exitCode, null);
+    } finally {
+      s.restore();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('analyze-atif (remote) rejects anonymous identity before authentication or analysis', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-anonymous-'));
+  const file = join(dir, 'anonymous.json');
+  writeFileSync(file, JSON.stringify(minimalTrajectory({ session_id: null })));
+  let networkCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    throw new Error('anonymous validation must precede network');
+  }) as typeof fetch;
+  const s = spy();
+  try {
+    try {
+      await analyzeAtif({ path: file, apiKey: 'unused', baseUrl: 'https://test' });
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+    assert.equal(s.exitCode, 1);
+    assert.equal(networkCalls, 0);
+    assert.ok(s.errs.some((line) => /requires a non-empty session_id or trajectory_id/.test(line)));
+    assert.doesNotMatch(s.logs.join('\n'), /No detections|No critical\/high-severity failures/);
+  } finally {
+    s.restore();
+    globalThis.fetch = originalFetch;
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('analyze-atif (remote) submits a continuation and cannot hide its high finding', async () => {
@@ -787,6 +874,7 @@ test('analyze-atif (remote) rejects malformed or inconsistent 200 responses', as
       unknown
     >[]
   )[0].detected;
+  const selfConsistentWrongTrace = mockAnalyzeResponse({ traceId: mockTraceId('another-run') });
 
   const cases: Array<{ name: string; response: unknown }> = [
     { name: 'missing diagnosis', response: { trace: {}, healing: null } },
@@ -804,6 +892,19 @@ test('analyze-atif (remote) rejects malformed or inconsistent 200 responses', as
     },
     { name: 'failure count mismatch', response: mismatchedCount },
     { name: 'trace ID mismatch', response: mismatchedTrace },
+    { name: 'self-consistent trace ID from another source', response: selfConsistentWrongTrace },
+    {
+      name: 'schema version from another source',
+      response: mockAnalyzeResponse({ schemaVersion: 'ATIF-v1.0' }),
+    },
+    {
+      name: 'session ID from another source',
+      response: mockAnalyzeResponse({ sessionId: 'different-session' }),
+    },
+    {
+      name: 'trajectory ID from another source',
+      response: mockAnalyzeResponse({ trajectoryId: 'different-document' }),
+    },
     { name: 'malformed detection row', response: missingDetected },
     {
       name: 'topology flag contradicts unresolved refs',

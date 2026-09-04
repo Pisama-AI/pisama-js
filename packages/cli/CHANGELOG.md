@@ -16,6 +16,10 @@ All notable changes to `@pisama/cli` are documented here.
   or displaying the secret.
 - `analyze-atif` exchanges the raw key for a read-scoped JWT, or a full-scoped
   JWT for explicit `--apply`, and re-exchanges at most once after a 401.
+- `analyze-atif` fails closed on incomplete detector/topology evidence and
+  binds hosted responses to the submitted schema, session, trajectory, and
+  deterministic trace identity. Hosted anonymous trajectories are rejected;
+  use `--local` when neither explicit ATIF identity field is available.
 - `mcp` replaces the removed anonymous project route with authenticated,
   read-scoped tenant trace, state, and detection reads. Its configuration now
   requires `PISAMA_API_KEY`; no project id is treated as an authentication

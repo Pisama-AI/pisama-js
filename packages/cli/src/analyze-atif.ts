@@ -24,6 +24,7 @@
 // a requested fix is absent/failed/rolled back so the command is CI-friendly.
 
 import { readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { createHash } from 'node:crypto';
 import { join, resolve, basename, dirname, isAbsolute, relative, sep, win32 } from 'node:path';
 import kleur from 'kleur';
 import { nanoid } from 'nanoid';
@@ -169,6 +170,13 @@ interface AtifTrajectory {
   };
 }
 
+interface HostedSourceIdentity {
+  traceId: string;
+  schemaVersion: string;
+  sessionId: string | null;
+  trajectoryId: string | null;
+}
+
 function parseTrajectory(file: string, raw: string): AtifTrajectory {
   let parsed: unknown;
   try {
@@ -191,6 +199,50 @@ function parseTrajectory(file: string, raw: string): AtifTrajectory {
     );
   }
   return trajectory;
+}
+
+function hostedSourceIdentity(file: string, trajectory: AtifTrajectory): HostedSourceIdentity {
+  const sessionId = trajectory.session_id ?? null;
+  const trajectoryId = trajectory.trajectory_id ?? null;
+  if (sessionId !== null && typeof sessionId !== 'string') {
+    fail(`${basename(file)}: session_id must be a string or null`);
+  }
+  if (trajectoryId !== null && typeof trajectoryId !== 'string') {
+    fail(`${basename(file)}: trajectory_id must be a string or null`);
+  }
+
+  // The backend also supports an anonymous, content-derived fallback after
+  // strict Pydantic normalization. Reproducing that normalization in this
+  // minimally parsed client would risk binding a response to the wrong
+  // source. Hosted mode therefore requires one of ATIF's explicit identity
+  // fields; anonymous trajectories remain supported by --local.
+  const key = sessionId ? sessionId.replace(/-cont-\d+$/, '') : trajectoryId;
+  if (!key) {
+    fail(
+      `${basename(file)}: hosted analysis requires a non-empty session_id or trajectory_id ` +
+        '(anonymous trajectories are supported with --local)',
+    );
+  }
+
+  return {
+    traceId: createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 32),
+    schemaVersion: trajectory.schema_version!,
+    sessionId,
+    trajectoryId,
+  };
+}
+
+async function loadTrajectories(
+  files: string[],
+  requireHostedIdentity: boolean,
+): Promise<Map<string, AtifTrajectory>> {
+  const trajectories = new Map<string, AtifTrajectory>();
+  for (const file of files) {
+    const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
+    if (requireHostedIdentity) hostedSourceIdentity(file, trajectory);
+    trajectories.set(file, trajectory);
+  }
+  return trajectories;
 }
 
 function toEpochMs(timestamp: string | undefined): number | undefined {
@@ -344,8 +396,9 @@ function finishAnalysis(
   applyFailureFound: boolean,
 ): void {
   console.log();
+  const trajectoryLabel = fileCount === 1 ? 'trajectory' : 'trajectories';
   console.log(
-    kleur.bold(`Summary: ${fileCount} trajectorie(s), ${totalFailures} total detection(s)`),
+    kleur.bold(`Summary: ${fileCount} ${trajectoryLabel}, ${totalFailures} total detection(s)`),
   );
   if (incompleteAnalysisFound) {
     console.log(
@@ -396,12 +449,17 @@ function responseString(record: Record<string, unknown>, key: string, label: str
   return value;
 }
 
-function responseNullableString(record: Record<string, unknown>, key: string, label: string): void {
+function responseNullableString(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): string | null {
   if (!(key in record)) invalidAnalyzeResponse(`${label}.${key} is required`);
   const value = record[key];
   if (value !== null && typeof value !== 'string') {
     invalidAnalyzeResponse(`${label}.${key} must be a string or null`);
   }
+  return value as string | null;
 }
 
 function responseCount(record: Record<string, unknown>, key: string, label: string): number {
@@ -669,19 +727,32 @@ function validateSourceTopology(unresolved: string[], contract: SourceTopologyCo
 
 function validateTrace(
   value: unknown,
-  expectedTraceId: string,
+  diagnosisTraceId: string,
+  sourceIdentity: HostedSourceIdentity,
   topologyContract: SourceTopologyContract,
 ): AnalyzeResponse['trace'] {
   const trace = responseRecord(value, 'trace');
   const traceId = responseString(trace, 'trace_id', 'trace');
-  if (traceId !== expectedTraceId) {
+  if (traceId !== diagnosisTraceId) {
     invalidAnalyzeResponse('trace.trace_id does not match diagnosis.trace_id');
+  }
+  if (traceId !== sourceIdentity.traceId) {
+    invalidAnalyzeResponse('response trace_id does not match the submitted trajectory identity');
   }
   responseCount(trace, 'span_count', 'trace');
   responseCount(trace, 'total_tokens', 'trace');
-  responseString(trace, 'atif_schema_version', 'trace');
-  responseNullableString(trace, 'atif_session_id', 'trace');
-  responseNullableString(trace, 'atif_trajectory_id', 'trace');
+  const schemaVersion = responseString(trace, 'atif_schema_version', 'trace');
+  const sessionId = responseNullableString(trace, 'atif_session_id', 'trace');
+  const trajectoryId = responseNullableString(trace, 'atif_trajectory_id', 'trace');
+  if (schemaVersion !== sourceIdentity.schemaVersion) {
+    invalidAnalyzeResponse('trace.atif_schema_version does not match the submitted trajectory');
+  }
+  if (sessionId !== sourceIdentity.sessionId) {
+    invalidAnalyzeResponse('trace.atif_session_id does not match the submitted trajectory');
+  }
+  if (trajectoryId !== sourceIdentity.trajectoryId) {
+    invalidAnalyzeResponse('trace.atif_trajectory_id does not match the submitted trajectory');
+  }
   if (typeof trace['topology_complete'] !== 'boolean') {
     invalidAnalyzeResponse('trace.topology_complete must be a boolean');
   }
@@ -698,12 +769,17 @@ function validateTrace(
   };
 }
 
-function validateAnalyzeResponse(value: unknown, trajectory: AtifTrajectory): AnalyzeResponse {
+function validateAnalyzeResponse(
+  value: unknown,
+  trajectory: AtifTrajectory,
+  sourceIdentity: HostedSourceIdentity,
+): AnalyzeResponse {
   const root = responseRecord(value, 'response');
   const diagnosis = validateDiagnosis(root['diagnosis']);
   const trace = validateTrace(
     root['trace'],
     diagnosis.trace_id,
+    sourceIdentity,
     sourceTopologyContract(trajectory),
   );
 
@@ -724,6 +800,7 @@ async function requestAnalysis(
   credentials: Record<string, unknown> | undefined,
   auth: PlatformAuth,
 ): Promise<AnalyzeResponse> {
+  const sourceIdentity = hostedSourceIdentity(file, trajectory);
   const scope: TokenScope = opts.apply ? 'full' : 'read';
   const requestId = `atif-${nanoid()}`;
   const body = JSON.stringify({
@@ -760,7 +837,7 @@ async function requestAnalysis(
     fail(`${basename(file)}: HTTP ${response.status} from analyze endpoint\n  ${kleur.dim(body)}`);
   }
   try {
-    return validateAnalyzeResponse(await response.json(), trajectory);
+    return validateAnalyzeResponse(await response.json(), trajectory, sourceIdentity);
   } catch (error) {
     const reason =
       error instanceof AnalyzeResponseValidationError
@@ -835,6 +912,7 @@ async function reconcileSubmittedContinuation(
 
 async function analyzeTrajectory(
   file: string,
+  trajectory: AtifTrajectory,
   target: string,
   targetIsDirectory: boolean,
   baseUrl: string,
@@ -848,7 +926,6 @@ async function analyzeTrajectory(
   analysisIncomplete: boolean;
   applyFailed: boolean;
 }> {
-  const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
   const rawData = opts.local
     ? analyzeTrajectoryLocally(file, trajectory)
     : await requestAnalysis(file, baseUrl, trajectory, opts, credentials, auth!);
@@ -914,6 +991,7 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
       `--apply is single-trajectory only; ${files.length} files matched. Pass a single .json file.`,
     );
   }
+  const trajectories = await loadTrajectories(files, !opts.local);
   const auth = await authenticateAnalysis(opts, baseUrl);
   const targetIsDir = (await stat(target)).isDirectory();
   const labelTarget = targetIsDir ? await realpath(target) : target;
@@ -934,8 +1012,10 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   let totalFailures = 0;
 
   for (const file of files) {
+    const trajectory = trajectories.get(file)!;
     const result = await analyzeTrajectory(
       file,
+      trajectory,
       labelTarget,
       targetIsDir,
       baseUrl,

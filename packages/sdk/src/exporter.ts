@@ -414,12 +414,12 @@ export class TraceExporter {
   }
 
   private reportFailure(error: unknown, debug: boolean): void {
-    if (
-      !isSilent() &&
-      (debug || String((error as Error)?.message).startsWith('API key exchange'))
-    ) {
-      console.warn(`[pisama] flush failed (events dropped):`, (error as Error)?.message ?? error);
-    }
+    if (isSilent()) return;
+    const detail = debug ? ` ${(error as Error)?.message ?? String(error)}` : '';
+    console.warn(
+      `[pisama] flush failed; events were dropped. Check network access, ` +
+        `PISAMA_API_KEY, and the configured ingest deployment.${detail}`,
+    );
   }
 
   private clearTimer(): void {

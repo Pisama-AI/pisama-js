@@ -12,6 +12,9 @@ All notable changes to `@pisama/sdk` are documented here.
   once after a 401 while preserving the exact batch and `X-Request-ID`.
 - Fail closed with no egress when the API key is absent, and emit
   standards-valid trace and span identifiers from the AI SDK middleware.
+- Redact recognized credential and identity patterns from error telemetry,
+  document the exact metadata-only retention boundary, and warn without
+  echoing transport-error details when an export drops events by default.
 
 ## [0.10.1] - 2026-07-30
 
