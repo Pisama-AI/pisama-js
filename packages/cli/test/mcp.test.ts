@@ -748,7 +748,12 @@ test('mcp: a trace page without the contracted total fails closed', async () => 
 });
 
 test('mcp: repeated and cross-page inconsistent trace pagination fail closed', async () => {
-  for (const mode of ['repeated-page', 'changed-total'] as const) {
+  for (const mode of [
+    'repeated-page',
+    'changed-total',
+    'duplicate-id-within-page',
+    'duplicate-id-across-pages',
+  ] as const) {
     await withHttpServer(
       (request, response) => {
         const url = new URL(request.url ?? '/', 'http://test');
@@ -761,7 +766,12 @@ test('mcp: repeated and cross-page inconsistent trace pagination fail closed', a
           if (requestedPage === 1) {
             respond(response, 200, {
               traces: Array.from({ length: 100 }, (_, index) =>
-                platformTrace({ id: `${mode}-page-1-${index}` }),
+                platformTrace({
+                  id:
+                    mode === 'duplicate-id-within-page' && index === 99
+                      ? `${mode}-page-1-0`
+                      : `${mode}-page-1-${index}`,
+                }),
               ),
               total: 101,
               page: 1,
@@ -771,7 +781,12 @@ test('mcp: repeated and cross-page inconsistent trace pagination fail closed', a
           }
           respond(response, 200, {
             traces: Array.from({ length: mode === 'changed-total' ? 2 : 1 }, (_, index) =>
-              platformTrace({ id: `${mode}-page-2-${index}` }),
+              platformTrace({
+                id:
+                  mode === 'duplicate-id-across-pages'
+                    ? `${mode}-page-1-0`
+                    : `${mode}-page-2-${index}`,
+              }),
             ),
             total: mode === 'changed-total' ? 102 : 101,
             page: mode === 'repeated-page' ? 1 : 2,
@@ -784,7 +799,14 @@ test('mcp: repeated and cross-page inconsistent trace pagination fail closed', a
       async (baseUrl) => {
         const response = await rpcCall(
           {
-            id: mode === 'repeated-page' ? 28 : 29,
+            id:
+              mode === 'repeated-page'
+                ? 28
+                : mode === 'changed-total'
+                  ? 29
+                  : mode === 'duplicate-id-within-page'
+                    ? 32
+                    : 33,
             method: 'tools/call',
             params: { name: 'get_recent_failures', arguments: { limit: 1 } },
           },
@@ -1150,7 +1172,12 @@ test('mcp: exact trace paginates visible detections and marks the response cap',
 
 test('mcp: repeated and cross-page inconsistent detection pagination fail closed', async () => {
   const traceId = '66666666-6666-4666-8666-666666666666';
-  for (const mode of ['repeated-page', 'changed-total'] as const) {
+  for (const mode of [
+    'repeated-page',
+    'changed-total',
+    'duplicate-id-within-page',
+    'duplicate-id-across-pages',
+  ] as const) {
     await withHttpServer(
       (request, response) => {
         const url = new URL(request.url ?? '/', 'http://test');
@@ -1175,7 +1202,12 @@ test('mcp: repeated and cross-page inconsistent detection pagination fail closed
           if (requestedPage === 1) {
             respond(response, 200, {
               items: Array.from({ length: 100 }, (_, index) =>
-                platformDetection(traceId, { id: `${mode}-page-1-${index}` }),
+                platformDetection(traceId, {
+                  id:
+                    mode === 'duplicate-id-within-page' && index === 99
+                      ? `${mode}-page-1-0`
+                      : `${mode}-page-1-${index}`,
+                }),
               ),
               total: 101,
               page: 1,
@@ -1185,7 +1217,12 @@ test('mcp: repeated and cross-page inconsistent detection pagination fail closed
           }
           respond(response, 200, {
             items: Array.from({ length: mode === 'changed-total' ? 2 : 1 }, (_, index) =>
-              platformDetection(traceId, { id: `${mode}-page-2-${index}` }),
+              platformDetection(traceId, {
+                id:
+                  mode === 'duplicate-id-across-pages'
+                    ? `${mode}-page-1-0`
+                    : `${mode}-page-2-${index}`,
+              }),
             ),
             total: mode === 'changed-total' ? 102 : 101,
             page: mode === 'repeated-page' ? 1 : 2,
@@ -1198,7 +1235,14 @@ test('mcp: repeated and cross-page inconsistent detection pagination fail closed
       async (baseUrl) => {
         const response = await rpcCall(
           {
-            id: mode === 'repeated-page' ? 30 : 31,
+            id:
+              mode === 'repeated-page'
+                ? 30
+                : mode === 'changed-total'
+                  ? 31
+                  : mode === 'duplicate-id-within-page'
+                    ? 34
+                    : 35,
             method: 'tools/call',
             params: { name: 'get_trace', arguments: { traceId } },
           },

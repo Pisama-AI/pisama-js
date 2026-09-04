@@ -659,6 +659,19 @@ function validateDetectionPage(
   };
 }
 
+function recordUniquePageIds<T extends { id: string }>(
+  items: T[],
+  seen: Set<string>,
+  label: string,
+): void {
+  for (const item of items) {
+    if (seen.has(item.id)) {
+      invalidPlatformShape(`${label} repeats record id ${item.id}`);
+    }
+    seen.add(item.id);
+  }
+}
+
 const TRACE_PAGE_SIZE = 100;
 const MAX_TRACE_SCAN = 1000;
 const DETECTION_PAGE_SIZE = 100;
@@ -716,6 +729,7 @@ async function fetchDetections(
   traceId: string,
 ): Promise<DetectionBatch> {
   const items: PlatformDetection[] = [];
+  const seenDetectionIds = new Set<string>();
   let page = 1;
   let reportedTotal: number | undefined;
 
@@ -732,6 +746,7 @@ async function fetchDetections(
       perPage,
     );
     const batch = result.items;
+    recordUniquePageIds(batch, seenDetectionIds, 'detection pagination');
     if (reportedTotal !== undefined && result.total !== reportedTotal) {
       invalidPlatformShape('detection page.total changed between pages');
     }
@@ -788,12 +803,14 @@ async function fetchRecentTraces(
   let scannedTraceCount = 0;
   let totalTraceCount = 0;
   let reportedTotal: number | undefined;
+  const seenTraceIds = new Set<string>();
   let scanComplete = false;
   let resultsTruncated = false;
 
   while (events.length < opts.limit && scannedTraceCount < MAX_TRACE_SCAN) {
     const result = await fetchTracePage(auth, baseUrl, tenantId, page, perPage);
     const rows = result.traces;
+    recordUniquePageIds(rows, seenTraceIds, 'trace pagination');
     if (reportedTotal !== undefined && result.total !== reportedTotal) {
       invalidPlatformShape('trace page.total changed between pages');
     }

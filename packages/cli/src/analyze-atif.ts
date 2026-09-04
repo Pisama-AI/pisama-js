@@ -576,50 +576,93 @@ function validateDiagnosis(value: unknown): AnalyzeResponse['diagnosis'] {
 }
 
 interface SourceTopologyContract {
-  allowedReferences: Set<string>;
-  requiredContinuationReferences: Set<string>;
+  expectedUnresolvedReferences: string[];
+}
+
+function optionalRecord(value: unknown): Record<string, unknown> | undefined {
+  return typeof value === 'object' && value !== null && !Array.isArray(value)
+    ? (value as Record<string, unknown>)
+    : undefined;
+}
+
+function recordArray(value: unknown): Array<Record<string, unknown>> {
+  if (!Array.isArray(value)) return [];
+  return value.flatMap((item) => {
+    const record = optionalRecord(item);
+    return record ? [record] : [];
+  });
+}
+
+function unresolvedSubagentReferences(
+  document: Record<string, unknown>,
+  embeddedIds: ReadonlySet<string>,
+): string[] {
+  const unresolved: string[] = [];
+  for (const step of recordArray(document['steps'])) {
+    const observation = optionalRecord(step['observation']);
+    for (const result of recordArray(observation?.['results'])) {
+      for (const reference of recordArray(result['subagent_trajectory_ref'])) {
+        const trajectoryId = reference['trajectory_id'];
+        const trajectoryPath = reference['trajectory_path'];
+        if (typeof trajectoryId === 'string' && embeddedIds.has(trajectoryId)) continue;
+        const target =
+          typeof trajectoryPath === 'string' && trajectoryPath ? trajectoryPath : trajectoryId;
+        if (typeof target === 'string') unresolved.push(target);
+      }
+    }
+  }
+  return unresolved;
 }
 
 function sourceTopologyContract(trajectory: AtifTrajectory): SourceTopologyContract {
-  const allowedReferences = collectSubagentTrajectoryTargets(trajectory);
-  const requiredContinuationReferences = new Set<string>();
-  const pendingDocuments: unknown[] = [trajectory];
+  const expectedUnresolvedReferences: string[] = [];
+  const seen = new Set<string>();
+  const add = (reference: string): void => {
+    if (seen.has(reference)) return;
+    seen.add(reference);
+    expectedUnresolvedReferences.push(reference);
+  };
 
-  while (pendingDocuments.length > 0) {
-    const current = pendingDocuments.pop();
-    if (typeof current !== 'object' || current === null) continue;
+  // Mirror backend/app/ingestion/atif_parser.py::_unresolved_trajectory_refs.
+  // An immediate embedded child's trajectory_id resolves an ID-bearing ref,
+  // even when that ref also carries a path. Otherwise the path wins over the
+  // ID. Each embedded document has its own immediate-child resolution scope.
+  const collect = (value: unknown): void => {
+    const document = optionalRecord(value);
+    if (!document) return;
+    const embedded = recordArray(document['subagent_trajectories']);
+    const embeddedIds = new Set(
+      embedded.flatMap((candidate) => {
+        const id = candidate['trajectory_id'];
+        return typeof id === 'string' ? [id] : [];
+      }),
+    );
+    for (const reference of unresolvedSubagentReferences(document, embeddedIds)) add(reference);
 
-    const record = current as Record<string, unknown>;
-    const continuedReference = record['continued_trajectory_ref'];
-    if (typeof continuedReference === 'string' && continuedReference.trim().length > 0) {
-      allowedReferences.add(continuedReference);
-      requiredContinuationReferences.add(continuedReference);
-    }
-    const embedded = record['subagent_trajectories'];
-    if (Array.isArray(embedded)) {
-      pendingDocuments.push(...embedded);
-    }
+    const continuedReference = document['continued_trajectory_ref'];
+    if (typeof continuedReference === 'string' && continuedReference) add(continuedReference);
+    for (const child of embedded) collect(child);
+  };
+
+  collect(trajectory);
+  return { expectedUnresolvedReferences };
+}
+
+function sameOrderedStrings(left: string[], right: string[]): boolean {
+  if (left.length !== right.length) return false;
+  for (let index = 0; index < left.length; index += 1) {
+    if (left[index] !== right[index]) return false;
   }
-
-  return { allowedReferences, requiredContinuationReferences };
+  return true;
 }
 
 function validateSourceTopology(unresolved: string[], contract: SourceTopologyContract): void {
   if (new Set(unresolved).size !== unresolved.length) {
     invalidAnalyzeResponse('trace.unresolved_trajectory_refs must not contain duplicates');
   }
-  const unexpected = unresolved.find((reference) => !contract.allowedReferences.has(reference));
-  if (unexpected !== undefined) {
+  if (!sameOrderedStrings(unresolved, contract.expectedUnresolvedReferences)) {
     invalidAnalyzeResponse(
-      `trace.unresolved_trajectory_refs contains a reference absent from the submitted trajectory: ${unexpected}`,
-    );
-  }
-  const missingContinuation = [...contract.requiredContinuationReferences].find(
-    (reference) => !unresolved.includes(reference),
-  );
-  if (missingContinuation !== undefined) {
-    invalidAnalyzeResponse(
-      `trace.unresolved_trajectory_refs omitted submitted continued_trajectory_ref: ${missingContinuation}`,
+      'trace.unresolved_trajectory_refs must exactly match unresolved refs derived from the submitted trajectory',
     );
   }
 }

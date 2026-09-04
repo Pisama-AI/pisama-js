@@ -24,6 +24,13 @@ const REAL_TRAJECTORY = resolve(
   'hello-world-context-summarization.trajectory.json',
 );
 const REAL_CONTINUATION_ROOT = resolve(here, 'fixtures', 'atif', 'continuation', 'trajectory.json');
+const TOPOLOGY_FREE_TRAJECTORY = resolve(
+  here,
+  'fixtures',
+  'atif',
+  'continuation',
+  'trajectory.cont-1.json',
+);
 
 interface Spy {
   logs: string[];
@@ -368,7 +375,8 @@ test('analyze-atif (remote) happy path: posts the trajectory and exits 0 on no d
         capturedAuth = new Headers(init?.headers).get('authorization') ?? undefined;
         return jsonResponse(mockAnalyzeResponse({}));
       },
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k-1', baseUrl: 'https://test/' }),
+      () =>
+        analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k-1', baseUrl: 'https://test/' }),
     );
     assert.equal(s.exitCode, null);
   } finally {
@@ -405,7 +413,12 @@ test('analyze-atif (remote) submits a continuation and cannot hide its high find
             return jsonResponse(
               mockAnalyzeResponse({
                 topologyComplete: false,
-                unresolvedTrajectoryRefs: ['trajectory.cont-1.json'],
+                unresolvedTrajectoryRefs: [
+                  'trajectory.summarization-1-summary.json',
+                  'trajectory.summarization-1-questions.json',
+                  'trajectory.summarization-1-answers.json',
+                  'trajectory.cont-1.json',
+                ],
               }),
             );
           }
@@ -445,7 +458,7 @@ test('analyze-atif (remote) submits a continuation and cannot hide its high find
   const output = s.logs.join('\n');
   assert.match(output, /continuation submitted: trajectory\.cont-1\.json/);
   assert.match(output, /completion_misjudgment/);
-  assert.match(output, /At least one critical\/high-severity detection fired/);
+  assert.match(output, /At least one analysis had incomplete detector or topology evidence/);
   assert.doesNotMatch(output, /Summary:[\s\S]*No critical\/high-severity failures/);
 });
 
@@ -521,7 +534,7 @@ test('analyze-atif (remote) exits 1 and never reports clean when every detector 
               detectorsFailed: { loop: 'detector timed out' },
             }),
           ),
-        () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+        () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
       );
       assert.fail('expected process.exit');
     } catch (error) {
@@ -552,7 +565,7 @@ test('analyze-atif (remote) exits 1 on partial detector coverage with no finding
               detectorsFailed: { persona_drift: 'dependency unavailable' },
             }),
           ),
-        () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+        () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
       );
       assert.fail('expected process.exit');
     } catch (error) {
@@ -618,6 +631,150 @@ test('analyze-atif (remote) never reports clean with unresolved topology', async
   assert.doesNotMatch(output, /No detections|No critical\/high-severity failures/);
 });
 
+test('analyze-atif (remote) requires the backend-exact nested subagent topology', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-nested-topology-'));
+  const trajectoryPath = join(dir, 'trajectory.json');
+  const trajectory = minimalTrajectory({
+    steps: [
+      {
+        observation: {
+          results: [
+            {
+              subagent_trajectory_ref: [
+                {
+                  trajectory_id: 'embedded-child',
+                  trajectory_path: 'embedded-child-path-is-resolved.json',
+                },
+                { trajectory_id: 'top-id' },
+                { trajectory_id: 'top-both-id', trajectory_path: 'top-path.json' },
+              ],
+            },
+          ],
+        },
+      },
+    ],
+    subagent_trajectories: [
+      minimalTrajectory({
+        trajectory_id: 'embedded-child',
+        steps: [
+          {
+            observation: {
+              results: [
+                {
+                  subagent_trajectory_ref: [
+                    {
+                      trajectory_id: 'nested-embedded',
+                      trajectory_path: 'nested-embedded-path-is-resolved.json',
+                    },
+                    { trajectory_id: 'nested-id' },
+                    {
+                      trajectory_id: 'nested-both-id',
+                      trajectory_path: 'nested-path.json',
+                    },
+                  ],
+                },
+              ],
+            },
+          },
+        ],
+        continued_trajectory_ref: 'nested-continuation.json',
+        subagent_trajectories: [minimalTrajectory({ trajectory_id: 'nested-embedded' })],
+      }),
+    ],
+  });
+  writeFileSync(trajectoryPath, JSON.stringify(trajectory));
+
+  const exact = [
+    'top-id',
+    'top-path.json',
+    'nested-id',
+    'nested-path.json',
+    'nested-continuation.json',
+  ];
+  const invalidCases: Array<{ name: string; refs: string[]; complete: boolean }> = [
+    { name: 'complete response omits every subagent ref', refs: [], complete: true },
+    {
+      name: 'response omits a nested subagent ref',
+      refs: exact.filter((ref) => ref !== 'nested-id'),
+      complete: false,
+    },
+    {
+      name: 'response uses ID instead of path when both are present',
+      refs: exact.map((ref) => (ref === 'top-path.json' ? 'top-both-id' : ref)),
+      complete: false,
+    },
+    {
+      name: 'response reports a ref resolved by an immediate embedded child',
+      refs: ['embedded-child', ...exact],
+      complete: false,
+    },
+    {
+      name: 'response reorders the backend topology contract',
+      refs: [...exact].reverse(),
+      complete: false,
+    },
+  ];
+
+  try {
+    for (const entry of invalidCases) {
+      const s = spy();
+      try {
+        try {
+          await withMockFetch(
+            () =>
+              jsonResponse(
+                mockAnalyzeResponse({
+                  topologyComplete: entry.complete,
+                  unresolvedTrajectoryRefs: entry.refs,
+                }),
+              ),
+            () => analyzeAtif({ path: trajectoryPath, apiKey: 'key', baseUrl: 'https://test' }),
+          );
+          assert.fail('expected process.exit');
+        } catch (error) {
+          assert.equal((error as Error).message, '__exit__', entry.name);
+        }
+      } finally {
+        s.restore();
+      }
+      assert.equal(s.exitCode, 1, entry.name);
+      assert.ok(
+        s.errs.some((line) => /unresolved refs derived from the submitted trajectory/.test(line)),
+        `${entry.name}: ${s.errs.join('\n')}`,
+      );
+      assert.doesNotMatch(s.logs.join('\n'), /No detections|No critical\/high-severity failures/);
+    }
+
+    const s = spy();
+    try {
+      try {
+        await withMockFetch(
+          () =>
+            jsonResponse(
+              mockAnalyzeResponse({
+                topologyComplete: false,
+                unresolvedTrajectoryRefs: exact,
+              }),
+            ),
+          () => analyzeAtif({ path: trajectoryPath, apiKey: 'key', baseUrl: 'https://test' }),
+        );
+        assert.fail('expected process.exit');
+      } catch (error) {
+        assert.equal((error as Error).message, '__exit__');
+      }
+    } finally {
+      s.restore();
+    }
+    assert.equal(s.exitCode, 1);
+    assert.match(
+      s.logs.join('\n'),
+      /top-id, top-path\.json, nested-id, nested-path\.json, nested-continuation\.json/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('analyze-atif (remote) rejects malformed or inconsistent 200 responses', async () => {
   const mismatchedTrace = mockAnalyzeResponse({});
   (mismatchedTrace.trace as Record<string, unknown>).trace_id = 'other-trace';
@@ -660,7 +817,8 @@ test('analyze-atif (remote) rejects malformed or inconsistent 200 responses', as
       try {
         await withMockFetch(
           () => jsonResponse(entry.response),
-          () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+          () =>
+            analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
         );
         assert.fail('expected process.exit');
       } catch (error) {
@@ -700,7 +858,8 @@ test('analyze-atif exchanges the raw key for a scoped JWT and retries exactly on
           ? new Response('expired', { status: 401 })
           : jsonResponse(mockAnalyzeResponse({}));
       },
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: rawKey, baseUrl: 'https://test' }),
+      () =>
+        analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: rawKey, baseUrl: 'https://test' }),
       (body) => tokenBodies.push(body),
     );
   } finally {
@@ -732,7 +891,8 @@ test('analyze-atif stops after the single authenticated retry on a persistent 40
         analyzeCalls += 1;
         return new Response('unauthorized', { status: 401 });
       },
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'secret', baseUrl: 'https://test' }),
+      () =>
+        analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'secret', baseUrl: 'https://test' }),
       () => {
         tokenCalls += 1;
       },
@@ -760,7 +920,7 @@ test('analyze-atif requests full scope for --apply and never uses credentials as
       },
       () =>
         analyzeAtif({
-          path: REAL_TRAJECTORY,
+          path: TOPOLOGY_FREE_TRAJECTORY,
           apply: true,
           framework: 'n8n',
           entityId: 'workflow-1',
@@ -791,7 +951,7 @@ test('analyze-atif (remote) exits 1 when the backend returns a high-severity det
             ],
           }),
         ),
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
     );
     assert.fail('expected process.exit');
   } catch (e) {
@@ -821,7 +981,7 @@ test('analyze-atif (remote) renders a critical detection and exits 1', async () 
             ],
           }),
         ),
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
     );
     assert.fail('expected process.exit');
   } catch (error) {
@@ -844,7 +1004,7 @@ test('analyze-atif (remote) fails clearly when the analyze endpoint is unreachab
       () => {
         throw new Error('connect ECONNREFUSED');
       },
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
     );
     assert.fail('expected process.exit');
   } catch (e) {
@@ -861,7 +1021,7 @@ test('analyze-atif (remote) fails on a non-ok HTTP status and surfaces the respo
   try {
     await withMockFetch(
       () => new Response('rate limited', { status: 429 }),
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
     );
     assert.fail('expected process.exit');
   } catch (e) {
@@ -883,7 +1043,7 @@ test('analyze-atif (remote) truncates a severity group beyond 3 items', async ()
   try {
     await withMockFetch(
       () => jsonResponse(mockAnalyzeResponse({ detections })),
-      () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      () => analyzeAtif({ path: TOPOLOGY_FREE_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
     );
     assert.equal(s.exitCode, null);
   } finally {
@@ -897,7 +1057,7 @@ test('analyze-atif (remote) truncates a severity group beyond 3 items', async ()
 // ---------------------------------------------------------------------------
 
 test('--apply requires --framework, --entity-id, and --credentials, each reported separately', async () => {
-  const base = { path: REAL_TRAJECTORY, apply: true } as const;
+  const base = { path: TOPOLOGY_FREE_TRAJECTORY, apply: true } as const;
   for (const [opts, expected] of [
     [base, /--apply requires --framework/],
     [{ ...base, framework: 'n8n' }, /--apply requires --entity-id/],
@@ -924,7 +1084,7 @@ test('--apply rejects invalid inline --credentials JSON', async () => {
   const s = spy();
   try {
     await analyzeAtif({
-      path: REAL_TRAJECTORY,
+      path: TOPOLOGY_FREE_TRAJECTORY,
       apply: true,
       framework: 'n8n',
       entityId: 'wf-1',
@@ -958,7 +1118,7 @@ test('--apply reads --credentials from a file path and rejects a missing or inva
         },
         () =>
           analyzeAtif({
-            path: REAL_TRAJECTORY,
+            path: TOPOLOGY_FREE_TRAJECTORY,
             apply: true,
             framework: 'n8n',
             entityId: 'wf-1',
@@ -977,7 +1137,7 @@ test('--apply reads --credentials from a file path and rejects a missing or inva
     const missing = spy();
     try {
       await analyzeAtif({
-        path: REAL_TRAJECTORY,
+        path: TOPOLOGY_FREE_TRAJECTORY,
         apply: true,
         framework: 'n8n',
         entityId: 'wf-1',
@@ -997,7 +1157,7 @@ test('--apply reads --credentials from a file path and rejects a missing or inva
     const bad = spy();
     try {
       await analyzeAtif({
-        path: REAL_TRAJECTORY,
+        path: TOPOLOGY_FREE_TRAJECTORY,
         apply: true,
         framework: 'n8n',
         entityId: 'wf-1',
@@ -1035,7 +1195,7 @@ test('--apply renders a successful, non-rolled-back healing with an id-keyed suc
         ),
       () =>
         analyzeAtif({
-          path: REAL_TRAJECTORY,
+          path: TOPOLOGY_FREE_TRAJECTORY,
           apply: true,
           framework: 'n8n',
           entityId: 'wf-1',
@@ -1073,7 +1233,7 @@ test('--apply renders a rolled-back healing with an agent_id-keyed successor', a
           ),
         () =>
           analyzeAtif({
-            path: REAL_TRAJECTORY,
+            path: TOPOLOGY_FREE_TRAJECTORY,
             apply: true,
             framework: 'n8n',
             entityId: 'wf-1',
@@ -1107,7 +1267,7 @@ test('--apply renders a failed healing with its error', async () => {
           ),
         () =>
           analyzeAtif({
-            path: REAL_TRAJECTORY,
+            path: TOPOLOGY_FREE_TRAJECTORY,
             apply: true,
             framework: 'n8n',
             entityId: 'wf-1',
@@ -1138,7 +1298,7 @@ test('--apply exits 1 when the backend omits the healing result', async () => {
         () => jsonResponse(mockAnalyzeResponse({ healing: null })),
         () =>
           analyzeAtif({
-            path: REAL_TRAJECTORY,
+            path: TOPOLOGY_FREE_TRAJECTORY,
             apply: true,
             framework: 'n8n',
             entityId: 'wf-1',
@@ -1161,7 +1321,7 @@ test('--apply exits 1 when the backend omits the healing result', async () => {
 test('--apply is single-trajectory only', async () => {
   const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-multi-'));
   try {
-    const trajectory = JSON.parse(readFileSync(REAL_TRAJECTORY, 'utf8'));
+    const trajectory = JSON.parse(readFileSync(TOPOLOGY_FREE_TRAJECTORY, 'utf8'));
     writeFileSync(join(dir, 'a.json'), JSON.stringify(trajectory));
     writeFileSync(join(dir, 'b.json'), JSON.stringify(trajectory));
 
