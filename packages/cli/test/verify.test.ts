@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verify } from '../src/verify.js';
+import { normaliseVerifyTimeout, verify } from '../src/verify.js';
 
 interface Spy {
   logs: string[];
@@ -110,7 +110,10 @@ function installPlatform(options: PlatformOptions = {}) {
       }
       pollCount++;
       const landed = !options.neverLand && pollCount >= 2 && seenTraceId;
-      return Response.json({ traces: landed ? [{ trace_id: seenTraceId }] : [] });
+      const id = landed
+        ? seenTraceId?.replace(/^(........)(....)(....)(....)(............)$/, '$1-$2-$3-$4-$5')
+        : undefined;
+      return Response.json({ traces: id ? [{ id }] : [] });
     }
     return new Response('', { status: 404 });
   }) as typeof fetch;
@@ -131,6 +134,97 @@ async function expectExit(run: () => Promise<void>): Promise<void> {
     assert.equal((error as Error).message, '__exit__');
   }
 }
+
+function hangingResponse(status = 200): Response {
+  return new Response(
+    new ReadableStream({
+      start() {
+        // Intentionally never enqueue or close: exercises the total body deadline.
+      },
+    }),
+    { status },
+  );
+}
+
+test('verify normalises a positive finite timeout and rejects unsafe values', () => {
+  assert.equal(normaliseVerifyTimeout(1.9), 1);
+  for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+    assert.throws(() => normaliseVerifyTimeout(value), /--timeout-ms must be between/);
+  }
+});
+
+for (const hangAt of [
+  'token fetch',
+  'token body',
+  'ingest fetch',
+  'ingest body',
+  'poll fetch',
+  'poll body',
+] as const) {
+  test(`verify total deadline bounds a hanging ${hangAt}`, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      if (url.endsWith('/api/v1/auth/token')) {
+        if (hangAt === 'token fetch') return new Promise<Response>(() => {});
+        if (hangAt === 'token body') return hangingResponse();
+        const body = JSON.parse(String(init.body)) as { scope?: string };
+        return Response.json({ access_token: token('tenant-abc', body.scope ?? 'read', 1) });
+      }
+      if (url.endsWith('/api/v1/traces/ingest')) {
+        if (hangAt === 'ingest fetch') return new Promise<Response>(() => {});
+        if (hangAt === 'ingest body') return hangingResponse(202);
+        return Response.json({ accepted: 1 }, { status: 202 });
+      }
+      if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
+        if (hangAt === 'poll fetch') return new Promise<Response>(() => {});
+        if (hangAt === 'poll body') return hangingResponse();
+        return Response.json({ traces: [] });
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+    const s = spy();
+    const started = Date.now();
+    try {
+      await expectExit(() =>
+        verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 25 }),
+      );
+      assert.equal(s.exitCode, 1);
+      assert.ok(Date.now() - started < 1_000, `${hangAt} exceeded the bounded deadline`);
+    } finally {
+      s.restore();
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+test('verify shares one deadline across sequential authentication stages', async () => {
+  const originalFetch = globalThis.fetch;
+  let protectedIngestCalls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = String(input);
+    if (url.endsWith('/api/v1/auth/token')) {
+      const body = JSON.parse(String(init.body)) as { scope?: string };
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      return Response.json({ access_token: token('tenant-abc', body.scope ?? 'read', 1) });
+    }
+    if (url.endsWith('/api/v1/traces/ingest')) protectedIngestCalls += 1;
+    return Response.json({ accepted: 1 }, { status: 202 });
+  }) as typeof fetch;
+  const s = spy();
+  const started = Date.now();
+  try {
+    await expectExit(() =>
+      verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 100 }),
+    );
+    assert.equal(s.exitCode, 1);
+    assert.equal(protectedIngestCalls, 0, 'ingest must not start after the total deadline expires');
+    assert.ok(Date.now() - started < 500);
+  } finally {
+    s.restore();
+    globalThis.fetch = originalFetch;
+  }
+});
 
 test('verify fails clearly when no API key is available anywhere', async () => {
   const original = process.env.PISAMA_API_KEY;

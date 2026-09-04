@@ -4,6 +4,9 @@ This package is retired. Version 0.9.0 is a no-network tombstone: every
 invocation exits non-zero after printing a migration message. It does not
 modify a repository, open a browser, or contact an API.
 
+Both the historical `pisama-ts` executable and the `whoopsie` alias run that
+tombstone, so an explicit upgrade cannot silently retain the old transport.
+
 Use `@pisama/cli@0.11.3` or newer. The command name is `pisama` (with
 `pisama-ts` retained as an alias):
 

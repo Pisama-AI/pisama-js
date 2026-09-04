@@ -42,7 +42,9 @@ AUDIT_CLI_ARTIFACT="${AUDIT_PACKED_CONSUMER:-0}" \
 
 install_dir=$(mktemp -d)
 legacy_extract=$(mktemp -d)
-trap 'rm -rf -- "$install_dir" "$legacy_extract"' EXIT
+legacy_cli_install=$(mktemp -d)
+legacy_guard=$(mktemp -d)
+trap 'rm -rf -- "$install_dir" "$legacy_extract" "$legacy_cli_install" "$legacy_guard"' EXIT
 
 npm install --ignore-scripts --prefix "$install_dir" \
   "$release_dir"/pisama-detectors-*.tgz
@@ -73,6 +75,51 @@ whoopsie_status=$?
 set -e
 test "$whoopsie_status" = 1
 grep -q '@whoopsie/cli is retired' <<< "$whoopsie_output"
+
+# Prove the historical executable name from @whoopsie/cli@0.8.1 remains a
+# fail-closed tombstone in a clean consumer. Test the alias too, with outbound
+# transports trapped and a byte-for-byte filesystem snapshot around each run.
+npm install --ignore-scripts --no-audit --no-fund --prefix "$legacy_cli_install" \
+  "$release_dir"/whoopsie-cli-*.tgz
+cp packages/whoopsie-cli/test/forbid-network.cjs "$legacy_guard/forbid-network.cjs"
+snapshot_install() {
+  node - "$legacy_cli_install" <<'NODE'
+const { createHash } = require('node:crypto');
+const { lstatSync, readFileSync, readdirSync, readlinkSync } = require('node:fs');
+const { join, relative } = require('node:path');
+const root = process.argv[2];
+const entries = [];
+function visit(path) {
+  const stat = lstatSync(path);
+  const name = relative(root, path);
+  if (stat.isSymbolicLink()) {
+    entries.push([name, 'link', readlinkSync(path)]);
+  } else if (stat.isDirectory()) {
+    for (const child of readdirSync(path).sort()) visit(join(path, child));
+  } else if (stat.isFile()) {
+    entries.push([name, 'file', createHash('sha256').update(readFileSync(path)).digest('hex')]);
+  }
+}
+visit(root);
+process.stdout.write(`${JSON.stringify(entries)}\n`);
+NODE
+}
+
+snapshot_install > "$legacy_guard/before.json"
+for legacy_command in pisama-ts whoopsie; do
+  set +e
+  legacy_output=$(WHOOPSIE_NETWORK_SENTINEL="$legacy_guard/network-attempted" \
+    NODE_OPTIONS="--require=$legacy_guard/forbid-network.cjs" \
+    "$legacy_cli_install/node_modules/.bin/$legacy_command" --help 2>&1)
+  legacy_status=$?
+  set -e
+  test "$legacy_status" = 1
+  grep -q '@whoopsie/cli is retired' <<< "$legacy_output"
+  grep -q '@pisama/cli@0.11.3' <<< "$legacy_output"
+  test ! -e "$legacy_guard/network-attempted"
+  snapshot_install > "$legacy_guard/after.json"
+  cmp "$legacy_guard/before.json" "$legacy_guard/after.json"
+done
 
 (
   cd "$install_dir"

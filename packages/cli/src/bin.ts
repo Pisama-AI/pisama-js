@@ -1,15 +1,23 @@
 #!/usr/bin/env node
 import { createRequire } from 'module';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import { analyzeAtif } from './analyze-atif.js';
 import { init } from './init.js';
 import { startMcpServer } from './mcp.js';
-import { verify } from './verify.js';
+import { normaliseVerifyTimeout, verify } from './verify.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
 
 const program = new Command();
+
+function parseTimeoutMs(value: string): number {
+  try {
+    return normaliseVerifyTimeout(Number(value));
+  } catch (error) {
+    throw new InvalidArgumentError((error as Error).message);
+  }
+}
 
 program
   .name('pisama')
@@ -58,8 +66,10 @@ program
   .option('--cwd <path>', 'Project root', process.cwd())
   .option('--api-key <key>', 'Pisama API key (defaults to PISAMA_API_KEY)')
   .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
-  .option('--timeout-ms <ms>', 'How long to wait for the trace to surface (default 15000)', (v) =>
-    Number(v),
+  .option(
+    '--timeout-ms <ms>',
+    'Total deadline for authentication, ingest, and readback (default 15000)',
+    parseTimeoutMs,
   )
   .action(async (opts: { cwd: string; apiKey?: string; baseUrl?: string; timeoutMs?: number }) => {
     await verify({

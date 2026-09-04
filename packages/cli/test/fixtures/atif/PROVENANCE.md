@@ -20,3 +20,16 @@ own golden-fixture tooling before import; nothing else was changed.
 
 Licensed Apache-2.0 upstream; redistributed here as test fixture data under
 that license, consistent with how it is already vendored in Pisama-AI/pisama.
+
+The `continuation/` directory is the same golden run in Harbor's explicit
+linear-history representation. Its two files were copied byte-for-byte from
+the same upstream revision and Pisama vendor directory:
+
+- `continuation/trajectory.json`: sha256
+  `06b56ab49c627ae3410a0dcb8650a41bb1b30f113d601d10060e590a5018c2bb`
+- `continuation/trajectory.cont-1.json`: sha256
+  `054dfbe7e9835830dca2d7c58dc01a8c7129362538b49df4f50468a875d69082`
+
+The root's `continued_trajectory_ref` points to the second file. These bytes
+exercise safe continuation-chain discovery and keep Harbor summarization
+helpers out of analysis.

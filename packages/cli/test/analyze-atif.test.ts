@@ -1,6 +1,14 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { readFileSync, mkdtempSync, writeFileSync, rmSync, mkdirSync } from 'node:fs';
+import {
+  chmodSync,
+  readFileSync,
+  mkdtempSync,
+  writeFileSync,
+  rmSync,
+  mkdirSync,
+  symlinkSync,
+} from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join, dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,6 +23,7 @@ const REAL_TRAJECTORY = resolve(
   'atif',
   'hello-world-context-summarization.trajectory.json',
 );
+const REAL_CONTINUATION_ROOT = resolve(here, 'fixtures', 'atif', 'continuation', 'trajectory.json');
 
 interface Spy {
   logs: string[];
@@ -58,6 +67,43 @@ function withNoNetwork<T>(fn: () => Promise<T>): Promise<T> {
   return fn().finally(() => {
     globalThis.fetch = originalFetch;
   });
+}
+
+function minimalTrajectory(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    schema_version: 'ATIF-v1.7',
+    session_id: 'continuation-test',
+    agent: { name: 'test', model_name: 'test-model' },
+    steps: [],
+    ...overrides,
+  };
+}
+
+async function expectDiscoveryFailureWithoutNetwork(path: string, expected: RegExp): Promise<void> {
+  let networkCalls = 0;
+  const originalFetch = globalThis.fetch;
+  globalThis.fetch = (async () => {
+    networkCalls += 1;
+    throw new Error('discovery failure must precede network');
+  }) as typeof fetch;
+  const s = spy();
+  try {
+    try {
+      await analyzeAtif({ path, apiKey: 'unused', baseUrl: 'https://test' });
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+    assert.equal(s.exitCode, 1);
+    assert.ok(
+      s.errs.some((line) => expected.test(line)),
+      s.errs.join('\n'),
+    );
+    assert.equal(networkCalls, 0);
+  } finally {
+    s.restore();
+    globalThis.fetch = originalFetch;
+  }
 }
 
 test('analyze-atif --local runs @pisama/detectors on a real Harbor trajectory with zero network calls', async () => {
@@ -173,11 +219,50 @@ test('analyze-atif --local still validates schema_version like the remote path',
   assert.ok(s.errs.some((l) => /unsupported schema_version/.test(l)));
 });
 
+test('analyze-atif rejects valid JSON whose root is not an object', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-root-'));
+  try {
+    for (const [index, value] of [null, [], 'trajectory', 42].entries()) {
+      const file = join(dir, `invalid-root-${index}.json`);
+      writeFileSync(file, JSON.stringify(value));
+      const s = spy();
+      try {
+        await withNoNetwork(() => analyzeAtif({ path: file, local: true }));
+        assert.fail('expected process.exit');
+      } catch (error) {
+        assert.equal((error as Error).message, '__exit__');
+      } finally {
+        s.restore();
+      }
+      assert.equal(s.exitCode, 1);
+      assert.ok(s.errs.some((line) => /trajectory JSON root must be an object/.test(line)));
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('fixture sanity: the vendored trajectory file still parses as valid JSON', () => {
   const raw = readFileSync(REAL_TRAJECTORY, 'utf8');
   const parsed = JSON.parse(raw) as { schema_version?: string; steps?: unknown[] };
   assert.equal(parsed.schema_version, 'ATIF-v1.7');
   assert.ok(Array.isArray(parsed.steps) && parsed.steps.length > 0);
+});
+
+test('analyze-atif --local follows the committed Harbor continuation in run order', async () => {
+  const s = spy();
+  try {
+    await withNoNetwork(() => analyzeAtif({ path: REAL_CONTINUATION_ROOT, local: true }));
+    assert.equal(s.exitCode, null);
+  } finally {
+    s.restore();
+  }
+  const output = s.logs.join('\n');
+  assert.match(output, /Analyzing 2 trajectories locally/);
+  assert.ok(output.indexOf('trajectory.json') < output.indexOf('trajectory.cont-1.json'));
+  assert.match(output, /trajectory\.json[\s\S]*No detections/);
+  assert.match(output, /trajectory\.cont-1\.json[\s\S]*High token usage: 8832 tokens/);
+  assert.match(output, /Summary: 2 trajectorie\(s\), 1 total detection\(s\)/);
 });
 
 // ---------------------------------------------------------------------------
@@ -190,22 +275,35 @@ interface MockDiagnosisDetection {
   severity?: string;
   confidence?: number;
   title?: string;
+  description?: string;
 }
 
 function mockAnalyzeResponse(overrides: {
   detections?: MockDiagnosisDetection[];
+  detectionStatus?: string;
+  detectorsRun?: string[];
+  detectorsFailed?: Record<string, string>;
+  topologyComplete?: boolean;
+  unresolvedTrajectoryRefs?: string[];
   healing?: Record<string, unknown> | null;
 }): Record<string, unknown> {
-  const detections = overrides.detections ?? [];
+  const detections = (overrides.detections ?? []).map((detection, index) => ({
+    category: detection.category ?? `detector_${index}`,
+    detected: true,
+    severity: detection.severity ?? 'medium',
+    confidence: detection.confidence ?? 0.5,
+    title: detection.title ?? 'Detector finding',
+    description: detection.description ?? 'Detector finding description.',
+  }));
   return {
     diagnosis: {
       trace_id: 'trace-1',
       has_failures: detections.length > 0,
       failure_count: detections.length,
-      detection_status: 'completed',
+      detection_status: overrides.detectionStatus ?? 'complete',
       all_detections: detections,
-      detectors_run: ['loop', 'persona_drift'],
-      detectors_failed: {},
+      detectors_run: overrides.detectorsRun ?? ['loop', 'persona_drift'],
+      detectors_failed: overrides.detectorsFailed ?? {},
     },
     trace: {
       trace_id: 'trace-1',
@@ -214,6 +312,8 @@ function mockAnalyzeResponse(overrides: {
       atif_schema_version: 'ATIF-v1.7',
       atif_session_id: 'sess-1',
       atif_trajectory_id: null,
+      topology_complete: overrides.topologyComplete ?? true,
+      unresolved_trajectory_refs: overrides.unresolvedTrajectoryRefs ?? [],
     },
     healing: overrides.healing ?? null,
   };
@@ -281,6 +381,301 @@ test('analyze-atif (remote) happy path: posts the trajectory and exits 0 on no d
   assert.match(out, /against https:\/\/test/);
   assert.match(out, /No detections/);
   assert.match(out, /No critical\/high-severity failures/);
+});
+
+test('analyze-atif (remote) submits a continuation and cannot hide its high finding', async () => {
+  const submitted: Array<{ continued_trajectory_ref?: string; continuation?: number }> = [];
+  const s = spy();
+  try {
+    try {
+      await withMockFetch(
+        (_url, init) => {
+          const body = JSON.parse(String(init?.body)) as {
+            trajectory: {
+              continued_trajectory_ref?: string;
+              agent?: { extra?: { continuation_index?: number } };
+            };
+          };
+          const trajectory = body.trajectory;
+          submitted.push({
+            continued_trajectory_ref: trajectory.continued_trajectory_ref,
+            continuation: trajectory.agent?.extra?.continuation_index,
+          });
+          if (trajectory.continued_trajectory_ref) {
+            return jsonResponse(
+              mockAnalyzeResponse({
+                topologyComplete: false,
+                unresolvedTrajectoryRefs: ['trajectory.cont-1.json'],
+              }),
+            );
+          }
+          return jsonResponse(
+            mockAnalyzeResponse({
+              detections: [
+                {
+                  category: 'completion_misjudgment',
+                  severity: 'high',
+                  confidence: 0.95,
+                  title: 'Continuation failed',
+                },
+              ],
+            }),
+          );
+        },
+        () =>
+          analyzeAtif({
+            path: REAL_CONTINUATION_ROOT,
+            apiKey: 'key',
+            baseUrl: 'https://test',
+          }),
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+  } finally {
+    s.restore();
+  }
+
+  assert.equal(s.exitCode, 1);
+  assert.deepEqual(submitted, [
+    { continued_trajectory_ref: 'trajectory.cont-1.json', continuation: undefined },
+    { continued_trajectory_ref: undefined, continuation: 1 },
+  ]);
+  const output = s.logs.join('\n');
+  assert.match(output, /continuation submitted: trajectory\.cont-1\.json/);
+  assert.match(output, /completion_misjudgment/);
+  assert.match(output, /At least one critical\/high-severity detection fired/);
+  assert.doesNotMatch(output, /Summary:[\s\S]*No critical\/high-severity failures/);
+});
+
+test('analyze-atif (remote) rejects continuation topology responses that disagree with source', async () => {
+  const continuedReference = 'trajectory.cont-1.json';
+  const cases: Array<{ name: string; response: Record<string, unknown> }> = [
+    {
+      name: 'complete response omits submitted continuation',
+      response: mockAnalyzeResponse({}),
+    },
+    {
+      name: 'incomplete response omits submitted continuation',
+      response: mockAnalyzeResponse({
+        topologyComplete: false,
+        unresolvedTrajectoryRefs: ['trajectory.summarization-1-summary.json'],
+      }),
+    },
+    {
+      name: 'response invents an undeclared reference',
+      response: mockAnalyzeResponse({
+        topologyComplete: false,
+        unresolvedTrajectoryRefs: [continuedReference, 'not-declared-by-source.json'],
+      }),
+    },
+    {
+      name: 'response duplicates the submitted continuation',
+      response: mockAnalyzeResponse({
+        topologyComplete: false,
+        unresolvedTrajectoryRefs: [continuedReference, continuedReference],
+      }),
+    },
+  ];
+
+  for (const entry of cases) {
+    const s = spy();
+    try {
+      try {
+        await withMockFetch(
+          () => jsonResponse(entry.response),
+          () =>
+            analyzeAtif({
+              path: REAL_CONTINUATION_ROOT,
+              apiKey: 'key',
+              baseUrl: 'https://test',
+            }),
+        );
+        assert.fail('expected process.exit');
+      } catch (error) {
+        assert.equal((error as Error).message, '__exit__', entry.name);
+      }
+    } finally {
+      s.restore();
+    }
+    assert.equal(s.exitCode, 1, entry.name);
+    assert.ok(
+      s.errs.some((line) => /analyze endpoint returned an invalid response/.test(line)),
+      entry.name,
+    );
+    assert.doesNotMatch(s.logs.join('\n'), /No detections|No critical\/high-severity failures/);
+  }
+});
+
+test('analyze-atif (remote) exits 1 and never reports clean when every detector failed', async () => {
+  const s = spy();
+  try {
+    try {
+      await withMockFetch(
+        () =>
+          jsonResponse(
+            mockAnalyzeResponse({
+              detectionStatus: 'failed',
+              detectorsRun: [],
+              detectorsFailed: { loop: 'detector timed out' },
+            }),
+          ),
+        () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+  } finally {
+    s.restore();
+  }
+
+  assert.equal(s.exitCode, 1);
+  const output = s.logs.join('\n');
+  assert.match(output, /Detection analysis failed; result is incomplete/);
+  assert.match(output, /detectors_failed: loop/);
+  assert.match(output, /0 confirmed detections returned; result is not clean/);
+  assert.match(output, /At least one analysis had incomplete detector or topology evidence/);
+  assert.doesNotMatch(output, /No detections|No critical\/high-severity failures/);
+});
+
+test('analyze-atif (remote) exits 1 on partial detector coverage with no findings', async () => {
+  const s = spy();
+  try {
+    try {
+      await withMockFetch(
+        () =>
+          jsonResponse(
+            mockAnalyzeResponse({
+              detectionStatus: 'partial',
+              detectorsFailed: { persona_drift: 'dependency unavailable' },
+            }),
+          ),
+        () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+  } finally {
+    s.restore();
+  }
+
+  assert.equal(s.exitCode, 1);
+  const output = s.logs.join('\n');
+  assert.match(output, /Detection analysis partial; result is incomplete/);
+  assert.match(output, /detectors_failed: persona_drift/);
+  assert.doesNotMatch(output, /No detections|No critical\/high-severity failures/);
+});
+
+test('analyze-atif (remote) never reports clean with unresolved topology', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-unresolved-source-'));
+  const trajectoryPath = join(dir, 'trajectory.json');
+  writeFileSync(
+    trajectoryPath,
+    JSON.stringify(
+      minimalTrajectory({
+        steps: [
+          {
+            observation: {
+              results: [
+                {
+                  subagent_trajectory_ref: [{ trajectory_path: 'external-subagent-trajectory' }],
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    ),
+  );
+  const s = spy();
+  try {
+    try {
+      await withMockFetch(
+        () =>
+          jsonResponse(
+            mockAnalyzeResponse({
+              topologyComplete: false,
+              unresolvedTrajectoryRefs: ['external-subagent-trajectory'],
+            }),
+          ),
+        () => analyzeAtif({ path: trajectoryPath, apiKey: 'key', baseUrl: 'https://test' }),
+      );
+      assert.fail('expected process.exit');
+    } catch (error) {
+      assert.equal((error as Error).message, '__exit__');
+    }
+  } finally {
+    s.restore();
+    rmSync(dir, { recursive: true, force: true });
+  }
+  assert.equal(s.exitCode, 1);
+  const output = s.logs.join('\n');
+  assert.match(output, /Trajectory topology is incomplete; result is not clean/);
+  assert.match(output, /unresolved_trajectory_refs: external-subagent-trajectory/);
+  assert.doesNotMatch(output, /No detections|No critical\/high-severity failures/);
+});
+
+test('analyze-atif (remote) rejects malformed or inconsistent 200 responses', async () => {
+  const mismatchedTrace = mockAnalyzeResponse({});
+  (mismatchedTrace.trace as Record<string, unknown>).trace_id = 'other-trace';
+  const mismatchedCount = mockAnalyzeResponse({});
+  (mismatchedCount.diagnosis as Record<string, unknown>).failure_count = 1;
+  const missingDetected = mockAnalyzeResponse({ detections: [{ category: 'loop' }] });
+  delete (
+    (missingDetected.diagnosis as Record<string, unknown>).all_detections as Record<
+      string,
+      unknown
+    >[]
+  )[0].detected;
+
+  const cases: Array<{ name: string; response: unknown }> = [
+    { name: 'missing diagnosis', response: { trace: {}, healing: null } },
+    {
+      name: 'non-terminal status',
+      response: mockAnalyzeResponse({ detectionStatus: 'running' }),
+    },
+    {
+      name: 'complete status with detector failure',
+      response: mockAnalyzeResponse({ detectorsFailed: { loop: 'failed' } }),
+    },
+    {
+      name: 'complete status with no attempted detector',
+      response: mockAnalyzeResponse({ detectorsRun: [] }),
+    },
+    { name: 'failure count mismatch', response: mismatchedCount },
+    { name: 'trace ID mismatch', response: mismatchedTrace },
+    { name: 'malformed detection row', response: missingDetected },
+    {
+      name: 'topology flag contradicts unresolved refs',
+      response: mockAnalyzeResponse({ unresolvedTrajectoryRefs: ['missing.json'] }),
+    },
+  ];
+
+  for (const entry of cases) {
+    const s = spy();
+    try {
+      try {
+        await withMockFetch(
+          () => jsonResponse(entry.response),
+          () => analyzeAtif({ path: REAL_TRAJECTORY, apiKey: 'k', baseUrl: 'https://test' }),
+        );
+        assert.fail('expected process.exit');
+      } catch (error) {
+        assert.equal((error as Error).message, '__exit__', entry.name);
+      }
+    } finally {
+      s.restore();
+    }
+    assert.equal(s.exitCode, 1, entry.name);
+    assert.ok(
+      s.errs.some((line) => /analyze endpoint returned an invalid response/.test(line)),
+      entry.name,
+    );
+    assert.doesNotMatch(s.logs.join('\n'), /No detections|No critical\/high-severity failures/);
+  }
 });
 
 test('analyze-atif exchanges the raw key for a scoped JWT and retries exactly once on 401', async () => {
@@ -856,6 +1251,181 @@ test('discovery: a Harbor job-output directory is walked recursively, skipping d
     assert.ok(s.logs.some((l) => /Analyzing 1 trajectory locally/.test(l)));
     assert.ok(s.logs.some((l) => /trial-1[/\\]agent[/\\]trajectory\.json/.test(l)));
   } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: Harbor root metadata JSON cannot mask nested trajectories', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-harbor-root-'));
+  try {
+    const raw = readFileSync(REAL_TRAJECTORY, 'utf8');
+    for (const filename of ['config.json', 'lock.json', 'result.json']) {
+      writeFileSync(join(dir, filename), JSON.stringify({ kind: 'harbor-metadata' }));
+    }
+    mkdirSync(join(dir, 'trials', 'trial-1', 'agent'), { recursive: true });
+    writeFileSync(join(dir, 'trials', 'trial-1', 'agent', 'trajectory.json'), raw);
+
+    const s = spy();
+    try {
+      await withNoNetwork(() => analyzeAtif({ path: dir, local: true }));
+      assert.equal(s.exitCode, null);
+    } finally {
+      s.restore();
+    }
+    const output = s.logs.join('\n');
+    assert.match(output, /Analyzing 1 trajectory locally/);
+    assert.match(output, /trials[/\\]trial-1[/\\]agent[/\\]trajectory\.json/);
+    assert.doesNotMatch(output, /config\.json|lock\.json|result\.json/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: unsafe, missing, cyclic, and invalid continuation refs fail before network', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-continuation-safety-'));
+  try {
+    const missing = join(dir, 'missing');
+    mkdirSync(missing);
+    writeFileSync(
+      join(missing, 'trajectory.json'),
+      JSON.stringify(minimalTrajectory({ continued_trajectory_ref: 'missing.json' })),
+    );
+    await expectDiscoveryFailureWithoutNetwork(
+      join(missing, 'trajectory.json'),
+      /Missing ATIF continued_trajectory_ref/,
+    );
+
+    const absolute = join(dir, 'absolute');
+    mkdirSync(absolute);
+    const absoluteContinuation = join(absolute, 'continuation.json');
+    writeFileSync(absoluteContinuation, JSON.stringify(minimalTrajectory()));
+    writeFileSync(
+      join(absolute, 'trajectory.json'),
+      JSON.stringify(minimalTrajectory({ continued_trajectory_ref: absoluteContinuation })),
+    );
+    await expectDiscoveryFailureWithoutNetwork(
+      join(absolute, 'trajectory.json'),
+      /continued_trajectory_ref must be relative/,
+    );
+
+    const escape = join(dir, 'escape');
+    mkdirSync(escape);
+    writeFileSync(join(dir, 'outside.json'), JSON.stringify(minimalTrajectory()));
+    writeFileSync(
+      join(escape, 'trajectory.json'),
+      JSON.stringify(minimalTrajectory({ continued_trajectory_ref: '../outside.json' })),
+    );
+    await expectDiscoveryFailureWithoutNetwork(
+      join(escape, 'trajectory.json'),
+      /continued_trajectory_ref escapes agent directory/,
+    );
+
+    const cycle = join(dir, 'cycle');
+    mkdirSync(cycle);
+    writeFileSync(
+      join(cycle, 'trajectory.json'),
+      JSON.stringify(minimalTrajectory({ continued_trajectory_ref: 'continuation.json' })),
+    );
+    writeFileSync(
+      join(cycle, 'continuation.json'),
+      JSON.stringify(minimalTrajectory({ continued_trajectory_ref: 'trajectory.json' })),
+    );
+    await expectDiscoveryFailureWithoutNetwork(
+      join(cycle, 'trajectory.json'),
+      /continued_trajectory_ref cycle detected/,
+    );
+
+    const invalid = join(dir, 'invalid');
+    mkdirSync(invalid);
+    writeFileSync(
+      join(invalid, 'trajectory.json'),
+      JSON.stringify(minimalTrajectory({ continued_trajectory_ref: '  ' })),
+    );
+    await expectDiscoveryFailureWithoutNetwork(
+      join(invalid, 'trajectory.json'),
+      /continued_trajectory_ref must be a non-empty string/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: continuation chains are bounded before authentication', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-continuation-bound-'));
+  try {
+    for (let index = 0; index <= 128; index += 1) {
+      writeFileSync(
+        join(dir, `segment-${index}.json`),
+        JSON.stringify(
+          minimalTrajectory(
+            index < 128 ? { continued_trajectory_ref: `segment-${index + 1}.json` } : {},
+          ),
+        ),
+      );
+    }
+    await expectDiscoveryFailureWithoutNetwork(
+      join(dir, 'segment-0.json'),
+      /continuation chain exceeds 128 segments/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: selected agent and flat-file symlinks cannot escape before network', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-symlink-boundary-'));
+  try {
+    const outsideAgent = join(dir, 'outside-agent');
+    mkdirSync(outsideAgent);
+    writeFileSync(join(outsideAgent, 'trajectory.json'), JSON.stringify(minimalTrajectory()));
+
+    const selectedAgentLink = join(dir, 'selected-agent-link');
+    mkdirSync(selectedAgentLink);
+    symlinkSync(outsideAgent, join(selectedAgentLink, 'agent'), 'dir');
+    await expectDiscoveryFailureWithoutNetwork(selectedAgentLink, /escapes the selected directory/);
+
+    const selectedFlatLink = join(dir, 'selected-flat-link');
+    mkdirSync(selectedFlatLink);
+    symlinkSync(join(outsideAgent, 'trajectory.json'), join(selectedFlatLink, 'leak.json'), 'file');
+    await expectDiscoveryFailureWithoutNetwork(
+      selectedFlatLink,
+      /trajectory root escapes the selected directory/,
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: broken agent links and over-depth trees fail instead of looking complete', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-discovery-completeness-'));
+  try {
+    const broken = join(dir, 'broken');
+    mkdirSync(broken);
+    symlinkSync(join(dir, 'does-not-exist'), join(broken, 'agent'), 'dir');
+    await expectDiscoveryFailureWithoutNetwork(broken, /Could not resolve ATIF symlink/);
+
+    const tooDeep = join(dir, 'too-deep');
+    mkdirSync(tooDeep);
+    let nested = tooDeep;
+    for (let index = 0; index < 8; index += 1) {
+      nested = join(nested, `level-${index}`);
+      mkdirSync(nested);
+    }
+    await expectDiscoveryFailureWithoutNetwork(tooDeep, /discovery exceeds maximum depth 6/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test('discovery: an unreadable subtree fails before authentication', async () => {
+  const dir = mkdtempSync(join(tmpdir(), 'pisama-analyze-atif-unreadable-'));
+  const unreadable = join(dir, 'unreadable');
+  try {
+    mkdirSync(unreadable);
+    chmodSync(unreadable, 0o000);
+    await expectDiscoveryFailureWithoutNetwork(dir, /Could not read ATIF directory/);
+  } finally {
+    chmodSync(unreadable, 0o700);
     rmSync(dir, { recursive: true, force: true });
   }
 });

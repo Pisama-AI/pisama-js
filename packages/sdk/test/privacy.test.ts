@@ -37,6 +37,10 @@ test('client id persists with owner-only permissions and survives cache reset', 
 });
 
 test('standard redaction removes supported secret and identity patterns', () => {
+  const pisamaKey = ['pisama', '_', 'z'.repeat(43)].join('');
+  const pisamaKeyEndingInDash = ['pisama', '_', 'z'.repeat(42), '-'].join('');
+  const githubServerToken = ['ghs', '_', 'e'.repeat(36)].join('');
+  const githubOauthToken = ['gho', '_', 'f'.repeat(36)].join('');
   const value = [
     'person@example.com',
     '+1 415-555-0100',
@@ -46,9 +50,13 @@ test('standard redaction removes supported secret and identity patterns', () => 
     `sk-${'a'.repeat(24)}`,
     `sk-proj-${'p'.repeat(32)}_suffix`,
     `sk-ant-${'b'.repeat(24)}`,
+    pisamaKey,
+    pisamaKeyEndingInDash,
     'AKIA1234567890ABCDEF',
     `ghp_${'c'.repeat(36)}`,
     `github_pat_${'d'.repeat(32)}_token`,
+    githubServerToken,
+    githubOauthToken,
     'xoxb-1234567890-token',
   ].join(' ');
 
@@ -62,11 +70,15 @@ test('standard redaction removes supported secret and identity patterns', () => 
     '[jwt]',
     '[openai-key]',
     '[anthropic-key]',
+    '[pisama-key]',
     '[aws-key]',
-    '[github-pat]',
+    '[github-token]',
     '[slack-token]',
   ]) {
     assert.match(redacted, new RegExp(`\\${replacement}`));
+  }
+  for (const secret of [pisamaKey, pisamaKeyEndingInDash, githubServerToken, githubOauthToken]) {
+    assert.ok(!redacted.includes(secret));
   }
   assert.doesNotMatch(redacted, /sk-proj-|github_pat_/);
 });

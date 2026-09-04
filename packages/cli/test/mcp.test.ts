@@ -163,6 +163,7 @@ function platformDetection(
     state_id: null,
     detection_type: 'loop',
     confidence: 80,
+    confidence_tier: 'HIGH',
     method: 'heuristic',
     details: {},
     validated: false,
@@ -372,7 +373,7 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
           ],
           total: 1,
           page: 1,
-          per_page: 5,
+          per_page: 100,
         });
         return;
       }
@@ -413,14 +414,26 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
         content: { text: string }[];
         structuredContent?: {
           tenantId?: string;
-          events?: Array<{ event?: { traceId?: string }; hits?: Array<{ detector?: string }> }>;
+          events?: Array<{
+            event?: { traceId?: string };
+            hits?: Array<{
+              detector?: string;
+              confidence?: number;
+              confidenceTier?: string;
+              severity?: number;
+            }>;
+          }>;
         };
       };
       assert.equal(result.isError, false);
       assert.equal(result.structuredContent?.tenantId, 'tenant-mcp-1');
       assert.equal(result.structuredContent?.events?.[0]?.event?.traceId, traceId);
       assert.equal(result.structuredContent?.events?.[0]?.hits?.[0]?.detector, 'loop');
-      assert.match(result.content[0].text, /loop\/8/);
+      assert.equal(result.structuredContent?.events?.[0]?.hits?.[0]?.confidence, 80);
+      assert.equal(result.structuredContent?.events?.[0]?.hits?.[0]?.confidenceTier, 'HIGH');
+      assert.equal(result.structuredContent?.events?.[0]?.hits?.[0]?.severity, undefined);
+      assert.match(result.content[0].text, /loop\/80% HIGH/);
+      assert.doesNotMatch(result.content[0].text, /severity/);
     },
   );
 
@@ -680,8 +693,7 @@ test('mcp: recent failures scan later trace pages and omit hidden-only detection
   assert.deepEqual(tracePages, [1, 2]);
 });
 
-test('mcp: a full trace page without total continues until a short page', async () => {
-  const visibleTraceId = 'visible-after-unknown-total';
+test('mcp: a trace page without the contracted total fails closed', async () => {
   const tracePages: number[] = [];
   await withHttpServer(
     async (request, response) => {
@@ -709,34 +721,6 @@ test('mcp: a full trace page without total continues until a short page', async 
           });
           return;
         }
-        respond(response, 200, {
-          traces: [
-            platformTrace({
-              id: visibleTraceId,
-              status: 'failed',
-              detection_status: 'complete',
-              created_at: '2026-09-04T11:00:00Z',
-              detection_count: 1,
-            }),
-          ],
-          page: 2,
-          per_page: 100,
-        });
-        return;
-      }
-      if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
-        respond(response, 200, {
-          items: [
-            platformDetection(visibleTraceId, {
-              detection_type: 'coordination',
-              confidence: 90,
-              explanation: 'Visible later-page failure.',
-            }),
-          ],
-          page: 1,
-          per_page: 100,
-        });
-        return;
       }
       respond(response, 404, { detail: 'not found' });
     },
@@ -752,82 +736,172 @@ test('mcp: a full trace page without total continues until a short page', async 
       );
       const result = response.result as {
         isError?: boolean;
-        structuredContent?: {
-          scannedTraceCount?: number;
-          totalTraceCount?: number;
-          scanComplete?: boolean;
-          events?: Array<{ event?: { traceId?: string } }>;
-        };
+        content?: Array<{ text?: string }>;
+        structuredContent?: { error?: { code?: string } };
       };
-      assert.equal(result.isError, false, JSON.stringify(response));
-      assert.equal(result.structuredContent?.scannedTraceCount, 101);
-      assert.equal(result.structuredContent?.totalTraceCount, 101);
-      assert.equal(result.structuredContent?.scanComplete, true);
-      assert.equal(result.structuredContent?.events?.[0]?.event?.traceId, visibleTraceId);
+      assert.equal(result.isError, true, JSON.stringify(response));
+      assert.equal(result.structuredContent?.error?.code, 'upstream_error');
+      assert.match(result.content?.[0]?.text ?? '', /invalid response/i);
     },
   );
-  assert.deepEqual(tracePages, [1, 2]);
+  assert.deepEqual(tracePages, [1]);
+});
+
+test('mcp: repeated and cross-page inconsistent trace pagination fail closed', async () => {
+  for (const mode of ['repeated-page', 'changed-total'] as const) {
+    await withHttpServer(
+      (request, response) => {
+        const url = new URL(request.url ?? '/', 'http://test');
+        if (url.pathname === '/api/v1/auth/token') {
+          respond(response, 200, { access_token: jwt('read', 1) });
+          return;
+        }
+        if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
+          const requestedPage = Number(url.searchParams.get('page'));
+          if (requestedPage === 1) {
+            respond(response, 200, {
+              traces: Array.from({ length: 100 }, (_, index) =>
+                platformTrace({ id: `${mode}-page-1-${index}` }),
+              ),
+              total: 101,
+              page: 1,
+              per_page: 100,
+            });
+            return;
+          }
+          respond(response, 200, {
+            traces: Array.from({ length: mode === 'changed-total' ? 2 : 1 }, (_, index) =>
+              platformTrace({ id: `${mode}-page-2-${index}` }),
+            ),
+            total: mode === 'changed-total' ? 102 : 101,
+            page: mode === 'repeated-page' ? 1 : 2,
+            per_page: 100,
+          });
+          return;
+        }
+        respond(response, 404, { detail: 'not found' });
+      },
+      async (baseUrl) => {
+        const response = await rpcCall(
+          {
+            id: mode === 'repeated-page' ? 28 : 29,
+            method: 'tools/call',
+            params: { name: 'get_recent_failures', arguments: { limit: 1 } },
+          },
+          6000,
+          { apiKey: 'pisama_key', baseUrl },
+        );
+        const result = response.result as {
+          isError?: boolean;
+          content?: Array<{ text?: string }>;
+          structuredContent?: { error?: { code?: string } };
+        };
+        assert.equal(result.isError, true, `${mode}: ${JSON.stringify(response)}`);
+        assert.equal(result.structuredContent?.error?.code, 'upstream_error');
+        assert.match(result.content?.[0]?.text ?? '', /invalid response/i);
+      },
+    );
+  }
 });
 
 test('mcp: malformed trace and detection pages fail closed', async () => {
+  const traceWithDetection = (id: string): Record<string, unknown> => ({
+    traces: [
+      platformTrace({
+        id,
+        status: 'failed',
+        detection_status: 'complete',
+        created_at: '2026-09-04T12:00:00Z',
+        detection_count: 1,
+      }),
+    ],
+    total: 1,
+    page: 1,
+    per_page: 100,
+  });
   const cases: Array<{ name: string; tracePage: unknown; detectionPage?: unknown }> = [
     {
       name: 'non-array traces',
-      tracePage: { traces: null, total: 1 },
+      tracePage: { traces: null, total: 1, page: 1, per_page: 100 },
     },
     {
       name: 'invalid trace total',
-      tracePage: { traces: [], total: '1' },
+      tracePage: { traces: [], total: '1', page: 1, per_page: 100 },
+    },
+    {
+      name: 'missing trace page echo',
+      tracePage: { traces: [], total: 0, per_page: 100 },
+    },
+    {
+      name: 'mismatched trace page echo',
+      tracePage: { traces: [], total: 0, page: 2, per_page: 100 },
+    },
+    {
+      name: 'mismatched trace per-page echo',
+      tracePage: { traces: [], total: 0, page: 1, per_page: 99 },
+    },
+    {
+      name: 'trace total smaller than observed items',
+      tracePage: {
+        traces: [platformTrace({ id: 'extra-trace' })],
+        total: 0,
+        page: 1,
+        per_page: 100,
+      },
     },
     {
       name: 'sparse trace row',
-      tracePage: { traces: [{ id: 'sparse-trace' }], total: 1 },
+      tracePage: { traces: [{ id: 'sparse-trace' }], total: 1, page: 1, per_page: 100 },
     },
     {
       name: 'non-array detections',
-      tracePage: {
-        traces: [
-          platformTrace({
-            id: 'malformed-detection-page',
-            status: 'failed',
-            detection_status: 'complete',
-            created_at: '2026-09-04T12:00:00Z',
-            detection_count: 1,
-          }),
-        ],
-        total: 1,
-      },
-      detectionPage: { items: null, total: 1 },
+      tracePage: traceWithDetection('malformed-detection-page'),
+      detectionPage: { items: null, total: 1, page: 1, per_page: 100 },
     },
     {
       name: 'invalid detection total',
-      tracePage: {
-        traces: [
-          platformTrace({
-            id: 'invalid-detection-total',
-            status: 'failed',
-            detection_status: 'complete',
-            created_at: '2026-09-04T12:00:00Z',
-            detection_count: 1,
-          }),
-        ],
-        total: 1,
-      },
-      detectionPage: { items: [], total: -1 },
+      tracePage: traceWithDetection('invalid-detection-total'),
+      detectionPage: { items: [], total: -1, page: 1, per_page: 100 },
+    },
+    {
+      name: 'missing detection page echo',
+      tracePage: traceWithDetection('missing-detection-page'),
+      detectionPage: { items: [], total: 0, per_page: 100 },
+    },
+    {
+      name: 'mismatched detection page echo',
+      tracePage: traceWithDetection('mismatched-detection-page'),
+      detectionPage: { items: [], total: 0, page: 2, per_page: 100 },
+    },
+    {
+      name: 'mismatched detection per-page echo',
+      tracePage: traceWithDetection('mismatched-detection-per-page'),
+      detectionPage: { items: [], total: 0, page: 1, per_page: 99 },
     },
     {
       name: 'sparse detection row',
-      tracePage: {
-        traces: [
-          platformTrace({
-            id: 'sparse-detection-row',
-            status: 'failed',
-            detection_count: 1,
+      tracePage: traceWithDetection('sparse-detection-row'),
+      detectionPage: {
+        items: [{ detection_type: 'loop' }],
+        total: 1,
+        page: 1,
+        per_page: 100,
+      },
+    },
+    {
+      name: 'contradictory detection confidence tier',
+      tracePage: traceWithDetection('contradictory-confidence-tier'),
+      detectionPage: {
+        items: [
+          platformDetection('contradictory-confidence-tier', {
+            confidence: 80,
+            confidence_tier: 'LOW',
           }),
         ],
         total: 1,
+        page: 1,
+        per_page: 100,
       },
-      detectionPage: { items: [{ detection_type: 'loop' }], total: 1 },
     },
   ];
 
@@ -1072,6 +1146,76 @@ test('mcp: exact trace paginates visible detections and marks the response cap',
   );
 
   assert.deepEqual(detectionPages, [1, 2, 3, 4, 5]);
+});
+
+test('mcp: repeated and cross-page inconsistent detection pagination fail closed', async () => {
+  const traceId = '66666666-6666-4666-8666-666666666666';
+  for (const mode of ['repeated-page', 'changed-total'] as const) {
+    await withHttpServer(
+      (request, response) => {
+        const url = new URL(request.url ?? '/', 'http://test');
+        if (url.pathname === '/api/v1/auth/token') {
+          respond(response, 200, { access_token: jwt('read', 1) });
+          return;
+        }
+        if (url.pathname.endsWith(`/traces/${traceId}`)) {
+          respond(
+            response,
+            200,
+            platformTrace({ id: traceId, detection_count: 102, state_count: 0 }),
+          );
+          return;
+        }
+        if (url.pathname.endsWith(`/traces/${traceId}/states`)) {
+          respond(response, 200, []);
+          return;
+        }
+        if (url.pathname.endsWith('/detections')) {
+          const requestedPage = Number(url.searchParams.get('page'));
+          if (requestedPage === 1) {
+            respond(response, 200, {
+              items: Array.from({ length: 100 }, (_, index) =>
+                platformDetection(traceId, { id: `${mode}-page-1-${index}` }),
+              ),
+              total: 101,
+              page: 1,
+              per_page: 100,
+            });
+            return;
+          }
+          respond(response, 200, {
+            items: Array.from({ length: mode === 'changed-total' ? 2 : 1 }, (_, index) =>
+              platformDetection(traceId, { id: `${mode}-page-2-${index}` }),
+            ),
+            total: mode === 'changed-total' ? 102 : 101,
+            page: mode === 'repeated-page' ? 1 : 2,
+            per_page: 100,
+          });
+          return;
+        }
+        respond(response, 404, { detail: 'not found' });
+      },
+      async (baseUrl) => {
+        const response = await rpcCall(
+          {
+            id: mode === 'repeated-page' ? 30 : 31,
+            method: 'tools/call',
+            params: { name: 'get_trace', arguments: { traceId } },
+          },
+          8000,
+          { apiKey: 'pisama_key', baseUrl },
+        );
+        const result = response.result as {
+          isError?: boolean;
+          content?: Array<{ text?: string }>;
+          structuredContent?: { error?: { code?: string } };
+        };
+        assert.equal(result.isError, true, `${mode}: ${JSON.stringify(response)}`);
+        assert.equal(result.structuredContent?.error?.code, 'upstream_error');
+        assert.match(result.content?.[0]?.text ?? '', /invalid response/i);
+      },
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------

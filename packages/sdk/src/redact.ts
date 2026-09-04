@@ -7,9 +7,10 @@ const STANDARD_PATTERNS: Array<[RegExp, string]> = [
   // whole value is replaced instead of leaving a visible suffix.
   [/sk-proj-[A-Za-z0-9_-]{20,}/g, '[openai-key]'],
   [/sk-[A-Za-z0-9_-]{20,}/g, '[openai-key]'],
+  [/\bpisama_[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])/g, '[pisama-key]'],
   [/AKIA[0-9A-Z]{16}/g, '[aws-key]'],
-  [/github_pat_[A-Za-z0-9_]{20,}/g, '[github-pat]'],
-  [/ghp_[A-Za-z0-9]{36}/g, '[github-pat]'],
+  [/github_pat_[A-Za-z0-9_]{20,}/g, '[github-token]'],
+  [/gh[pousr]_[A-Za-z0-9]{20,}/g, '[github-token]'],
   [/xox[bpars]-[A-Za-z0-9-]{10,}/g, '[slack-token]'],
   [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[email]'],
   [/\b(?:\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}\b/g, '[phone]'],

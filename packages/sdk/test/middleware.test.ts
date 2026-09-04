@@ -299,8 +299,11 @@ test('error telemetry applies each configured privacy mode before OTLP serializa
   const email = 'private.person@example.com';
   const openAiKey = `sk-proj-${'x'.repeat(32)}_suffix`;
   const githubKey = `github_pat_${'y'.repeat(32)}_suffix`;
-  const originalMessage = `failure for ${email} using ${openAiKey}`;
-  const originalName = `ProviderError-${githubKey}`;
+  const pisamaKey = ['pisama', '_', 'z'.repeat(43)].join('');
+  const githubServerToken = ['ghs', '_', 's'.repeat(36)].join('');
+  const githubOauthToken = ['gho', '_', 'o'.repeat(36)].join('');
+  const originalMessage = `failure for ${email} using ${openAiKey} ${pisamaKey} ${githubServerToken}`;
+  const originalName = `ProviderError-${githubKey}-${githubOauthToken}`;
 
   for (const mode of ['standard', 'metadata-only', 'off'] as const) {
     const bodies: unknown[] = [];
@@ -341,19 +344,68 @@ test('error telemetry applies each configured privacy mode before OTLP serializa
       assert.match(serialized, /private\.person@example\.com/);
       assert.ok(serialized.includes(openAiKey));
       assert.ok(serialized.includes(githubKey));
+      assert.ok(serialized.includes(pisamaKey));
+      assert.ok(serialized.includes(githubServerToken));
+      assert.ok(serialized.includes(githubOauthToken));
     } else {
       assert.doesNotMatch(serialized, /private\.person@example\.com/);
       assert.ok(!serialized.includes(openAiKey));
       assert.ok(!serialized.includes(githubKey));
+      assert.ok(!serialized.includes(pisamaKey));
+      assert.ok(!serialized.includes(githubServerToken));
+      assert.ok(!serialized.includes(githubOauthToken));
       if (mode === 'standard') {
         assert.match(serialized, /\[email\]/);
         assert.match(serialized, /\[openai-key\]/);
-        assert.match(serialized, /\[github-pat\]/);
+        assert.match(serialized, /\[pisama-key\]/);
+        assert.match(serialized, /\[github-token\]/);
       } else {
         assert.match(serialized, /\[redacted\]/);
       }
     }
   }
+});
+
+test('stream setup errors redact first-party and GitHub token shapes before OTLP serialization', async () => {
+  const pisamaKey = ['pisama', '_', 'q'.repeat(43)].join('');
+  const githubServerToken = ['ghs', '_', 'r'.repeat(36)].join('');
+  const githubOauthToken = ['gho', '_', 't'.repeat(36)].join('');
+  const bodies: unknown[] = [];
+  const exporter = new TraceExporter({
+    apiKey: 'pisama_stream_privacy_test_key',
+    projectId: 'ws_stream_privacy',
+    endpoint: 'https://api.test/api/v1/traces/ingest',
+    maxBatchSize: 32,
+    fetchImpl: (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      if (String(input).endsWith('/api/v1/auth/token')) return tokenResponse();
+      bodies.push(JSON.parse(String(init.body)));
+      return Response.json({ accepted: 1 }, { status: 202 });
+    }) as typeof fetch,
+  });
+  const middleware = pisamaMiddleware({ exporter, redact: 'standard', eager: true });
+  const providerError = new Error(
+    `stream refused ${pisamaKey} ${githubServerToken} ${githubOauthToken}`,
+  );
+
+  await assert.rejects(
+    () =>
+      middleware.wrapStream!({
+        doStream: async () => {
+          throw providerError;
+        },
+        params: { prompt: `do not expose ${pisamaKey}` },
+        model: { modelId: 'privacy-stream-model' },
+      } as never),
+    (error: unknown) => error === providerError,
+  );
+
+  assert.equal(bodies.length, 1);
+  const serialized = JSON.stringify(bodies[0]);
+  for (const secret of [pisamaKey, githubServerToken, githubOauthToken]) {
+    assert.ok(!serialized.includes(secret));
+  }
+  assert.match(serialized, /\[pisama-key\]/);
+  assert.match(serialized, /\[github-token\]/);
 });
 
 test('error telemetry preserves a hostile thrown value without invoking unsafe fields', async () => {

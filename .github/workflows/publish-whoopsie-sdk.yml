@@ -32,11 +32,12 @@ concurrency:
 jobs:
   prepare:
     name: Build and verify one immutable artifact
+    if: ${{ github.ref == format('refs/tags/{0}', inputs.git_tag) }}
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ inputs.git_tag }}
+          ref: ${{ github.sha }}
           fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/prepare-npm-stage
@@ -48,10 +49,13 @@ jobs:
           expected-sha256: ${{ inputs.expected_sha256 }}
           git-tag: ${{ inputs.git_tag }}
           tag-prefix: whoopsie-sdk-v
+          event-ref: ${{ github.ref }}
+          event-sha: ${{ github.sha }}
           artifact-name: npm-stage-whoopsie-sdk-${{ github.run_id }}
 
   stage:
     name: OIDC stage only (human 2FA approval remains separate)
+    if: ${{ github.ref == format('refs/tags/{0}', inputs.git_tag) }}
     needs: prepare
     runs-on: ubuntu-latest
     environment: npm-staging
@@ -61,7 +65,8 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
-          ref: refs/tags/${{ inputs.git_tag }}
+          ref: ${{ github.sha }}
+          fetch-depth: 0
           persist-credentials: false
       - uses: ./.github/actions/stage-npm-package
         with:
@@ -69,5 +74,9 @@ jobs:
           package-dir: packages/whoopsie-sdk
           version: ${{ inputs.version }}
           expected-sha256: ${{ inputs.expected_sha256 }}
+          git-tag: ${{ inputs.git_tag }}
+          tag-prefix: whoopsie-sdk-v
+          event-ref: ${{ github.ref }}
+          event-sha: ${{ github.sha }}
           dist-tag: ${{ inputs.dist_tag }}
           artifact-name: npm-stage-whoopsie-sdk-${{ github.run_id }}

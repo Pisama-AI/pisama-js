@@ -35,10 +35,15 @@ test('retired CLI always fails closed with no network attempt', () => {
 test('retirement package has no dependencies, install lifecycle, or legacy transport', () => {
   const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8')) as {
     version?: string;
+    bin?: Record<string, string>;
     dependencies?: unknown;
     scripts?: Record<string, string>;
   };
   assert.equal(manifest.version, '0.9.0');
+  assert.deepEqual(manifest.bin, {
+    'pisama-ts': './dist/bin.js',
+    whoopsie: './dist/bin.js',
+  });
   assert.equal(manifest.dependencies, undefined);
   for (const lifecycle of ['preinstall', 'install', 'postinstall']) {
     assert.equal(manifest.scripts?.[lifecycle], undefined);

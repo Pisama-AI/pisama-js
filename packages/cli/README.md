@@ -82,7 +82,8 @@ Flags:
 - `--cwd <path>`: project root for reading `.env.local` (default: cwd)
 - `--api-key <key>`: override `PISAMA_API_KEY` (prefer the environment to avoid shell history)
 - `--base-url <url>`: point at a self-hosted Pisama API (default `https://api.pisama.ai`)
-- `--timeout-ms <ms>`: how long to wait for the trace to surface (default 15000)
+- `--timeout-ms <ms>`: positive finite total deadline for authentication, ingest,
+  and trace readback (default 15000)
 
 Exit code is 0 on success, 1 on any failure (missing/rejected key, insufficient
 scope, ingest 5xx, network error, or trace not landing within the timeout).
@@ -198,10 +199,13 @@ pass credentials through shared shell history. For `analyze-atif --apply`,
 prefer a least-privilege credentials file and remove it when the operation is
 complete.
 
-Official releases are built from a commit on `main`, tested on Node.js 20 and
-24, installed from the exact packed tarball, checked for vulnerable production
-dependencies, and published through npm trusted publishing. npm records
-provenance for successful releases. Inspect it with:
+Official releases are built from an immutable tag whose commit is on `main`,
+tested on Node.js 20 and 24, installed from the exact digest-bound tarball, and
+checked for vulnerable production dependencies. The package-specific workflow
+can only stage through npm trusted publishing; a human separately inspects and
+approves that stage with 2FA. Registry/account readback and token-revocation
+gates are mandatory before staging; see the repository `RELEASING.md`. Inspect
+the resulting public provenance with:
 
 ```bash
 npm view @pisama/cli@latest dist.integrity dist.attestations

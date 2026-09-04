@@ -23,8 +23,11 @@ The packages run locally and do not require a Pisama account for local
 detection. Hosted ingestion, dashboards, managed calibration, and paid
 automation are separate Pisama services and are outside this repository.
 
-Each package has its own README and version. Release workflows verify the tag,
-build, type-check, and test the selected package before npm trusted publishing.
+Each package has its own README and version. Package-specific workflows verify
+one immutable tag, build, type-check, test, and digest-bind one tarball before
+trusted **staging**. Direct publication is disabled. The mandatory npm-owner
+readback, token-revocation, staging, and human 2FA gates are in
+[`RELEASING.md`](./RELEASING.md).
 
 ## License
 

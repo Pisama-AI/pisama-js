@@ -23,6 +23,12 @@ inputs:
   tag-prefix:
     required: true
     description: Package-specific tag prefix.
+  event-ref:
+    required: true
+    description: Immutable tag ref that triggered workflow_dispatch.
+  event-sha:
+    required: true
+    description: Commit SHA bound to the triggering workflow run.
   artifact-name:
     required: true
     description: Unique Actions artifact name shared with the staging job.
@@ -43,11 +49,16 @@ runs:
         RELEASE_VERSION: ${{ inputs.version }}
         RELEASE_TAG: ${{ inputs.git-tag }}
         TAG_PREFIX: ${{ inputs.tag-prefix }}
+        EVENT_REF: ${{ inputs.event-ref }}
+        EVENT_SHA: ${{ inputs.event-sha }}
       run: |
         set -euo pipefail
         test "$RELEASE_TAG" = "$TAG_PREFIX$RELEASE_VERSION"
-        test "$(git tag --points-at HEAD --list "$RELEASE_TAG")" = "$RELEASE_TAG"
-        git merge-base --is-ancestor HEAD origin/main
+        test "$EVENT_REF" = "refs/tags/$RELEASE_TAG"
+        test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+        test "$(git rev-parse "$RELEASE_TAG^{}")" = "$EVENT_SHA"
+        test "$(git tag --points-at "$EVENT_SHA" --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+        git merge-base --is-ancestor "$EVENT_SHA" origin/main
         node - "$PACKAGE_DIR/package.json" "$PACKAGE_NAME" "$RELEASE_VERSION" "$PACKAGE_DIR" <<'NODE'
         const { readFileSync } = require('node:fs');
         const [manifestPath, expectedName, expectedVersion, expectedDirectory] = process.argv.slice(2);

@@ -4,6 +4,7 @@
   "description": "Retired CLI tombstone. Migrate to @pisama/cli.",
   "type": "module",
   "bin": {
+    "pisama-ts": "./dist/bin.js",
     "whoopsie": "./dist/bin.js"
   },
   "files": [

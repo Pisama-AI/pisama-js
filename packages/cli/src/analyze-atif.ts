@@ -20,10 +20,11 @@
 //     (see packages/detectors/README.md), not a replacement for the backend's
 //     calibrated suite.
 // Both modes render a per-trajectory summary and exit non-zero when any
-// critical- or high-severity detection fires so the command is CI-friendly.
+// critical/high-severity detection fires, detector coverage is incomplete, or
+// a requested fix is absent/failed/rolled back so the command is CI-friendly.
 
-import { readFile, readdir, stat } from 'node:fs/promises';
-import { join, resolve, basename, relative } from 'node:path';
+import { readFile, readdir, realpath, stat } from 'node:fs/promises';
+import { join, resolve, basename, dirname, isAbsolute, relative, sep, win32 } from 'node:path';
 import kleur from 'kleur';
 import { nanoid } from 'nanoid';
 import { runDetectors, v1Detectors, type AgentTrace, type ToolEvent } from '@pisama/detectors';
@@ -45,6 +46,8 @@ export interface AnalyzeAtifOptions {
 }
 
 const DEFAULT_BASE = 'https://api.pisama.ai';
+const MAX_CONTINUATION_SEGMENTS = 128;
+const MAX_TRAJECTORY_FILES = 1_000;
 
 // Match the schema_version values supported by Pisama's vendored ATIF
 // Pydantic models (backend/app/ingestion/atif_models.py). Keep these in
@@ -60,12 +63,14 @@ const SUPPORTED_SCHEMA_VERSIONS = new Set([
   'ATIF-v1.7',
 ]);
 
+type DetectionStatus = 'complete' | 'partial' | 'failed';
+
 interface AnalyzeResponse {
   diagnosis: {
     trace_id: string;
     has_failures: boolean;
     failure_count: number;
-    detection_status: string;
+    detection_status: DetectionStatus;
     all_detections: Array<{
       // Backend's DetectionResult uses `category` (the DetectionCategory
       // enum value), not `detector` — keep both shapes accepted in case
@@ -88,8 +93,12 @@ interface AnalyzeResponse {
     atif_schema_version: string;
     atif_session_id: string | null;
     atif_trajectory_id: string | null;
+    topology_complete: boolean;
+    unresolved_trajectory_refs: string[];
+    client_resolved_trajectory_refs: string[];
+    reconciled_topology_complete: boolean;
   };
-  healing?: {
+  healing: {
     success: boolean;
     healing_id?: string;
     fix_type?: string;
@@ -150,6 +159,7 @@ interface AtifTrajectory {
   schema_version?: string;
   session_id?: string;
   trajectory_id?: string;
+  continued_trajectory_ref?: string;
   agent?: { model_name?: string };
   steps?: AtifStep[];
   final_metrics?: {
@@ -160,12 +170,17 @@ interface AtifTrajectory {
 }
 
 function parseTrajectory(file: string, raw: string): AtifTrajectory {
-  let trajectory: AtifTrajectory;
+  let parsed: unknown;
   try {
-    trajectory = JSON.parse(raw);
+    parsed = JSON.parse(raw) as unknown;
   } catch (error) {
     fail(`${basename(file)}: not valid JSON (${(error as Error).message})`);
   }
+
+  if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+    fail(`${basename(file)}: trajectory JSON root must be an object`);
+  }
+  const trajectory = parsed as AtifTrajectory;
 
   const version = trajectory.schema_version;
   if (!version || !SUPPORTED_SCHEMA_VERSIONS.has(version)) {
@@ -291,7 +306,7 @@ function buildLocalResponse(
       trace_id: trace.traceId,
       has_failures: results.length > 0,
       failure_count: results.length,
-      detection_status: 'completed',
+      detection_status: 'complete',
       all_detections: localDetectionsToApiShape(results),
       detectors_run: v1Detectors.map((d) => d.name),
       detectors_failed: {},
@@ -306,6 +321,10 @@ function buildLocalResponse(
       atif_schema_version: trajectory.schema_version ?? 'unknown',
       atif_session_id: trajectory.session_id ?? null,
       atif_trajectory_id: trajectory.trajectory_id ?? null,
+      topology_complete: true,
+      unresolved_trajectory_refs: [],
+      client_resolved_trajectory_refs: [],
+      reconciled_topology_complete: true,
     },
     healing: null,
   };
@@ -315,6 +334,343 @@ function analyzeTrajectoryLocally(file: string, trajectory: AtifTrajectory): Ana
   const trace = atifTrajectoryToAgentTrace(trajectory, basename(file));
   const results = runDetectors(trace);
   return buildLocalResponse(trajectory, trace, results);
+}
+
+function finishAnalysis(
+  fileCount: number,
+  totalFailures: number,
+  incompleteAnalysisFound: boolean,
+  blockingSeverityFound: boolean,
+  applyFailureFound: boolean,
+): void {
+  console.log();
+  console.log(
+    kleur.bold(`Summary: ${fileCount} trajectorie(s), ${totalFailures} total detection(s)`),
+  );
+  if (incompleteAnalysisFound) {
+    console.log(
+      kleur.red(
+        '✗ At least one analysis had incomplete detector or topology evidence. Exiting with code 1.',
+      ),
+    );
+    process.exit(1);
+  }
+  if (blockingSeverityFound) {
+    console.log(
+      kleur.red('✗ At least one critical/high-severity detection fired. Exiting with code 1.'),
+    );
+    process.exit(1);
+  }
+  if (applyFailureFound) {
+    console.log(
+      kleur.red('✗ A requested fix was missing, failed, or rolled back. Exiting with code 1.'),
+    );
+    process.exit(1);
+  }
+  console.log(kleur.green('✓ No critical/high-severity failures.'));
+}
+
+class AnalyzeResponseValidationError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'AnalyzeResponseValidationError';
+  }
+}
+
+function invalidAnalyzeResponse(message: string): never {
+  throw new AnalyzeResponseValidationError(message);
+}
+
+function responseRecord(value: unknown, label: string): Record<string, unknown> {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invalidAnalyzeResponse(`${label} must be an object`);
+  }
+  return value as Record<string, unknown>;
+}
+
+function responseString(record: Record<string, unknown>, key: string, label: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    invalidAnalyzeResponse(`${label}.${key} must be a non-empty string`);
+  }
+  return value;
+}
+
+function responseNullableString(record: Record<string, unknown>, key: string, label: string): void {
+  if (!(key in record)) invalidAnalyzeResponse(`${label}.${key} is required`);
+  const value = record[key];
+  if (value !== null && typeof value !== 'string') {
+    invalidAnalyzeResponse(`${label}.${key} must be a string or null`);
+  }
+}
+
+function responseCount(record: Record<string, unknown>, key: string, label: string): number {
+  const value = record[key];
+  if (typeof value !== 'number' || !Number.isInteger(value) || value < 0) {
+    invalidAnalyzeResponse(`${label}.${key} must be a non-negative integer`);
+  }
+  return value;
+}
+
+function responseStringArray(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): string[] {
+  const value = record[key];
+  if (
+    !Array.isArray(value) ||
+    value.some((item) => typeof item !== 'string' || item.trim().length === 0)
+  ) {
+    invalidAnalyzeResponse(`${label}.${key} must be an array of non-empty strings`);
+  }
+  return value as string[];
+}
+
+function responseFailureMap(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): Record<string, string> {
+  const value = responseRecord(record[key], `${label}.${key}`);
+  for (const [detector, error] of Object.entries(value)) {
+    if (detector.trim().length === 0 || typeof error !== 'string') {
+      invalidAnalyzeResponse(`${label}.${key} must map detector names to strings`);
+    }
+  }
+  return value as Record<string, string>;
+}
+
+function validateDetection(value: unknown, index: number): Detection {
+  const label = `diagnosis.all_detections[${index}]`;
+  const record = responseRecord(value, label);
+  const category = record['category'] ?? record['detector'] ?? record['detection_type'];
+  if (typeof category !== 'string' || category.trim().length === 0) {
+    invalidAnalyzeResponse(`${label} must identify a detector category`);
+  }
+  const detected = record['detected'];
+  if (detected !== true) {
+    invalidAnalyzeResponse(`${label}.detected must be true`);
+  }
+  const confidence = record['confidence'];
+  if (
+    typeof confidence !== 'number' ||
+    !Number.isFinite(confidence) ||
+    confidence < 0 ||
+    confidence > 1
+  ) {
+    invalidAnalyzeResponse(`${label}.confidence must be a number from 0 through 1`);
+  }
+  const severity = responseString(record, 'severity', label).toLowerCase();
+  if (!['critical', 'high', 'medium', 'low', 'info'].includes(severity)) {
+    invalidAnalyzeResponse(`${label}.severity is unsupported`);
+  }
+  responseString(record, 'title', label);
+  responseString(record, 'description', label);
+  return value as Detection;
+}
+
+function validateOptionalStringField(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): void {
+  const value = record[key];
+  if (value !== undefined && typeof value !== 'string') {
+    invalidAnalyzeResponse(`${label}.${key} must be a string when present`);
+  }
+}
+
+function validateOptionalNullableStringField(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): void {
+  const value = record[key];
+  if (value !== undefined && value !== null && typeof value !== 'string') {
+    invalidAnalyzeResponse(`${label}.${key} must be a string or null when present`);
+  }
+}
+
+function validateOptionalObjectField(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): void {
+  const value = record[key];
+  if (
+    value !== undefined &&
+    value !== null &&
+    (typeof value !== 'object' || Array.isArray(value))
+  ) {
+    invalidAnalyzeResponse(`${label}.${key} must be an object or null when present`);
+  }
+}
+
+function validateHealing(value: unknown): AnalyzeResponse['healing'] {
+  if (value === null) return null;
+  const record = responseRecord(value, 'healing');
+  if (typeof record['success'] !== 'boolean') {
+    invalidAnalyzeResponse('healing.success must be a boolean');
+  }
+  if (record['rolled_back'] !== undefined && typeof record['rolled_back'] !== 'boolean') {
+    invalidAnalyzeResponse('healing.rolled_back must be a boolean when present');
+  }
+  for (const key of ['healing_id', 'fix_type', 'fix_id', 'backup_commit_sha'] as const) {
+    validateOptionalStringField(record, key, 'healing');
+  }
+  for (const key of ['applied_at', 'error'] as const) {
+    validateOptionalNullableStringField(record, key, 'healing');
+  }
+  validateOptionalObjectField(record, 'successor_entity', 'healing');
+  return value as AnalyzeResponse['healing'];
+}
+
+function validateCoverage(
+  status: DetectionStatus,
+  detectorsRun: string[],
+  detectorsFailed: Record<string, string>,
+): void {
+  const failedCount = Object.keys(detectorsFailed).length;
+  const consistent =
+    (status === 'complete' && failedCount === 0 && detectorsRun.length > 0) ||
+    (status === 'partial' && failedCount > 0 && detectorsRun.length > 0) ||
+    (status === 'failed' && failedCount > 0 && detectorsRun.length === 0);
+  if (!consistent) {
+    invalidAnalyzeResponse('diagnosis detection status disagrees with detector coverage');
+  }
+}
+
+function validateDiagnosis(value: unknown): AnalyzeResponse['diagnosis'] {
+  const diagnosis = responseRecord(value, 'diagnosis');
+  const diagnosisTraceId = responseString(diagnosis, 'trace_id', 'diagnosis');
+  if (typeof diagnosis['has_failures'] !== 'boolean') {
+    invalidAnalyzeResponse('diagnosis.has_failures must be a boolean');
+  }
+  const failureCount = responseCount(diagnosis, 'failure_count', 'diagnosis');
+  const status = responseString(diagnosis, 'detection_status', 'diagnosis');
+  if (!['complete', 'partial', 'failed'].includes(status)) {
+    invalidAnalyzeResponse('diagnosis.detection_status must be complete, partial, or failed');
+  }
+  if (!Array.isArray(diagnosis['all_detections'])) {
+    invalidAnalyzeResponse('diagnosis.all_detections must be an array');
+  }
+  const detections = diagnosis['all_detections'].map(validateDetection);
+  if (failureCount !== detections.length) {
+    invalidAnalyzeResponse('diagnosis.failure_count must equal all_detections.length');
+  }
+  if (diagnosis['has_failures'] !== failureCount > 0) {
+    invalidAnalyzeResponse('diagnosis.has_failures disagrees with failure_count');
+  }
+  const detectorsRun = responseStringArray(diagnosis, 'detectors_run', 'diagnosis');
+  const detectorsFailed = responseFailureMap(diagnosis, 'detectors_failed', 'diagnosis');
+  validateCoverage(status as DetectionStatus, detectorsRun, detectorsFailed);
+  return {
+    ...(diagnosis as unknown as AnalyzeResponse['diagnosis']),
+    trace_id: diagnosisTraceId,
+    detection_status: status as DetectionStatus,
+    all_detections: detections,
+    detectors_run: detectorsRun,
+    detectors_failed: detectorsFailed,
+  };
+}
+
+interface SourceTopologyContract {
+  allowedReferences: Set<string>;
+  requiredContinuationReferences: Set<string>;
+}
+
+function sourceTopologyContract(trajectory: AtifTrajectory): SourceTopologyContract {
+  const allowedReferences = collectSubagentTrajectoryTargets(trajectory);
+  const requiredContinuationReferences = new Set<string>();
+  const pendingDocuments: unknown[] = [trajectory];
+
+  while (pendingDocuments.length > 0) {
+    const current = pendingDocuments.pop();
+    if (typeof current !== 'object' || current === null) continue;
+
+    const record = current as Record<string, unknown>;
+    const continuedReference = record['continued_trajectory_ref'];
+    if (typeof continuedReference === 'string' && continuedReference.trim().length > 0) {
+      allowedReferences.add(continuedReference);
+      requiredContinuationReferences.add(continuedReference);
+    }
+    const embedded = record['subagent_trajectories'];
+    if (Array.isArray(embedded)) {
+      pendingDocuments.push(...embedded);
+    }
+  }
+
+  return { allowedReferences, requiredContinuationReferences };
+}
+
+function validateSourceTopology(unresolved: string[], contract: SourceTopologyContract): void {
+  if (new Set(unresolved).size !== unresolved.length) {
+    invalidAnalyzeResponse('trace.unresolved_trajectory_refs must not contain duplicates');
+  }
+  const unexpected = unresolved.find((reference) => !contract.allowedReferences.has(reference));
+  if (unexpected !== undefined) {
+    invalidAnalyzeResponse(
+      `trace.unresolved_trajectory_refs contains a reference absent from the submitted trajectory: ${unexpected}`,
+    );
+  }
+  const missingContinuation = [...contract.requiredContinuationReferences].find(
+    (reference) => !unresolved.includes(reference),
+  );
+  if (missingContinuation !== undefined) {
+    invalidAnalyzeResponse(
+      `trace.unresolved_trajectory_refs omitted submitted continued_trajectory_ref: ${missingContinuation}`,
+    );
+  }
+}
+
+function validateTrace(
+  value: unknown,
+  expectedTraceId: string,
+  topologyContract: SourceTopologyContract,
+): AnalyzeResponse['trace'] {
+  const trace = responseRecord(value, 'trace');
+  const traceId = responseString(trace, 'trace_id', 'trace');
+  if (traceId !== expectedTraceId) {
+    invalidAnalyzeResponse('trace.trace_id does not match diagnosis.trace_id');
+  }
+  responseCount(trace, 'span_count', 'trace');
+  responseCount(trace, 'total_tokens', 'trace');
+  responseString(trace, 'atif_schema_version', 'trace');
+  responseNullableString(trace, 'atif_session_id', 'trace');
+  responseNullableString(trace, 'atif_trajectory_id', 'trace');
+  if (typeof trace['topology_complete'] !== 'boolean') {
+    invalidAnalyzeResponse('trace.topology_complete must be a boolean');
+  }
+  const unresolved = responseStringArray(trace, 'unresolved_trajectory_refs', 'trace');
+  if (trace['topology_complete'] !== (unresolved.length === 0)) {
+    invalidAnalyzeResponse('trace.topology_complete disagrees with unresolved_trajectory_refs');
+  }
+  validateSourceTopology(unresolved, topologyContract);
+  return {
+    ...(trace as unknown as AnalyzeResponse['trace']),
+    unresolved_trajectory_refs: unresolved,
+    client_resolved_trajectory_refs: [],
+    reconciled_topology_complete: trace['topology_complete'],
+  };
+}
+
+function validateAnalyzeResponse(value: unknown, trajectory: AtifTrajectory): AnalyzeResponse {
+  const root = responseRecord(value, 'response');
+  const diagnosis = validateDiagnosis(root['diagnosis']);
+  const trace = validateTrace(
+    root['trace'],
+    diagnosis.trace_id,
+    sourceTopologyContract(trajectory),
+  );
+
+  if (!('healing' in root)) invalidAnalyzeResponse('response.healing is required');
+  const healing = validateHealing(root['healing']);
+  return {
+    diagnosis,
+    trace,
+    healing,
+  };
 }
 
 async function requestAnalysis(
@@ -360,7 +716,78 @@ async function requestAnalysis(
     const body = await safeReadBody(response);
     fail(`${basename(file)}: HTTP ${response.status} from analyze endpoint\n  ${kleur.dim(body)}`);
   }
-  return (await response.json()) as AnalyzeResponse;
+  try {
+    return validateAnalyzeResponse(await response.json(), trajectory);
+  } catch (error) {
+    const reason =
+      error instanceof AnalyzeResponseValidationError
+        ? error.message
+        : 'response body is not valid JSON';
+    fail(
+      `${basename(file)}: analyze endpoint returned an invalid response\n  ${kleur.dim(reason)}`,
+    );
+  }
+}
+
+function collectSubagentTrajectoryTargets(value: unknown): Set<string> {
+  const targets = new Set<string>();
+  const pending: unknown[] = [value];
+  while (pending.length > 0) {
+    const current = pending.pop();
+    if (Array.isArray(current)) {
+      pending.push(...current);
+      continue;
+    }
+    if (typeof current !== 'object' || current === null) continue;
+    const record = current as Record<string, unknown>;
+    const refs = record['subagent_trajectory_ref'];
+    if (Array.isArray(refs)) {
+      for (const ref of refs) {
+        if (typeof ref !== 'object' || ref === null || Array.isArray(ref)) continue;
+        for (const key of ['trajectory_path', 'trajectory_id']) {
+          const target = (ref as Record<string, unknown>)[key];
+          if (typeof target === 'string') targets.add(target);
+        }
+      }
+    }
+    pending.push(...Object.values(record));
+  }
+  return targets;
+}
+
+async function reconcileSubmittedContinuation(
+  file: string,
+  trajectory: AtifTrajectory,
+  submittedFiles: ReadonlySet<string>,
+  data: AnalyzeResponse,
+): Promise<AnalyzeResponse> {
+  const reference = trajectory.continued_trajectory_ref;
+  if (
+    !reference ||
+    collectSubagentTrajectoryTargets(trajectory).has(reference) ||
+    !data.trace.unresolved_trajectory_refs.includes(reference)
+  ) {
+    return data;
+  }
+
+  let target: string;
+  try {
+    target = await realpath(resolve(dirname(file), reference));
+  } catch (error) {
+    fail(`${basename(file)}: continuation changed after discovery (${(error as Error).message})`);
+  }
+  if (!submittedFiles.has(target)) return data;
+
+  const remaining = data.trace.unresolved_trajectory_refs.filter((item) => item !== reference);
+  return {
+    ...data,
+    trace: {
+      ...data.trace,
+      client_resolved_trajectory_refs: [reference],
+      reconciled_topology_complete: remaining.length === 0,
+      unresolved_trajectory_refs: remaining,
+    },
+  };
 }
 
 async function analyzeTrajectory(
@@ -371,22 +798,38 @@ async function analyzeTrajectory(
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
   auth: PlatformAuth | undefined,
-): Promise<{ failureCount: number; blockingSeverity: boolean; applyFailed: boolean }> {
+  submittedFiles: ReadonlySet<string>,
+): Promise<{
+  failureCount: number;
+  blockingSeverity: boolean;
+  analysisIncomplete: boolean;
+  applyFailed: boolean;
+}> {
   const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
-  const data = opts.local
+  const rawData = opts.local
     ? analyzeTrajectoryLocally(file, trajectory)
     : await requestAnalysis(file, baseUrl, trajectory, opts, credentials, auth!);
+  const data = await reconcileSubmittedContinuation(file, trajectory, submittedFiles, rawData);
   const blockingSeverity = data.diagnosis.all_detections.some((detection) =>
     ['critical', 'high'].includes((detection.severity ?? '').toLowerCase()),
   );
   const applyFailed = Boolean(
     opts.apply && (!data.healing || !data.healing.success || data.healing.rolled_back),
   );
+  const analysisIncomplete =
+    data.diagnosis.detection_status !== 'complete' ||
+    Object.keys(data.diagnosis.detectors_failed).length > 0 ||
+    !data.trace.reconciled_topology_complete;
   const label = targetIsDirectory ? relative(target, file) || basename(file) : basename(file);
 
   renderTrajectorySummary(label, data);
   if (opts.apply && data.healing) renderHealingSummary(data.healing);
-  return { failureCount: data.diagnosis.failure_count, blockingSeverity, applyFailed };
+  return {
+    failureCount: data.diagnosis.failure_count,
+    blockingSeverity,
+    analysisIncomplete,
+    applyFailed,
+  };
 }
 
 async function authenticateAnalysis(
@@ -430,6 +873,8 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   }
   const auth = await authenticateAnalysis(opts, baseUrl);
   const targetIsDir = (await stat(target)).isDirectory();
+  const labelTarget = targetIsDir ? await realpath(target) : target;
+  const submittedFiles = new Set(files);
   step(
     opts.local
       ? `Analyzing ${kleur.bold(String(files.length))} trajector${
@@ -441,62 +886,65 @@ export async function analyzeAtif(opts: AnalyzeAtifOptions): Promise<void> {
   );
 
   let blockingSeverityFound = false;
+  let incompleteAnalysisFound = false;
   let applyFailureFound = false;
   let totalFailures = 0;
 
   for (const file of files) {
     const result = await analyzeTrajectory(
       file,
-      target,
+      labelTarget,
       targetIsDir,
       baseUrl,
       opts,
       credentials,
       auth,
+      submittedFiles,
     );
     totalFailures += result.failureCount;
     blockingSeverityFound ||= result.blockingSeverity;
+    incompleteAnalysisFound ||= result.analysisIncomplete;
     applyFailureFound ||= result.applyFailed;
   }
 
-  console.log();
-  console.log(
-    kleur.bold(`Summary: ${files.length} trajectorie(s), ${totalFailures} total detection(s)`),
+  finishAnalysis(
+    files.length,
+    totalFailures,
+    incompleteAnalysisFound,
+    blockingSeverityFound,
+    applyFailureFound,
   );
-  if (blockingSeverityFound) {
-    console.log(
-      kleur.red('✗ At least one critical/high-severity detection fired. Exiting with code 1.'),
-    );
-    process.exit(1);
-  }
-  if (applyFailureFound) {
-    console.log(
-      kleur.red('✗ A requested fix was missing, failed, or rolled back. Exiting with code 1.'),
-    );
-    process.exit(1);
-  }
-  console.log(kleur.green('✓ No critical/high-severity failures.'));
 }
 
 async function collectTrajectoryFiles(target: string): Promise<string[]> {
   const st = await stat(target).catch(() => null);
   if (!st) fail(`No such file or directory: ${target}`);
-  if (st.isFile()) return [target];
+  if (st.isFile()) {
+    const boundary = await canonicalDirectory(dirname(target));
+    return expandContinuationChains([target], boundary);
+  }
   if (st.isDirectory()) {
+    const boundary = await canonicalDirectory(target);
     // Three discovery modes, tried in order:
     // 1. Single Harbor trial dir: contains agent/trajectory.json
-    // 2. Flat directory: *.json directly inside
-    // 3. Harbor job-output dir: recursive **/agent/trajectory.json
-    //    (and as a fallback, any **/trajectory.json)
+    // 2. Harbor job-output dir: recursive **/agent/trajectory.json
+    //    (and as a fallback, any **/trajectory.json). This must precede the
+    //    flat fallback because normal Harbor roots also contain config/result
+    //    JSON that are metadata, not trajectories.
+    // 3. Flat directory: *.json directly inside, for ad-hoc trajectory sets
     const directTrial = join(target, 'agent', 'trajectory.json');
-    if (await fileExists(directTrial)) return [directTrial];
+    if (await fileExists(directTrial)) {
+      return expandContinuationChains([directTrial], boundary);
+    }
+
+    const recursive = await findTrajectoryFiles(target, 6, boundary);
+    if (recursive.length > 0) return expandContinuationChains(recursive.sort(), boundary);
 
     const entries = await readdir(target);
-    const flat = entries.filter((name) => name.endsWith('.json')).map((name) => join(target, name));
-    if (flat.length > 0) return flat.sort();
-
-    const recursive = await findTrajectoryFiles(target, 6);
-    if (recursive.length > 0) return recursive.sort();
+    const flat = entries
+      .filter((name) => name.endsWith('.json') && !isContinuationHelper(name))
+      .map((name) => join(target, name));
+    if (flat.length > 0) return expandContinuationChains(flat.sort(), boundary);
 
     fail(
       `No trajectories found at ${target}. Looked for: agent/trajectory.json, *.json, **/agent/trajectory.json, **/trajectory.json`,
@@ -510,26 +958,210 @@ async function fileExists(p: string): Promise<boolean> {
   return !!st && st.isFile();
 }
 
-async function findTrajectoryFiles(root: string, maxDepth: number): Promise<string[]> {
+function pathIsWithin(candidate: string, boundary: string): boolean {
+  const rel = relative(boundary, candidate);
+  return rel === '' || (rel !== '..' && !rel.startsWith(`..${sep}`) && !isAbsolute(rel));
+}
+
+async function canonicalDirectory(directory: string): Promise<string> {
+  let canonical: string;
+  try {
+    canonical = await realpath(directory);
+  } catch (error) {
+    fail(`Could not resolve ATIF directory ${directory}: ${(error as Error).message}`);
+  }
+  if (!(await stat(canonical)).isDirectory()) fail(`ATIF path is not a directory: ${directory}`);
+  return canonical;
+}
+
+function isContinuationHelper(name: string): boolean {
+  const lower = name.toLowerCase();
+  return (
+    lower.includes('.summarization-') ||
+    lower.includes('.trajectory.cont-') ||
+    lower.startsWith('trajectory.cont-')
+  );
+}
+
+async function readContinuationReference(file: string): Promise<string | undefined> {
+  let value: unknown;
+  try {
+    value = JSON.parse(await readFile(file, 'utf8')) as unknown;
+  } catch (error) {
+    fail(`Could not read ATIF trajectory JSON ${file}: ${(error as Error).message}`);
+  }
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    fail(`${basename(file)}: trajectory JSON root must be an object`);
+  }
+  const reference = (value as Record<string, unknown>)['continued_trajectory_ref'];
+  if (reference === undefined || reference === null) return undefined;
+  if (typeof reference !== 'string' || reference.trim().length === 0) {
+    fail(`ATIF continued_trajectory_ref must be a non-empty string: ${file}`);
+  }
+  return reference;
+}
+
+async function resolveChainRoot(
+  root: string,
+  selectionBoundary: string,
+): Promise<{
+  agentDirectory: string;
+  trajectory: string;
+}> {
+  let agentDirectory: string;
+  let trajectory: string;
+  try {
+    agentDirectory = await realpath(dirname(root));
+    trajectory = await realpath(root);
+  } catch (error) {
+    fail(`Could not resolve ATIF trajectory file ${root}: ${(error as Error).message}`);
+  }
+  if (
+    !pathIsWithin(agentDirectory, selectionBoundary) ||
+    !pathIsWithin(trajectory, selectionBoundary) ||
+    !pathIsWithin(trajectory, agentDirectory) ||
+    !(await stat(trajectory)).isFile()
+  ) {
+    fail(`ATIF trajectory root escapes the selected directory: ${root}`);
+  }
+  return { agentDirectory, trajectory };
+}
+
+async function continuationChain(root: string, selectionBoundary: string): Promise<string[]> {
+  const { agentDirectory, trajectory } = await resolveChainRoot(root, selectionBoundary);
+  const chain: string[] = [];
+  const seen = new Set<string>();
+  let current = trajectory;
+
+  while (true) {
+    if (!pathIsWithin(current, agentDirectory) || !pathIsWithin(current, selectionBoundary)) {
+      fail(`ATIF continued_trajectory_ref escapes the selected agent directory: ${current}`);
+    }
+    if (seen.has(current)) fail(`ATIF continued_trajectory_ref cycle detected at: ${current}`);
+    if (chain.length >= MAX_CONTINUATION_SEGMENTS) {
+      fail(`ATIF continuation chain exceeds ${MAX_CONTINUATION_SEGMENTS} segments: ${root}`);
+    }
+    if (!(await stat(current)).isFile()) fail(`ATIF continuation is not a file: ${current}`);
+    seen.add(current);
+    chain.push(current);
+
+    const reference = await readContinuationReference(current);
+    if (reference === undefined) return chain;
+    if (isAbsolute(reference) || win32.isAbsolute(reference)) {
+      fail(`ATIF continued_trajectory_ref must be relative: ${JSON.stringify(reference)}`);
+    }
+
+    let candidate: string;
+    try {
+      candidate = resolve(dirname(current), reference);
+    } catch (error) {
+      fail(
+        `Invalid ATIF continued_trajectory_ref ${JSON.stringify(reference)}: ${(error as Error).message}`,
+      );
+    }
+    if (!pathIsWithin(candidate, agentDirectory)) {
+      fail(`ATIF continued_trajectory_ref escapes agent directory: ${JSON.stringify(reference)}`);
+    }
+    try {
+      current = await realpath(candidate);
+    } catch {
+      fail(`Missing ATIF continued_trajectory_ref ${JSON.stringify(reference)} in ${root}`);
+    }
+  }
+}
+
+async function expandContinuationChains(
+  roots: string[],
+  selectionBoundary: string,
+): Promise<string[]> {
+  const expanded: string[] = [];
+  const emitted = new Set<string>();
+  for (const root of roots) {
+    for (const file of await continuationChain(root, selectionBoundary)) {
+      if (emitted.has(file)) continue;
+      if (expanded.length >= MAX_TRAJECTORY_FILES) {
+        fail(`ATIF selection exceeds ${MAX_TRAJECTORY_FILES} trajectory files`);
+      }
+      emitted.add(file);
+      expanded.push(file);
+    }
+  }
+  return expanded;
+}
+
+async function findTrajectoryFiles(
+  root: string,
+  maxDepth: number,
+  selectionBoundary: string,
+): Promise<string[]> {
   // Targeted walk: only follow directories and only collect files named
   // trajectory.json. Caps depth so a misaimed path doesn't churn through
   // a huge tree (Harbor trial trees are 3-4 levels deep, so 6 is generous).
   const out: string[] = [];
+  const visitedDirectories = new Set<string>();
+
+  async function descend(directory: string, currentDepth: number): Promise<void> {
+    if (currentDepth >= maxDepth) {
+      fail(`ATIF discovery exceeds maximum depth ${maxDepth} at ${directory}`);
+    }
+    await walk(directory, currentDepth + 1);
+  }
+
+  async function inspectRelevantSymlink(full: string, name: string, depth: number): Promise<void> {
+    let canonical: string;
+    let targetStat: Awaited<ReturnType<typeof stat>>;
+    try {
+      canonical = await realpath(full);
+      targetStat = await stat(canonical);
+    } catch (error) {
+      fail(`Could not resolve ATIF symlink ${full}: ${(error as Error).message}`);
+    }
+    if (!pathIsWithin(canonical, selectionBoundary)) {
+      fail(`ATIF symlink escapes selected directory: ${full}`);
+    }
+    if (name === 'trajectory.json') {
+      if (!targetStat.isFile()) fail(`ATIF trajectory symlink is not a file: ${full}`);
+      out.push(full);
+      return;
+    }
+    if (!targetStat.isDirectory()) fail(`ATIF agent symlink is not a directory: ${full}`);
+    await descend(full, depth);
+  }
+
   async function walk(dir: string, depth: number): Promise<void> {
-    if (depth > maxDepth) return;
+    let canonicalDirectoryPath: string;
+    try {
+      canonicalDirectoryPath = await realpath(dir);
+    } catch (error) {
+      fail(`Could not resolve ATIF directory ${dir}: ${(error as Error).message}`);
+    }
+    if (!pathIsWithin(canonicalDirectoryPath, selectionBoundary)) {
+      fail(`ATIF directory symlink escapes selected directory: ${dir}`);
+    }
+    if (visitedDirectories.has(canonicalDirectoryPath)) return;
+    visitedDirectories.add(canonicalDirectoryPath);
+
     let entries: import('node:fs').Dirent[];
     try {
       entries = (await readdir(dir, {
         withFileTypes: true,
       })) as unknown as import('node:fs').Dirent[];
-    } catch {
-      return;
+    } catch (error) {
+      fail(`Could not read ATIF directory ${dir}: ${(error as Error).message}`);
     }
     for (const e of entries) {
       const full = join(dir, e.name);
-      if (e.isFile() && e.name === 'trajectory.json') out.push(full);
-      else if (e.isDirectory() && !e.name.startsWith('.')) {
-        await walk(full, depth + 1);
+      if (e.isFile() && e.name === 'trajectory.json') {
+        out.push(full);
+        continue;
+      }
+      if (e.name.startsWith('.')) continue;
+      if (e.isDirectory()) {
+        await descend(full, depth);
+        continue;
+      }
+      if (e.isSymbolicLink() && (e.name === 'agent' || e.name === 'trajectory.json')) {
+        await inspectRelevantSymlink(full, e.name, depth);
       }
     }
   }
@@ -574,7 +1206,35 @@ function renderTrajectorySummary(label: string, data: AnalyzeResponse): void {
     `  ${kleur.dim('session')} ${t.atif_session_id ?? '-'}  ${kleur.dim('schema')} ${t.atif_schema_version}`,
   );
 
+  const failedDetectors = Object.keys(d.detectors_failed);
+  const detectorIncomplete = d.detection_status !== 'complete' || failedDetectors.length > 0;
+  const topologyIncomplete = !t.reconciled_topology_complete;
+  const incomplete = detectorIncomplete || topologyIncomplete;
+  if (detectorIncomplete) {
+    console.log(
+      `  ${kleur.red('✗')} Detection analysis ${d.detection_status}; result is incomplete`,
+    );
+    if (failedDetectors.length > 0) {
+      console.log(`  ${kleur.dim('detectors_failed:')} ${failedDetectors.join(', ')}`);
+    }
+  }
+  if (t.client_resolved_trajectory_refs.length > 0) {
+    console.log(
+      `  ${kleur.green('✓')} continuation submitted: ${t.client_resolved_trajectory_refs.join(', ')}`,
+    );
+  }
+  if (topologyIncomplete) {
+    console.log(`  ${kleur.red('✗')} Trajectory topology is incomplete; result is not clean`);
+    console.log(
+      `  ${kleur.dim('unresolved_trajectory_refs:')} ${t.unresolved_trajectory_refs.join(', ')}`,
+    );
+  }
+
   if (d.failure_count === 0) {
+    if (incomplete) {
+      console.log(`  ${kleur.yellow('!')} 0 confirmed detections returned; result is not clean`);
+      return;
+    }
     console.log(`  ${kleur.green('✓')} No detections (${d.detectors_run.length} detectors ran)`);
     return;
   }
@@ -583,14 +1243,8 @@ function renderTrajectorySummary(label: string, data: AnalyzeResponse): void {
     `  ${kleur.yellow('!')} ${d.failure_count} detection(s) across ${d.detectors_run.length} detector(s)`,
   );
   const grouped = groupBySeverity(d.all_detections);
-  for (const severity of ['critical', 'high', 'medium', 'low']) {
+  for (const severity of ['critical', 'high', 'medium', 'low', 'info']) {
     renderSeverityGroup(severity, grouped.get(severity) ?? []);
-  }
-
-  if (Object.keys(d.detectors_failed).length > 0) {
-    console.log(
-      `  ${kleur.dim('detectors_failed:')} ${Object.keys(d.detectors_failed).join(', ')}`,
-    );
   }
 }
 

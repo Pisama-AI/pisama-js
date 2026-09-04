@@ -58,7 +58,8 @@ interface TraceStateMetadata {
 interface DetectionResult {
   detector: string;
   detected: boolean;
-  severity: number;
+  confidence: number;
+  confidenceTier: 'HIGH' | 'LIKELY' | 'POSSIBLE' | 'LOW';
   summary: string;
   fix?: string;
   evidence?: Record<string, unknown>;
@@ -348,6 +349,7 @@ interface PlatformDetection {
   state_id: string | null;
   detection_type: string;
   confidence: number;
+  confidence_tier?: 'HIGH' | 'LIKELY' | 'POSSIBLE' | 'LOW' | null;
   method: string;
   details: Record<string, unknown>;
   validated: boolean;
@@ -360,14 +362,16 @@ interface PlatformDetection {
 
 interface TracePage {
   traces: PlatformTrace[];
-  total?: number;
+  total: number;
+  page: number;
+  per_page: number;
 }
 
 interface DetectionPage {
   items: PlatformDetection[];
-  total?: number;
-  page?: number;
-  per_page?: number;
+  total: number;
+  page: number;
+  per_page: number;
 }
 
 interface DetectionBatch {
@@ -396,6 +400,16 @@ function optionalCount(
 function requiredCount(record: Record<string, unknown>, key: string, label: string): number {
   const value = optionalCount(record, key, label);
   if (value === undefined) invalidPlatformShape(`${label}.${key} is required`);
+  return value;
+}
+
+function requiredPositiveCount(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): number {
+  const value = requiredCount(record, key, label);
+  if (value === 0) invalidPlatformShape(`${label}.${key} must be a positive integer`);
   return value;
 }
 
@@ -492,6 +506,7 @@ function validatePlatformDetection(
   requiredString(record, 'detection_type', label);
   const confidence = requiredCount(record, 'confidence', label);
   if (confidence > 100) invalidPlatformShape(`${label}.confidence must be at most 100`);
+  validateConfidenceTier(record['confidence_tier'], confidence, label);
   requiredString(record, 'method', label);
   const details = record['details'];
   if (typeof details !== 'object' || details === null || Array.isArray(details)) {
@@ -509,6 +524,21 @@ function validatePlatformDetection(
     optionalNullableString(record, field, label);
   }
   return value as PlatformDetection;
+}
+
+function confidenceTierFor(confidence: number): DetectionResult['confidenceTier'] {
+  if (confidence >= 80) return 'HIGH';
+  if (confidence >= 60) return 'LIKELY';
+  if (confidence >= 40) return 'POSSIBLE';
+  return 'LOW';
+}
+
+function validateConfidenceTier(value: unknown, confidence: number, label: string): void {
+  if (value === undefined || value === null) return;
+  const expected = confidenceTierFor(confidence);
+  if (value !== expected) {
+    invalidPlatformShape(`${label}.confidence_tier must agree with confidence (${expected})`);
+  }
 }
 
 function validatePlatformStates(value: unknown): PlatformState[] {
@@ -537,7 +567,42 @@ function validatePlatformStates(value: unknown): PlatformState[] {
   });
 }
 
-function validateTracePage(value: unknown): TracePage {
+function validatePaginationEnvelope(
+  record: Record<string, unknown>,
+  label: string,
+  itemCount: number,
+  expectedPage: number,
+  expectedPerPage: number,
+): { total: number; page: number; perPage: number } {
+  const total = requiredCount(record, 'total', label);
+  const page = requiredPositiveCount(record, 'page', label);
+  const perPage = requiredPositiveCount(record, 'per_page', label);
+  if (page !== expectedPage) {
+    invalidPlatformShape(`${label}.page must equal requested page ${expectedPage}`);
+  }
+  if (perPage !== expectedPerPage) {
+    invalidPlatformShape(`${label}.per_page must equal requested per_page ${expectedPerPage}`);
+  }
+  if (itemCount > perPage) {
+    invalidPlatformShape(`${label} contains more items than per_page`);
+  }
+
+  const offset = (page - 1) * perPage;
+  const observedEnd = offset + itemCount;
+  if (observedEnd > total) {
+    invalidPlatformShape(`${label}.total is smaller than the observed page range`);
+  }
+  if (itemCount < perPage && observedEnd !== total) {
+    invalidPlatformShape(`${label}.total disagrees with a terminal short page`);
+  }
+  return { total, page, perPage };
+}
+
+function validateTracePage(
+  value: unknown,
+  expectedPage: number,
+  expectedPerPage: number,
+): TracePage {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     invalidPlatformShape('trace page must be an object');
   }
@@ -548,10 +613,27 @@ function validateTracePage(value: unknown): TracePage {
   const traces = record['traces'].map((trace, index) =>
     validatePlatformTrace(trace, `trace page traces[${index}]`),
   );
-  return { traces, total: optionalCount(record, 'total', 'trace page') };
+  const pagination = validatePaginationEnvelope(
+    record,
+    'trace page',
+    traces.length,
+    expectedPage,
+    expectedPerPage,
+  );
+  return {
+    traces,
+    total: pagination.total,
+    page: pagination.page,
+    per_page: pagination.perPage,
+  };
 }
 
-function validateDetectionPage(value: unknown, expectedTraceId: string): DetectionPage {
+function validateDetectionPage(
+  value: unknown,
+  expectedTraceId: string,
+  expectedPage: number,
+  expectedPerPage: number,
+): DetectionPage {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     invalidPlatformShape('detection page must be an object');
   }
@@ -562,11 +644,18 @@ function validateDetectionPage(value: unknown, expectedTraceId: string): Detecti
   const items = record['items'].map((item, index) =>
     validatePlatformDetection(item, index, expectedTraceId),
   );
+  const pagination = validatePaginationEnvelope(
+    record,
+    'detection page',
+    items.length,
+    expectedPage,
+    expectedPerPage,
+  );
   return {
     items,
-    total: optionalCount(record, 'total', 'detection page'),
-    page: optionalCount(record, 'page', 'detection page'),
-    per_page: optionalCount(record, 'per_page', 'detection page'),
+    total: pagination.total,
+    page: pagination.page,
+    per_page: pagination.perPage,
   };
 }
 
@@ -617,7 +706,7 @@ async function fetchTracePage(
   const url = tenantApiUrl(baseUrl, tenantId, 'traces');
   url.searchParams.set('page', String(page));
   url.searchParams.set('per_page', String(perPage));
-  return validateTracePage(await platformJson<unknown>(auth, url));
+  return validateTracePage(await platformJson<unknown>(auth, url), page, perPage);
 }
 
 async function fetchDetections(
@@ -636,26 +725,30 @@ async function fetchDetections(
     url.searchParams.set('trace_id', traceId);
     url.searchParams.set('page', String(page));
     url.searchParams.set('per_page', String(perPage));
-    const result = validateDetectionPage(await platformJson<unknown>(auth, url), traceId);
+    const result = validateDetectionPage(
+      await platformJson<unknown>(auth, url),
+      traceId,
+      page,
+      perPage,
+    );
     const batch = result.items;
-    if (typeof result.total === 'number' && Number.isFinite(result.total)) {
-      reportedTotal = Math.max(0, Math.floor(result.total));
+    if (reportedTotal !== undefined && result.total !== reportedTotal) {
+      invalidPlatformShape('detection page.total changed between pages');
     }
+    reportedTotal = result.total;
     items.push(...batch.slice(0, MAX_DETECTIONS_PER_TRACE - items.length));
 
-    if (batch.length < perPage || (reportedTotal !== undefined && items.length >= reportedTotal)) {
+    if (batch.length < perPage || items.length >= reportedTotal) {
       break;
     }
     page += 1;
   }
 
-  const total = Math.max(items.length, reportedTotal ?? items.length);
+  const total = reportedTotal ?? 0;
   return {
     items,
     total,
-    truncated:
-      total > items.length ||
-      (reportedTotal === undefined && items.length >= MAX_DETECTIONS_PER_TRACE),
+    truncated: total > items.length,
   };
 }
 
@@ -694,16 +787,19 @@ async function fetchRecentTraces(
   let page = 1;
   let scannedTraceCount = 0;
   let totalTraceCount = 0;
-  let totalTraceCountKnown = false;
+  let reportedTotal: number | undefined;
   let scanComplete = false;
   let resultsTruncated = false;
 
   while (events.length < opts.limit && scannedTraceCount < MAX_TRACE_SCAN) {
     const result = await fetchTracePage(auth, baseUrl, tenantId, page, perPage);
     const rows = result.traces;
+    if (reportedTotal !== undefined && result.total !== reportedTotal) {
+      invalidPlatformShape('trace page.total changed between pages');
+    }
+    reportedTotal = result.total;
     scannedTraceCount += rows.length;
-    totalTraceCount = Math.max(totalTraceCount, result.total ?? 0, scannedTraceCount);
-    if (result.total !== undefined) totalTraceCountKnown = true;
+    totalTraceCount = result.total;
 
     const candidates = opts.onlyFailures
       ? rows.filter((row) => (row.detection_count ?? 0) > 0)
@@ -714,13 +810,9 @@ async function fetchRecentTraces(
     events.push(...visible.slice(0, remaining));
     if (visible.length > remaining) resultsTruncated = true;
 
-    const reachedSourceEnd =
-      result.total === undefined
-        ? rows.length < perPage
-        : rows.length === 0 || scannedTraceCount >= result.total;
+    const reachedSourceEnd = scannedTraceCount >= result.total;
     if (reachedSourceEnd) {
       scanComplete = true;
-      totalTraceCountKnown = true;
       break;
     }
     if (events.length >= opts.limit) {
@@ -737,7 +829,7 @@ async function fetchRecentTraces(
     events,
     scannedTraceCount,
     totalTraceCount,
-    totalTraceCountKnown,
+    totalTraceCountKnown: true,
     scanComplete,
     resultsTruncated,
   };
@@ -811,10 +903,8 @@ function adaptDetection(detection: PlatformDetection): DetectionResult {
   return {
     detector,
     detected: true,
-    severity:
-      typeof detection.confidence === 'number'
-        ? Math.max(0, Math.min(10, Math.round(detection.confidence / 10)))
-        : 5,
+    confidence: detection.confidence,
+    confidenceTier: confidenceTierFor(detection.confidence),
     summary,
     ...(detection.suggested_fix || detection.suggested_action
       ? { fix: detection.suggested_fix ?? detection.suggested_action ?? undefined }
@@ -889,7 +979,12 @@ function adaptPlatformTrace(
 
 function formatHitSummary(trace: TraceWithHits): string {
   if (trace.hits.length > 0) {
-    const summary = trace.hits.map((hit) => `${hit.detector}/${hit.severity}`).join(',');
+    const summary = trace.hits
+      .map(
+        (hit) =>
+          `${hit.detector}/${hit.confidence}%${hit.confidenceTier ? ` ${hit.confidenceTier}` : ''}`,
+      )
+      .join(',');
     return trace.hitsTruncated ? `${summary},… (${trace.visibleDetectionCount} visible)` : summary;
   }
   if ((trace.event.storedDetectionCount ?? 0) > 0) return '(no visible detector hits)';
@@ -974,7 +1069,8 @@ function formatDetectionHits(t: TraceWithHits): string[] {
   if (t.hits.length > 0) {
     out.push(`\ndetector hits:`);
     for (const h of t.hits) {
-      out.push(`  - ${h.detector} (severity ${h.severity}): ${h.summary}`);
+      const tier = h.confidenceTier ? `, ${h.confidenceTier}` : '';
+      out.push(`  - ${h.detector} (confidence ${h.confidence}%${tier}): ${h.summary}`);
       if (h.fix) out.push(`    fix: ${h.fix}`);
     }
   } else if ((t.event.storedDetectionCount ?? 0) > 0) {
@@ -1150,7 +1246,7 @@ export function buildPromptMessages(name: string, args: Record<string, string>):
       'Steps:\n' +
       `1. Call \`get_trace\` with \`traceId="${traceId}"\`.\n` +
       '2. Walk the available prompt, completion, and state metadata. Note what the agent attempted.\n' +
-      '3. Read the `detector hits` block. For each hit, note the detector name, severity, and summary.\n' +
+      '3. Read the `detector hits` block. For each hit, note the detector name, confidence, confidence tier when present, and summary.\n' +
       '4. Reply with a short narrative: what the agent tried to do, where it failed, and which Pisama detector caught it.';
     return {
       description: 'Plain-English explanation of a single trace.',

@@ -61,6 +61,12 @@ artifact_extract=$(mktemp -d)
 trap 'rm -rf -- "$install_dir" "$consumer_dir" "$artifact_extract"' EXIT
 
 tar -xzf "$artifact" -C "$artifact_extract"
+expected_fast_uri=$(node -p "require('./package.json').pnpm.overrides['fast-uri']")
+if ! grep -Fq -- "\`fast-uri\` ${expected_fast_uri}," \
+  "$artifact_extract/package/THIRD_PARTY_NOTICES.md"; then
+  echo "CLI notice does not match pinned fast-uri ${expected_fast_uri}" >&2
+  exit 1
+fi
 if grep -RIEq 'whoopsie[.]dev|pisama[.]ai/live|/api/v1/spans' "$artifact_extract/package"; then
   echo 'CLI artifact retains a retired host or removed route reference' >&2
   exit 1

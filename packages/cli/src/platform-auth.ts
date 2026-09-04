@@ -37,8 +37,11 @@ export class PlatformAuth {
     this.timeoutMs = normaliseTimeout(timeoutMs);
   }
 
-  async identity(scope: TokenScope = 'read'): Promise<TokenClaims> {
-    const claims = decodeClaims(await this.accessToken(scope, Date.now() + this.timeoutMs));
+  async identity(
+    scope: TokenScope = 'read',
+    deadline: number = Date.now() + this.timeoutMs,
+  ): Promise<TokenClaims> {
+    const claims = decodeClaims(await this.accessToken(scope, deadline));
     return claims;
   }
 
@@ -46,8 +49,8 @@ export class PlatformAuth {
     scope: TokenScope,
     input: RequestInfo | URL,
     init: RequestInit = {},
+    deadline: number = Date.now() + this.timeoutMs,
   ): Promise<Response> {
-    const deadline = Date.now() + this.timeoutMs;
     const token = await this.accessToken(scope, deadline);
     let response = await this.fetchOnce(input, init, token, deadline);
     if (response.status === 401) {

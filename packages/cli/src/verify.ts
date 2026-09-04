@@ -30,12 +30,25 @@ export interface VerifyOptions {
 const DEFAULT_BASE = 'https://api.pisama.ai';
 const DEFAULT_DASHBOARD_BASE = 'https://pisama.ai';
 const DEFAULT_TIMEOUT_MS = 15_000;
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+export function normaliseVerifyTimeout(value: number): number {
+  if (!Number.isFinite(value) || value <= 0 || value > MAX_TIMEOUT_MS) {
+    throw new RangeError(`--timeout-ms must be between 1 and ${MAX_TIMEOUT_MS}.`);
+  }
+  return Math.max(1, Math.floor(value));
+}
 
 export async function verify(opts: VerifyOptions): Promise<void> {
   const baseUrl = (opts.baseUrl ?? DEFAULT_BASE).replace(/\/$/, '');
   const dashboardBaseUrl = baseUrl === DEFAULT_BASE ? DEFAULT_DASHBOARD_BASE : baseUrl;
   const healthUrl = `${baseUrl}/api/v1/health`;
-  const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  let timeoutMs: number;
+  try {
+    timeoutMs = normaliseVerifyTimeout(opts.timeoutMs ?? DEFAULT_TIMEOUT_MS);
+  } catch (error) {
+    fail((error as Error).message);
+  }
 
   const apiKey = opts.apiKey ?? process.env.PISAMA_API_KEY;
   if (!apiKey) {
@@ -44,10 +57,11 @@ export async function verify(opts: VerifyOptions): Promise<void> {
         `  Create one at ${kleur.cyan(`${dashboardBaseUrl}/settings/api-keys`)}`,
     );
   }
-  const auth = new PlatformAuth(baseUrl, apiKey);
+  const deadline = Date.now() + timeoutMs;
+  const auth = new PlatformAuth(baseUrl, apiKey, undefined, timeoutMs);
 
   step('Resolving tenant from API key...');
-  const tenantId = await resolveTenant(auth, baseUrl, dashboardBaseUrl, healthUrl);
+  const tenantId = await resolveTenant(auth, baseUrl, dashboardBaseUrl, healthUrl, deadline);
   ok(`Tenant: ${kleur.bold(tenantId)}`);
 
   const traceId = randomBytes(16).toString('hex');
@@ -85,17 +99,23 @@ export async function verify(opts: VerifyOptions): Promise<void> {
 
   step(`Sending synthetic trace via ${kleur.dim(baseUrl + '/api/v1/traces/ingest')}...`);
   const requestId = `pisama-cli-${randomBytes(12).toString('hex')}`;
-  const postRes = await postTrace(auth, baseUrl, healthUrl, {
-    method: 'POST',
-    headers: { 'content-type': 'application/json', 'x-request-id': requestId },
-    body: JSON.stringify(payload),
-  });
+  const postRes = await postTrace(
+    auth,
+    baseUrl,
+    healthUrl,
+    {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', 'x-request-id': requestId },
+      body: JSON.stringify(payload),
+    },
+    deadline,
+  );
   assertIngestAccepted(postRes, baseUrl, dashboardBaseUrl, healthUrl);
   ok(`Ingest accepted (HTTP ${postRes.status}).`);
 
   step('Waiting for the trace to surface...');
   const start = Date.now();
-  const landed = await pollForTrace(baseUrl, auth, tenantId, traceId, timeoutMs);
+  const landed = await pollForTrace(baseUrl, auth, tenantId, traceId, deadline);
   if (!landed) {
     fail(
       `Trace didn't appear within ${Math.round(timeoutMs / 1000)}s.\n` +
@@ -116,9 +136,10 @@ async function resolveTenant(
   baseUrl: string,
   dashboardBaseUrl: string,
   healthUrl: string,
+  deadline: number,
 ): Promise<string> {
   try {
-    return (await auth.identity('read')).tenantId;
+    return (await auth.identity('read', deadline)).tenantId;
   } catch (error) {
     const authError = error as PlatformAuthError;
     if (authError.status === 401 || authError.status === 403) {
@@ -140,12 +161,18 @@ async function postTrace(
   baseUrl: string,
   healthUrl: string,
   init: RequestInit,
+  deadline: number,
 ): Promise<Response> {
   try {
-    return await auth.fetch('ingest', `${baseUrl}/api/v1/traces/ingest`, {
-      ...init,
-      method: 'POST',
-    });
+    return await auth.fetch(
+      'ingest',
+      `${baseUrl}/api/v1/traces/ingest`,
+      {
+        ...init,
+        method: 'POST',
+      },
+      deadline,
+    );
   } catch (err) {
     if (err instanceof PlatformAuthError) {
       fail(
@@ -199,17 +226,16 @@ async function pollForTrace(
   auth: PlatformAuth,
   tenantId: string,
   traceId: string,
-  timeoutMs: number,
+  deadline: number,
 ): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
   const url = `${baseUrl}/api/v1/tenants/${encodeURIComponent(tenantId)}/traces?per_page=50`;
   while (Date.now() < deadline) {
     let res: Response;
     try {
-      res = await auth.fetch('read', url);
+      res = await auth.fetch('read', url, {}, deadline);
     } catch {
       // transient — try again
-      await new Promise((resolve) => setTimeout(resolve, 750));
+      await waitForNextPoll(deadline);
       continue;
     }
     if (res.status === 401 || res.status === 403) {
@@ -217,17 +243,36 @@ async function pollForTrace(
     }
     if (res.ok) {
       const data = (await res.json()) as {
-        traces?: Array<{ trace_id?: string; session_id?: string }>;
-        items?: Array<{ trace_id?: string; session_id?: string }>;
+        traces?: Array<{ id?: string; trace_id?: string; session_id?: string }>;
+        items?: Array<{ id?: string; trace_id?: string; session_id?: string }>;
       };
       const rows = data.traces ?? data.items ?? [];
-      if (rows.some((trace) => trace?.trace_id === traceId || trace?.session_id === traceId)) {
+      if (
+        rows.some(
+          (trace) =>
+            normalizeTraceId(trace?.id ?? trace?.trace_id) === traceId ||
+            trace?.session_id === traceId,
+        )
+      ) {
         return true;
       }
     }
-    await new Promise((resolve) => setTimeout(resolve, 750));
+    await waitForNextPoll(deadline);
   }
   return false;
+}
+
+function normalizeTraceId(value: string | undefined): string | undefined {
+  if (!value) return undefined;
+  const compact = value.replaceAll('-', '').toLowerCase();
+  return /^[0-9a-f]{32}$/.test(compact) ? compact : value;
+}
+
+async function waitForNextPoll(deadline: number): Promise<void> {
+  const remaining = deadline - Date.now();
+  if (remaining > 0) {
+    await new Promise((resolve) => setTimeout(resolve, Math.min(750, remaining)));
+  }
 }
 
 function step(msg: string): void {

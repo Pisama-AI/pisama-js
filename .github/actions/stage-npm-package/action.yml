@@ -14,6 +14,18 @@ inputs:
   expected-sha256:
     required: true
     description: Independently reviewed lowercase SHA-256 of the exact tarball.
+  git-tag:
+    required: true
+    description: Exact immutable tag selected by the dispatch.
+  tag-prefix:
+    required: true
+    description: Package-specific tag prefix.
+  event-ref:
+    required: true
+    description: Immutable tag ref that triggered workflow_dispatch.
+  event-sha:
+    required: true
+    description: Commit SHA bound to the triggering workflow run.
   dist-tag:
     required: true
     description: npm dist-tag to apply if a human later approves the stage.
@@ -24,6 +36,22 @@ inputs:
 runs:
   using: composite
   steps:
+    - name: Reverify immutable source identity
+      shell: bash
+      env:
+        RELEASE_VERSION: ${{ inputs.version }}
+        RELEASE_TAG: ${{ inputs.git-tag }}
+        TAG_PREFIX: ${{ inputs.tag-prefix }}
+        EVENT_REF: ${{ inputs.event-ref }}
+        EVENT_SHA: ${{ inputs.event-sha }}
+      run: |
+        set -euo pipefail
+        test "$RELEASE_TAG" = "$TAG_PREFIX$RELEASE_VERSION"
+        test "$EVENT_REF" = "refs/tags/$RELEASE_TAG"
+        test "$(git rev-parse HEAD)" = "$EVENT_SHA"
+        test "$(git rev-parse "$RELEASE_TAG^{}")" = "$EVENT_SHA"
+        test "$(git tag --points-at "$EVENT_SHA" --list "$RELEASE_TAG")" = "$RELEASE_TAG"
+        git merge-base --is-ancestor "$EVENT_SHA" origin/main
     - uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
       with:
         node-version: 22.14.0
@@ -41,6 +69,10 @@ runs:
         user_config=$(npm config get userconfig)
         global_config=$(npm config get globalconfig)
         while IFS= read -r -d '' npmrc; do
+          if [[ ! -f "$npmrc" ]]; then
+            echo "npm config path is not a readable file: $npmrc" >&2
+            exit 1
+          fi
           if grep -Eiq '(^|[:/])(_auth|_authToken|_password|username)[[:space:]]*=' "$npmrc"; then
             echo "npm config contains credential material before bootstrap: $npmrc" >&2
             exit 1
@@ -51,7 +83,7 @@ runs:
             [[ -f "$global_config" ]] && printf '%s\0' "$global_config"
             find "$GITHUB_WORKSPACE" \
               \( -path '*/.git' -o -path '*/node_modules' \) -prune -o \
-              -name .npmrc -type f -print0
+              -name .npmrc -print0
           }
         )
         npm install --global npm@11.19.1 --ignore-scripts --registry=https://registry.npmjs.org/
@@ -114,6 +146,10 @@ runs:
         user_config=$(npm config get userconfig)
         global_config=$(npm config get globalconfig)
         while IFS= read -r -d '' npmrc; do
+          if [[ ! -f "$npmrc" ]]; then
+            echo "npm config path is not a readable file: $npmrc" >&2
+            exit 1
+          fi
           if grep -Eiq '(^|[:/])(_auth|_authToken|_password|username)[[:space:]]*=' "$npmrc"; then
             echo "npm config contains credential material: $npmrc" >&2
             exit 1
@@ -124,7 +160,7 @@ runs:
             [[ -f "$global_config" ]] && printf '%s\0' "$global_config"
             find "$GITHUB_WORKSPACE" \
               \( -path '*/.git' -o -path '*/node_modules' \) -prune -o \
-              -name .npmrc -type f -print0
+              -name .npmrc -print0
           }
         )
         expected_registry='https://registry.npmjs.org/'

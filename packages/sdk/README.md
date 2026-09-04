@@ -37,7 +37,7 @@ const model = wrapLanguageModel({
 
 ### Privacy
 
-PII is redacted in the SDK before bytes leave the machine. Default mode is `standard` (emails, phones, SSNs, cards, JWTs, OpenAI/Anthropic/AWS/GitHub/Slack-shaped API keys). Pass `redact: 'aggressive'` for more, `'metadata-only'` for token counts and detector verdicts only, or `'off'` to disable. Redaction is client-side and happens before the OTLP payload is serialized.
+PII is redacted in the SDK before bytes leave the machine. Default mode is `standard` (emails, phones, SSNs, cards, JWTs, Pisama/OpenAI/Anthropic/AWS/GitHub/Slack-shaped API keys). Pass `redact: 'aggressive'` for more, `'metadata-only'` for token counts and detector verdicts only, or `'off'` to disable. Redaction is client-side and happens before the OTLP payload is serialized.
 
 ```ts
 observe(model, { redact: 'metadata-only' });
