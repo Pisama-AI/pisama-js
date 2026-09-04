@@ -315,40 +315,47 @@ function clampLimit(n: number | undefined, fallback: number): number {
 
 interface PlatformTrace {
   id: string;
-  session_id?: string | null;
-  framework?: string | null;
-  status?: string | null;
-  detection_status?: string | null;
-  total_tokens?: number | null;
-  total_cost_cents?: number | null;
-  created_at?: string | null;
-  completed_at?: string | null;
-  state_count?: number | null;
-  detection_count?: number | null;
+  session_id: string;
+  framework: string;
+  status: string;
+  detection_status: string;
+  total_tokens: number;
+  total_cost_cents: number;
+  created_at: string;
+  completed_at: string | null;
+  state_count: number;
+  detection_count: number;
   detection_metadata?: Record<string, unknown> | null;
 }
 
 interface PlatformState {
   id: string;
   sequence_num: number;
-  agent_id?: string | null;
-  state_delta?: Record<string, unknown> | null;
+  agent_id: string;
+  state_delta: Record<string, unknown>;
+  state_hash: string;
   response_redacted?: string | null;
-  token_count?: number | null;
-  latency_ms?: number | null;
-  created_at?: string | null;
+  token_count: number;
+  latency_ms: number;
+  created_at: string;
   span_kind?: string | null;
   span_status?: string | null;
 }
 
 interface PlatformDetection {
-  detection_type?: string | null;
-  confidence?: number | null;
-  details?: Record<string, unknown> | null;
+  id: string;
+  trace_id: string;
+  state_id: string | null;
+  detection_type: string;
+  confidence: number;
+  method: string;
+  details: Record<string, unknown>;
+  validated: boolean;
+  false_positive: boolean | null;
   explanation?: string | null;
   suggested_action?: string | null;
   suggested_fix?: string | null;
-  created_at?: string | null;
+  created_at: string;
 }
 
 interface TracePage {
@@ -386,6 +393,150 @@ function optionalCount(
   return value;
 }
 
+function requiredCount(record: Record<string, unknown>, key: string, label: string): number {
+  const value = optionalCount(record, key, label);
+  if (value === undefined) invalidPlatformShape(`${label}.${key} is required`);
+  return value;
+}
+
+function requiredString(record: Record<string, unknown>, key: string, label: string): string {
+  const value = record[key];
+  if (typeof value !== 'string' || value.trim().length === 0) {
+    invalidPlatformShape(`${label}.${key} must be a non-empty string`);
+  }
+  return value;
+}
+
+function optionalNullableString(record: Record<string, unknown>, key: string, label: string): void {
+  const value = record[key];
+  if (value !== undefined && value !== null && typeof value !== 'string') {
+    invalidPlatformShape(`${label}.${key} must be a string or null when present`);
+  }
+}
+
+function requiredNullableString(record: Record<string, unknown>, key: string, label: string): void {
+  if (!(key in record)) invalidPlatformShape(`${label}.${key} is required`);
+  optionalNullableString(record, key, label);
+}
+
+function requiredTimestamp(record: Record<string, unknown>, key: string, label: string): string {
+  const value = requiredString(record, key, label);
+  if (!Number.isFinite(Date.parse(value))) {
+    invalidPlatformShape(`${label}.${key} must be a valid timestamp`);
+  }
+  return value;
+}
+
+function requiredNullableTimestamp(
+  record: Record<string, unknown>,
+  key: string,
+  label: string,
+): void {
+  requiredNullableString(record, key, label);
+  const value = record[key];
+  if (typeof value === 'string' && !Number.isFinite(Date.parse(value))) {
+    invalidPlatformShape(`${label}.${key} must be a valid timestamp or null`);
+  }
+}
+
+function validatePlatformTrace(
+  value: unknown,
+  label: string,
+  expectedTraceId?: string,
+): PlatformTrace {
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invalidPlatformShape(`${label} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  const id = requiredString(record, 'id', label);
+  if (expectedTraceId !== undefined && id !== expectedTraceId) {
+    invalidPlatformShape(`${label}.id does not match the requested trace`);
+  }
+  requiredString(record, 'session_id', label);
+  requiredString(record, 'framework', label);
+  requiredString(record, 'status', label);
+  const detectionStatus = requiredString(record, 'detection_status', label);
+  if (!['pending', 'running', 'partial', 'complete', 'failed'].includes(detectionStatus)) {
+    invalidPlatformShape(`${label}.detection_status is unsupported`);
+  }
+  requiredCount(record, 'total_tokens', label);
+  requiredCount(record, 'total_cost_cents', label);
+  requiredTimestamp(record, 'created_at', label);
+  requiredNullableTimestamp(record, 'completed_at', label);
+  requiredCount(record, 'state_count', label);
+  requiredCount(record, 'detection_count', label);
+  const metadata = record['detection_metadata'];
+  if (metadata !== undefined && metadata !== null) {
+    if (typeof metadata !== 'object' || Array.isArray(metadata)) {
+      invalidPlatformShape(`${label}.detection_metadata must be an object or null`);
+    }
+  }
+  return value as PlatformTrace;
+}
+
+function validatePlatformDetection(
+  value: unknown,
+  index: number,
+  expectedTraceId: string,
+): PlatformDetection {
+  const label = `detection page items[${index}]`;
+  if (typeof value !== 'object' || value === null || Array.isArray(value)) {
+    invalidPlatformShape(`${label} must be an object`);
+  }
+  const record = value as Record<string, unknown>;
+  requiredString(record, 'id', label);
+  if (requiredString(record, 'trace_id', label) !== expectedTraceId) {
+    invalidPlatformShape(`${label}.trace_id does not match the requested trace`);
+  }
+  requiredNullableString(record, 'state_id', label);
+  requiredString(record, 'detection_type', label);
+  const confidence = requiredCount(record, 'confidence', label);
+  if (confidence > 100) invalidPlatformShape(`${label}.confidence must be at most 100`);
+  requiredString(record, 'method', label);
+  const details = record['details'];
+  if (typeof details !== 'object' || details === null || Array.isArray(details)) {
+    invalidPlatformShape(`${label}.details must be an object`);
+  }
+  if (typeof record['validated'] !== 'boolean') {
+    invalidPlatformShape(`${label}.validated must be a boolean`);
+  }
+  const falsePositive = record['false_positive'];
+  if (falsePositive !== null && typeof falsePositive !== 'boolean') {
+    invalidPlatformShape(`${label}.false_positive must be a boolean or null`);
+  }
+  requiredTimestamp(record, 'created_at', label);
+  for (const field of ['explanation', 'suggested_action', 'suggested_fix'] as const) {
+    optionalNullableString(record, field, label);
+  }
+  return value as PlatformDetection;
+}
+
+function validatePlatformStates(value: unknown): PlatformState[] {
+  if (!Array.isArray(value)) invalidPlatformShape('trace states must be an array');
+  return value.map((state, index) => {
+    const label = `trace states[${index}]`;
+    if (typeof state !== 'object' || state === null || Array.isArray(state)) {
+      invalidPlatformShape(`${label} must be an object`);
+    }
+    const record = state as Record<string, unknown>;
+    requiredString(record, 'id', label);
+    requiredCount(record, 'sequence_num', label);
+    requiredString(record, 'agent_id', label);
+    const delta = record['state_delta'];
+    if (typeof delta !== 'object' || delta === null || Array.isArray(delta)) {
+      invalidPlatformShape(`${label}.state_delta must be an object`);
+    }
+    requiredString(record, 'state_hash', label);
+    optionalNullableString(record, 'response_redacted', label);
+    requiredCount(record, 'token_count', label);
+    requiredCount(record, 'latency_ms', label);
+    requiredTimestamp(record, 'created_at', label);
+    optionalNullableString(record, 'span_kind', label);
+    optionalNullableString(record, 'span_status', label);
+    return state as PlatformState;
+  });
+}
+
 function validateTracePage(value: unknown): TracePage {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     invalidPlatformShape('trace page must be an object');
@@ -394,20 +545,13 @@ function validateTracePage(value: unknown): TracePage {
   if (!Array.isArray(record['traces'])) {
     invalidPlatformShape('trace page traces must be an array');
   }
-  const traces = record['traces'].map((trace, index) => {
-    if (typeof trace !== 'object' || trace === null || Array.isArray(trace)) {
-      invalidPlatformShape(`trace page traces[${index}] must be an object`);
-    }
-    const id = (trace as Record<string, unknown>)['id'];
-    if (typeof id !== 'string' || id.trim().length === 0) {
-      invalidPlatformShape(`trace page traces[${index}].id must be a non-empty string`);
-    }
-    return trace as PlatformTrace;
-  });
+  const traces = record['traces'].map((trace, index) =>
+    validatePlatformTrace(trace, `trace page traces[${index}]`),
+  );
   return { traces, total: optionalCount(record, 'total', 'trace page') };
 }
 
-function validateDetectionPage(value: unknown): DetectionPage {
+function validateDetectionPage(value: unknown, expectedTraceId: string): DetectionPage {
   if (typeof value !== 'object' || value === null || Array.isArray(value)) {
     invalidPlatformShape('detection page must be an object');
   }
@@ -415,12 +559,9 @@ function validateDetectionPage(value: unknown): DetectionPage {
   if (!Array.isArray(record['items'])) {
     invalidPlatformShape('detection page items must be an array');
   }
-  const items = record['items'].map((item, index) => {
-    if (typeof item !== 'object' || item === null || Array.isArray(item)) {
-      invalidPlatformShape(`detection page items[${index}] must be an object`);
-    }
-    return item as PlatformDetection;
-  });
+  const items = record['items'].map((item, index) =>
+    validatePlatformDetection(item, index, expectedTraceId),
+  );
   return {
     items,
     total: optionalCount(record, 'total', 'detection page'),
@@ -495,7 +636,7 @@ async function fetchDetections(
     url.searchParams.set('trace_id', traceId);
     url.searchParams.set('page', String(page));
     url.searchParams.set('per_page', String(perPage));
-    const result = validateDetectionPage(await platformJson<unknown>(auth, url));
+    const result = validateDetectionPage(await platformJson<unknown>(auth, url), traceId);
     const batch = result.items;
     if (typeof result.total === 'number' && Number.isFinite(result.total)) {
       reportedTotal = Math.max(0, Math.floor(result.total));
@@ -609,15 +750,19 @@ async function fetchTrace(
   traceId: string,
 ): Promise<TraceWithHits> {
   const traceUrl = tenantApiUrl(baseUrl, tenantId, `traces/${encodeURIComponent(traceId)}`);
-  const trace = await platformJson<PlatformTrace>(auth, traceUrl);
+  const trace = validatePlatformTrace(
+    await platformJson<unknown>(auth, traceUrl),
+    'trace response',
+    traceId,
+  );
   const statesUrl = tenantApiUrl(baseUrl, tenantId, `traces/${encodeURIComponent(traceId)}/states`);
   statesUrl.searchParams.set('full_state', 'true');
   statesUrl.searchParams.set('limit', '2000');
   const [states, detections] = await Promise.all([
-    platformJson<PlatformState[]>(auth, statesUrl),
+    platformJson<unknown>(auth, statesUrl).then(validatePlatformStates),
     fetchDetections(auth, baseUrl, tenantId, traceId),
   ]);
-  return adaptPlatformTrace(trace, detections, Array.isArray(states) ? states : []);
+  return adaptPlatformTrace(trace, detections, states);
 }
 
 const PROMPT_KEYS = [

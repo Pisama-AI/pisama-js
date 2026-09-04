@@ -136,6 +136,59 @@ function respond(response: ServerResponse, status: number, body: unknown): void 
   response.end(JSON.stringify(body));
 }
 
+function platformTrace(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'trace-default',
+    session_id: 'session-default',
+    framework: 'langgraph',
+    status: 'completed',
+    detection_status: 'complete',
+    total_tokens: 0,
+    total_cost_cents: 0,
+    created_at: '2026-09-04T12:00:00Z',
+    completed_at: null,
+    state_count: 0,
+    detection_count: 0,
+    ...overrides,
+  };
+}
+
+function platformDetection(
+  traceId: string,
+  overrides: Record<string, unknown> = {},
+): Record<string, unknown> {
+  return {
+    id: `detection-${traceId}`,
+    trace_id: traceId,
+    state_id: null,
+    detection_type: 'loop',
+    confidence: 80,
+    method: 'heuristic',
+    details: {},
+    validated: false,
+    false_positive: null,
+    created_at: '2026-09-04T12:00:00Z',
+    ...overrides,
+  };
+}
+
+function platformState(overrides: Record<string, unknown> = {}): Record<string, unknown> {
+  return {
+    id: 'state-default',
+    sequence_num: 0,
+    agent_id: 'agent',
+    state_delta: {},
+    state_hash: 'state-hash',
+    response_redacted: null,
+    token_count: 0,
+    latency_ms: 0,
+    created_at: '2026-09-04T12:00:00Z',
+    span_kind: null,
+    span_status: null,
+    ...overrides,
+  };
+}
+
 async function withHttpServer<T>(
   handler: (request: IncomingMessage, response: ServerResponse) => void | Promise<void>,
   run: (baseUrl: string) => Promise<T>,
@@ -303,7 +356,7 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
         }
         respond(response, 200, {
           traces: [
-            {
+            platformTrace({
               id: traceId,
               session_id: 'session-1',
               framework: 'vercel-ai-sdk',
@@ -315,7 +368,7 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
               completed_at: '2026-09-04T12:00:01Z',
               detection_count: 1,
               state_count: 1,
-            },
+            }),
           ],
           total: 1,
           page: 1,
@@ -328,13 +381,13 @@ test('mcp: executable exchanges the raw key and reads current tenant routes with
         assert.equal(url.searchParams.get('page'), '1');
         respond(response, 200, {
           items: [
-            {
+            platformDetection(traceId, {
               detection_type: 'loop',
               confidence: 80,
               details: { repeated: 4 },
               explanation: 'Repeated the same tool.',
               suggested_fix: 'Bound retries.',
-            },
+            }),
           ],
           total: 1,
           page: 1,
@@ -390,26 +443,30 @@ test('mcp: get_trace uses exact authenticated trace, states, and detections rout
       seenPaths.push(`${url.pathname}${url.search}`);
       assert.match(request.headers.authorization ?? '', /^Bearer test\./);
       if (url.pathname.endsWith(`/traces/${traceId}`)) {
-        respond(response, 200, {
-          id: traceId,
-          session_id: 'session-detail',
-          framework: 'langgraph',
-          status: 'completed',
-          detection_status: 'partial',
-          total_tokens: 10,
-          total_cost_cents: 1,
-          created_at: '2026-09-04T12:00:00Z',
-          completed_at: '2026-09-04T12:00:01Z',
-          detection_count: 1,
-          state_count: 1,
-        });
+        respond(
+          response,
+          200,
+          platformTrace({
+            id: traceId,
+            session_id: 'session-detail',
+            framework: 'langgraph',
+            status: 'completed',
+            detection_status: 'partial',
+            total_tokens: 10,
+            total_cost_cents: 1,
+            created_at: '2026-09-04T12:00:00Z',
+            completed_at: '2026-09-04T12:00:01Z',
+            detection_count: 1,
+            state_count: 1,
+          }),
+        );
         return;
       }
       if (url.pathname.endsWith(`/traces/${traceId}/states`)) {
         assert.equal(url.searchParams.get('full_state'), 'true');
         assert.equal(url.searchParams.get('limit'), '2000');
         respond(response, 200, [
-          {
+          platformState({
             id: '33333333-3333-4333-8333-333333333333',
             sequence_num: 0,
             agent_id: 'agent',
@@ -420,7 +477,7 @@ test('mcp: get_trace uses exact authenticated trace, states, and detections rout
             created_at: '2026-09-04T12:00:00Z',
             span_kind: 'internal',
             span_status: 'ok',
-          },
+          }),
         ]);
         return;
       }
@@ -527,15 +584,17 @@ test('mcp: recent failures scan later trace pages and omit hidden-only detection
         assert.equal(url.searchParams.get('per_page'), '100');
         if (page === 1) {
           respond(response, 200, {
-            traces: Array.from({ length: 100 }, (_, index) => ({
-              id: index === 0 ? hiddenTraceId : `clean-${index}`,
-              framework: 'langgraph',
-              status: 'completed',
-              detection_status: 'complete',
-              total_tokens: index,
-              created_at: '2026-09-04T12:00:00Z',
-              detection_count: index === 0 ? 1 : 0,
-            })),
+            traces: Array.from({ length: 100 }, (_, index) =>
+              platformTrace({
+                id: index === 0 ? hiddenTraceId : `clean-${index}`,
+                framework: 'langgraph',
+                status: 'completed',
+                detection_status: 'complete',
+                total_tokens: index,
+                created_at: '2026-09-04T12:00:00Z',
+                detection_count: index === 0 ? 1 : 0,
+              }),
+            ),
             total: 101,
             page: 1,
             per_page: 100,
@@ -544,7 +603,7 @@ test('mcp: recent failures scan later trace pages and omit hidden-only detection
         }
         respond(response, 200, {
           traces: [
-            {
+            platformTrace({
               id: visibleTraceId,
               framework: 'crewai',
               status: 'failed',
@@ -552,7 +611,7 @@ test('mcp: recent failures scan later trace pages and omit hidden-only detection
               total_tokens: 21,
               created_at: '2026-09-04T11:00:00Z',
               detection_count: 1,
-            },
+            }),
           ],
           total: 101,
           page: 2,
@@ -569,11 +628,11 @@ test('mcp: recent failures scan later trace pages and omit hidden-only detection
           assert.equal(traceId, visibleTraceId);
           respond(response, 200, {
             items: [
-              {
+              platformDetection(visibleTraceId, {
                 detection_type: 'loop',
                 confidence: 90,
                 explanation: 'Visible loop.',
-              },
+              }),
             ],
             total: 1,
             page: 1,
@@ -636,13 +695,15 @@ test('mcp: a full trace page without total continues until a short page', async 
         tracePages.push(page);
         if (page === 1) {
           respond(response, 200, {
-            traces: Array.from({ length: 100 }, (_, index) => ({
-              id: `unknown-total-clean-${index}`,
-              status: 'completed',
-              detection_status: 'complete',
-              created_at: '2026-09-04T12:00:00Z',
-              detection_count: 0,
-            })),
+            traces: Array.from({ length: 100 }, (_, index) =>
+              platformTrace({
+                id: `unknown-total-clean-${index}`,
+                status: 'completed',
+                detection_status: 'complete',
+                created_at: '2026-09-04T12:00:00Z',
+                detection_count: 0,
+              }),
+            ),
             page: 1,
             per_page: 100,
           });
@@ -650,13 +711,13 @@ test('mcp: a full trace page without total continues until a short page', async 
         }
         respond(response, 200, {
           traces: [
-            {
+            platformTrace({
               id: visibleTraceId,
               status: 'failed',
               detection_status: 'complete',
               created_at: '2026-09-04T11:00:00Z',
               detection_count: 1,
-            },
+            }),
           ],
           page: 2,
           per_page: 100,
@@ -666,11 +727,11 @@ test('mcp: a full trace page without total continues until a short page', async 
       if (url.pathname === '/api/v1/tenants/tenant-mcp-1/detections') {
         respond(response, 200, {
           items: [
-            {
+            platformDetection(visibleTraceId, {
               detection_type: 'coordination',
               confidence: 90,
               explanation: 'Visible later-page failure.',
-            },
+            }),
           ],
           page: 1,
           per_page: 100,
@@ -719,16 +780,20 @@ test('mcp: malformed trace and detection pages fail closed', async () => {
       tracePage: { traces: [], total: '1' },
     },
     {
+      name: 'sparse trace row',
+      tracePage: { traces: [{ id: 'sparse-trace' }], total: 1 },
+    },
+    {
       name: 'non-array detections',
       tracePage: {
         traces: [
-          {
+          platformTrace({
             id: 'malformed-detection-page',
             status: 'failed',
             detection_status: 'complete',
             created_at: '2026-09-04T12:00:00Z',
             detection_count: 1,
-          },
+          }),
         ],
         total: 1,
       },
@@ -738,17 +803,31 @@ test('mcp: malformed trace and detection pages fail closed', async () => {
       name: 'invalid detection total',
       tracePage: {
         traces: [
-          {
+          platformTrace({
             id: 'invalid-detection-total',
             status: 'failed',
             detection_status: 'complete',
             created_at: '2026-09-04T12:00:00Z',
             detection_count: 1,
-          },
+          }),
         ],
         total: 1,
       },
       detectionPage: { items: [], total: -1 },
+    },
+    {
+      name: 'sparse detection row',
+      tracePage: {
+        traces: [
+          platformTrace({
+            id: 'sparse-detection-row',
+            status: 'failed',
+            detection_count: 1,
+          }),
+        ],
+        total: 1,
+      },
+      detectionPage: { items: [{ detection_type: 'loop' }], total: 1 },
     },
   ];
 
@@ -793,6 +872,76 @@ test('mcp: malformed trace and detection pages fail closed', async () => {
   }
 });
 
+test('mcp: get_trace rejects mismatched traces and malformed states', async () => {
+  const traceId = '55555555-5555-4555-8555-555555555555';
+  const cases: Array<{ name: string; trace: unknown; states: unknown }> = [
+    {
+      name: 'mismatched trace ID',
+      trace: platformTrace({ id: 'another-trace' }),
+      states: [],
+    },
+    {
+      name: 'sparse trace response',
+      trace: { id: traceId },
+      states: [],
+    },
+    {
+      name: 'non-array states response',
+      trace: platformTrace({ id: traceId }),
+      states: { items: [] },
+    },
+    {
+      name: 'sparse state row',
+      trace: platformTrace({ id: traceId, state_count: 1 }),
+      states: [{ id: 'sparse-state' }],
+    },
+  ];
+
+  for (const entry of cases) {
+    await withHttpServer(
+      async (request, response) => {
+        const url = new URL(request.url ?? '/', 'http://test');
+        if (url.pathname === '/api/v1/auth/token') {
+          respond(response, 200, { access_token: jwt('read', 1) });
+          return;
+        }
+        if (url.pathname.endsWith(`/traces/${traceId}`)) {
+          respond(response, 200, entry.trace);
+          return;
+        }
+        if (url.pathname.endsWith(`/traces/${traceId}/states`)) {
+          respond(response, 200, entry.states);
+          return;
+        }
+        if (url.pathname.endsWith('/detections')) {
+          respond(response, 200, { items: [], total: 0, page: 1, per_page: 100 });
+          return;
+        }
+        respond(response, 404, { detail: 'not found' });
+      },
+      async (baseUrl) => {
+        const response = await rpcCall(
+          {
+            id: 27,
+            method: 'tools/call',
+            params: { name: 'get_trace', arguments: { traceId } },
+          },
+          5000,
+          { apiKey: 'pisama_key', baseUrl },
+        );
+        const result = response.result as {
+          isError?: boolean;
+          content?: Array<{ text?: string }>;
+          structuredContent?: { error?: { code?: string } };
+        };
+        assert.equal(result.isError, true, `${entry.name}: ${JSON.stringify(response)}`);
+        assert.equal(result.structuredContent?.error?.code, 'upstream_error');
+        assert.match(result.content?.[0]?.text ?? '', /invalid response/i);
+      },
+    );
+  }
+});
+
 test('mcp: a trace with only filtered detections is never rendered as clean', async () => {
   const traceId = 'hidden-only-trace';
   await withHttpServer(
@@ -805,14 +954,14 @@ test('mcp: a trace with only filtered detections is never rendered as clean', as
       if (url.pathname === '/api/v1/tenants/tenant-mcp-1/traces') {
         respond(response, 200, {
           traces: [
-            {
+            platformTrace({
               id: traceId,
               framework: 'n8n',
               status: 'completed',
               detection_status: 'complete',
               created_at: '2026-09-04T12:00:00Z',
               detection_count: 2,
-            },
+            }),
           ],
           total: 1,
           page: 1,
@@ -855,15 +1004,19 @@ test('mcp: exact trace paginates visible detections and marks the response cap',
         return;
       }
       if (url.pathname.endsWith(`/traces/${traceId}`)) {
-        respond(response, 200, {
-          id: traceId,
-          framework: 'openai-agents',
-          status: 'completed',
-          detection_status: 'complete',
-          created_at: '2026-09-04T12:00:00Z',
-          detection_count: 501,
-          state_count: 0,
-        });
+        respond(
+          response,
+          200,
+          platformTrace({
+            id: traceId,
+            framework: 'openai-agents',
+            status: 'completed',
+            detection_status: 'complete',
+            created_at: '2026-09-04T12:00:00Z',
+            detection_count: 501,
+            state_count: 0,
+          }),
+        );
         return;
       }
       if (url.pathname.endsWith(`/traces/${traceId}/states`)) {
@@ -875,11 +1028,14 @@ test('mcp: exact trace paginates visible detections and marks the response cap',
         detectionPages.push(page);
         assert.equal(url.searchParams.get('per_page'), '100');
         respond(response, 200, {
-          items: Array.from({ length: 100 }, (_, index) => ({
-            detection_type: `detector-${page}-${index}`,
-            confidence: 80,
-            explanation: `Detection ${page}-${index}`,
-          })),
+          items: Array.from({ length: 100 }, (_, index) =>
+            platformDetection(traceId, {
+              id: `detection-${page}-${index}`,
+              detection_type: `detector-${page}-${index}`,
+              confidence: 80,
+              explanation: `Detection ${page}-${index}`,
+            }),
+          ),
           total: 501,
           page,
           per_page: 100,
