@@ -62,3 +62,20 @@ The staged-publish jobs require a GitHub-hosted runner, OIDC `id-token: write`,
 Node.js 22.14.0, and npm 11.19.1. They reject npm credentials and registry
 redirection. npm stage approval, deprecation, DNS changes, and repository
 archival are separate permission gates.
+
+## Canonical artifact compression
+
+The packed-consumer gate preserves the entire uncompressed tar stream and
+canonicalizes gzip encoding before installation, auditing, or digest checks.
+It uses Python's standard zlib at level 6, a zero timestamp, no filename, and
+fixed gzip OS byte 19 from the reviewed archives (metadata only, not a target
+platform restriction). Node's bundled zlib can produce different compressed
+bytes from identical content, including on the pinned Linux release runtime.
+
+The preparation action pins Python 3.11.13. Local verification needs Python 3
+with standard zlib. Real-file tests cover content preservation, idempotence,
+changed-content digest rejection, malformed input, symlinks, and size limits.
+This step does not unpack or alter package members. It does not bypass the
+independently supplied expected SHA-256: a changed compressor or tar stream
+still stops the release on any mismatch. Never update an approved digest just
+to accommodate unexplained build drift.

@@ -51,6 +51,15 @@ for (const [filename, packageName, packageDir, tagPrefix] of releases) {
 const prepare = readFileSync('.github/actions/prepare-npm-stage/action.yml', 'utf8');
 const stage = readFileSync('.github/actions/stage-npm-package/action.yml', 'utf8');
 const runbook = readFileSync('RELEASING.md', 'utf8');
+const packedConsumer = readFileSync('scripts/verify-packed-consumer.sh', 'utf8');
+expectCount(prepare, "python-version: '3.11.13'", 1, 'prepare action');
+expectCount(packedConsumer, 'python3 scripts/test_canonicalize_npm_archive.py', 1, 'packed gate');
+expectCount(
+  packedConsumer,
+  'python3 scripts/canonicalize-npm-archive.py "$release_dir"/*.tgz',
+  1,
+  'packed gate',
+);
 for (const [label, source] of [
   ['prepare action', prepare],
   ['stage action', stage],

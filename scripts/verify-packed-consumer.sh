@@ -33,6 +33,11 @@ pnpm --dir packages/whoopsie-detectors pack --pack-destination "$release_dir"
 pnpm --dir packages/whoopsie-sdk pack --pack-destination "$release_dir"
 pnpm --dir packages/whoopsie-cli pack --pack-destination "$release_dir"
 
+# Keep the exact tar stream while making gzip bytes independent of Node's
+# bundled zlib. Digest verification later still binds every package byte.
+python3 scripts/test_canonicalize_npm_archive.py
+python3 scripts/canonicalize-npm-archive.py "$release_dir"/*.tgz
+
 expected_cli_version=$(node -p "require('./packages/cli/package.json').version")
 AUDIT_CLI_ARTIFACT="${AUDIT_PACKED_CONSUMER:-0}" \
   ./scripts/verify-cli-artifact.sh \
