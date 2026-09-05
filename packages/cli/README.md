@@ -6,12 +6,12 @@ trajectories, and expose failure data to MCP clients.
 Requires Node.js 20 or newer. You can run every command through `npx` without
 a global install.
 
-| Command                  | Purpose                                  | Network behavior                                           |
-| ------------------------ | ---------------------------------------- | ---------------------------------------------------------- |
-| `pisama-ts init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set      |
-| `pisama-ts verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API |
+| Command                  | Purpose                                  | Network behavior                                                         |
+| ------------------------ | ---------------------------------------- | ------------------------------------------------------------------------ |
+| `pisama-ts init`         | Patch a Next.js and AI SDK project       | Opens the project dashboard unless `--no-open` is set                    |
+| `pisama-ts verify`       | Prove ingestion and dashboard visibility | Sends a generated verification trace to the configured API               |
 | `pisama-ts analyze-atif` | Analyze Harbor ATIF trajectories         | Sends trajectory content to the configured API (or none, with `--local`) |
-| `pisama-ts mcp`          | Expose Pisama failures to an MCP client  | Reads authenticated tenant trace data from the configured API |
+| `pisama-ts mcp`          | Expose Pisama failures to an MCP client  | Reads authenticated tenant trace data from the configured API            |
 
 The `pisama` and `pisama-ts` commands are equivalent starting in version
 0.10.3. The registry-backed examples use `pisama-ts` so they also work with
@@ -97,27 +97,48 @@ output directory:
 npx --yes --package=@pisama/cli@latest -- pisama-ts analyze-atif ./harbor-output
 ```
 
-The command accepts ATIF v1.0 through v1.7 and checks the declared schema
-version in both modes below. It prints detector evidence and exits with code
-1 when a high-severity finding is present, making it suitable for CI gates.
+The command accepts ATIF v1.0 through v1.7 and checks any explicit schema
+version in both modes below. Matching the backend model, an omitted version is
+set to ATIF-v1.7 in memory; explicit null, empty, or unknown values are rejected.
+The source file is never changed. It prints detector evidence and exits with
+code 1 when a high-severity finding is present, making it suitable for CI gates.
 
 - **Default**: sends each trajectory to Pisama's `/api/v1/atif/analyze`
   endpoint, which runs the full calibrated backend detector suite (and
   supports `--apply` healing). Requires network access and `PISAMA_API_KEY`.
   The key is exchanged for a read-scoped JWT, or a full-scoped JWT when you
   explicitly pass `--apply`; it is never sent as bearer auth. A 401 causes at
-  most one token re-exchange and exact request retry. Hosted inputs must carry
-  a non-empty `session_id` or `trajectory_id`; the command derives the same
-  deterministic trace ID as the backend and rejects a response whose trace,
-  schema, session, trajectory, or unresolved-topology identity does not match
-  the submitted source. Anonymous ATIF documents remain available in
-  `--local` mode.
+  most one token re-exchange and exact request retry. The command rejects a
+  response whose trace, schema, session, trajectory, or unresolved-topology
+  identity does not match the submitted source. For an anonymous document
+  (both identity fields absent, null, or empty), the CLI adds a deterministic
+  `pisama-anonymous-…` trajectory ID to the in-memory request clone only. That
+  ID is a domain-separated full SHA-256 of the original UTF-8 file bytes: the
+  same bytes are idempotent, while a content or formatting change intentionally
+  gets a different ID. The file on disk is never changed. This CLI-assigned
+  byte identity intentionally differs from the backend's canonical-step
+  identity when an anonymous document is posted directly without the CLI.
+  Across a multi-file selection, a server-unresolved file-backed trajectory
+  reference is reconciled only when its canonical target was also selected and
+  submitted; an ID-only, missing, absolute, or escaping reference remains
+  incomplete and makes the command exit 1.
 - **`--local`**: runs `@pisama/detectors`' v1 pack (loop, repetition, cost,
   completion, hallucination, context, derailment) in-process. No network
   call, no API key, and no `--apply` — it's a simplified subset of the
   backend's suite, the same one `@pisama/detectors` documents itself as, not
   a replacement for it. `@pisama/cli` depends on `@pisama/detectors`
-  directly, so this works with no separate install.
+  directly, so this works with no separate install. The CLI validates the
+  projection fields and flattens ATIF multimodal content using the backend's
+  text/image convention before detection. Any local detector exception makes
+  the result incomplete and the command exits 1; it is never reported clean.
+  File-backed continuation and subagent references are complete only when the
+  canonical target is also in the selected trajectory set. Missing, escaping,
+  or ID-only references remain incomplete. Embedded `subagent_trajectories`
+  require hosted analysis because the simplified local projection does not
+  recursively analyze them; local mode exits 1 instead of calling them clean.
+  Local trace attribution uses the same session-first, continuation-normalized
+  identity order as hosted analysis, including the byte-derived fallback for
+  anonymous files.
 
 ```bash
 npx --yes --package=@pisama/cli@latest -- pisama-ts analyze-atif ./harbor-output --local
@@ -151,8 +172,7 @@ machine entirely, at the cost of the backend's full calibrated suite.
 Runs an MCP server over stdio so any MCP-compatible AI assistant can read your
 tenant's failures inline. The server exchanges `PISAMA_API_KEY` for a
 read-scoped JWT and uses the authenticated tenant API. The raw key is never a
-bearer token, and each protected request re-exchanges at most once after a
-401. The server exposes three read-only tools:
+bearer token, and each protected request re-exchanges at most once after a 401. The server exposes three read-only tools:
 
 - `get_recent_failures(limit?)`: recent traces that fired any detector
 - `get_recent_traces(limit?)`: recent traces, regardless of failure status

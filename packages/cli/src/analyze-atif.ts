@@ -20,15 +20,16 @@
 //     (see packages/detectors/README.md), not a replacement for the backend's
 //     calibrated suite.
 // Both modes render a per-trajectory summary and exit non-zero when any
-// critical/high-severity detection fires, detector coverage is incomplete, or
-// a requested fix is absent/failed/rolled back so the command is CI-friendly.
+// critical/high-severity detection fires, detector coverage or trajectory
+// topology is incomplete, or a requested fix is absent/failed/rolled back so
+// the command is CI-friendly.
 
 import { readFile, readdir, realpath, stat } from 'node:fs/promises';
 import { createHash } from 'node:crypto';
 import { join, resolve, basename, dirname, isAbsolute, relative, sep, win32 } from 'node:path';
 import kleur from 'kleur';
 import { nanoid } from 'nanoid';
-import { runDetectors, v1Detectors, type AgentTrace, type ToolEvent } from '@pisama/detectors';
+import { v1Detectors, type AgentTrace, type ToolEvent } from '@pisama/detectors';
 import type { DetectionResult as LocalDetectionResult } from '@pisama/detectors';
 import { PlatformAuth, type TokenScope } from './platform-auth.js';
 
@@ -49,6 +50,8 @@ export interface AnalyzeAtifOptions {
 const DEFAULT_BASE = 'https://api.pisama.ai';
 const MAX_CONTINUATION_SEGMENTS = 128;
 const MAX_TRAJECTORY_FILES = 1_000;
+const ISO_ATIF_TIMESTAMP =
+  /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2})(?:\.\d+)?)?(?:Z|([+-])(\d{2}):(\d{2}))?$/;
 
 // Match the schema_version values supported by Pisama's vendored ATIF
 // Pydantic models (backend/app/ingestion/atif_models.py). Keep these in
@@ -145,29 +148,36 @@ interface AtifStepMetrics {
   cost_usd?: number;
 }
 
+interface AtifContentPart {
+  type?: string;
+  text?: string | null;
+  source?: { media_type?: string; path?: string } | null;
+}
+
 interface AtifStep {
   step_id?: number;
-  timestamp?: string;
+  timestamp?: string | null;
   source?: string;
-  message?: string;
-  model_name?: string;
+  message?: string | AtifContentPart[];
+  model_name?: string | null;
   tool_calls?: AtifToolCall[];
   observation?: { results?: AtifObservationResult[] };
   metrics?: AtifStepMetrics;
 }
 
 interface AtifTrajectory {
-  schema_version?: string;
-  session_id?: string;
-  trajectory_id?: string;
-  continued_trajectory_ref?: string;
-  agent?: { model_name?: string };
+  schema_version?: string | null;
+  session_id?: string | null;
+  trajectory_id?: string | null;
+  continued_trajectory_ref?: string | null;
+  agent?: { name?: string; version?: string; model_name?: string | null };
   steps?: AtifStep[];
+  subagent_trajectories?: unknown[] | null;
   final_metrics?: {
-    total_prompt_tokens?: number;
-    total_completion_tokens?: number;
-    total_cost_usd?: number;
-  };
+    total_prompt_tokens?: number | null;
+    total_completion_tokens?: number | null;
+    total_cost_usd?: number | null;
+  } | null;
 }
 
 interface HostedSourceIdentity {
@@ -175,6 +185,29 @@ interface HostedSourceIdentity {
   schemaVersion: string;
   sessionId: string | null;
   trajectoryId: string | null;
+}
+
+interface LoadedTrajectory {
+  source: AtifTrajectory;
+  submitted: AtifTrajectory;
+  traceId: string;
+  identity?: HostedSourceIdentity;
+}
+
+function anonymousTrajectoryId(raw: Uint8Array): string {
+  return `pisama-anonymous-${createHash('sha256')
+    .update('pisama:atif:anonymous-source:v1\0', 'utf8')
+    .update(raw)
+    .digest('hex')}`;
+}
+
+function explicitTraceKey(trajectory: AtifTrajectory): string | undefined {
+  if (trajectory.session_id) return trajectory.session_id.replace(/-cont-\d+$/, '');
+  return trajectory.trajectory_id || undefined;
+}
+
+function traceIdFromKey(key: string): string {
+  return createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 32);
 }
 
 function parseTrajectory(file: string, raw: string): AtifTrajectory {
@@ -190,7 +223,7 @@ function parseTrajectory(file: string, raw: string): AtifTrajectory {
   }
   const trajectory = parsed as AtifTrajectory;
 
-  const version = trajectory.schema_version;
+  const version = trajectory.schema_version === undefined ? 'ATIF-v1.7' : trajectory.schema_version;
   if (!version || !SUPPORTED_SCHEMA_VERSIONS.has(version)) {
     fail(
       `${basename(file)}: unsupported schema_version ${kleur.red(
@@ -198,10 +231,363 @@ function parseTrajectory(file: string, raw: string): AtifTrajectory {
       )}. Expected one of: ${[...SUPPORTED_SCHEMA_VERSIONS].join(', ')}`,
     );
   }
-  return trajectory;
+  return trajectory.schema_version === undefined
+    ? { ...trajectory, schema_version: version }
+    : trajectory;
 }
 
-function hostedSourceIdentity(file: string, trajectory: AtifTrajectory): HostedSourceIdentity {
+function decodeUtf8(file: string, bytes: Buffer): string {
+  try {
+    return new TextDecoder('utf-8', { fatal: true, ignoreBOM: true }).decode(bytes);
+  } catch {
+    fail(`${basename(file)}: trajectory file is not valid UTF-8`);
+  }
+}
+
+function localInputError(file: string, detail: string): never {
+  fail(`${basename(file)}: invalid ATIF trajectory for --local (${detail})`);
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return typeof value === 'object' && value !== null && !Array.isArray(value);
+}
+
+function isSupportedIsoTimestamp(value: string): boolean {
+  const match = ISO_ATIF_TIMESTAMP.exec(value);
+  if (!match) return false;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const hour = Number(match[4]);
+  const minute = Number(match[5]);
+  const second = Number(match[6] ?? '0');
+  const offsetHour = Number(match[8] ?? '0');
+  const offsetMinute = Number(match[9] ?? '0');
+  const daysInMonth = new Date(Date.UTC(year, month, 0)).getUTCDate();
+  return (
+    year >= 1 &&
+    month >= 1 &&
+    month <= 12 &&
+    day >= 1 &&
+    day <= daysInMonth &&
+    hour <= 23 &&
+    minute <= 59 &&
+    second <= 59 &&
+    offsetHour <= 23 &&
+    offsetMinute <= 59 &&
+    !Number.isNaN(Date.parse(value))
+  );
+}
+
+function validateContentParts(file: string, value: unknown, label: string): void {
+  if (typeof value === 'string') return;
+  if (!Array.isArray(value)) localInputError(file, `${label} must be a string or content array`);
+  for (const [index, item] of value.entries()) {
+    if (!isRecord(item)) localInputError(file, `${label}[${index}] must be an object`);
+    if (item['type'] === 'text') {
+      if (typeof item['text'] !== 'string' || (item['source'] ?? null) !== null) {
+        localInputError(file, `${label}[${index}] is not a valid text content part`);
+      }
+      continue;
+    }
+    if (item['type'] === 'image') {
+      const source = item['source'];
+      if (
+        !isRecord(source) ||
+        !['image/jpeg', 'image/png', 'image/gif', 'image/webp'].includes(
+          String(source['media_type']),
+        ) ||
+        typeof source['path'] !== 'string' ||
+        (item['text'] ?? null) !== null
+      ) {
+        localInputError(file, `${label}[${index}] is not a valid image content part`);
+      }
+      continue;
+    }
+    localInputError(file, `${label}[${index}].type must be text or image`);
+  }
+}
+
+function validateToolCalls(file: string, value: unknown, index: number): Set<string> {
+  const toolCallIds = new Set<string>();
+  if (value === undefined || value === null) return toolCallIds;
+  if (!Array.isArray(value)) {
+    localInputError(file, `steps[${index}].tool_calls must be an array`);
+  }
+  for (const [toolIndex, tool] of value.entries()) {
+    if (
+      !isRecord(tool) ||
+      typeof tool['tool_call_id'] !== 'string' ||
+      typeof tool['function_name'] !== 'string' ||
+      !isRecord(tool['arguments'])
+    ) {
+      localInputError(file, `steps[${index}].tool_calls[${toolIndex}] is invalid`);
+    }
+    toolCallIds.add(tool['tool_call_id']);
+  }
+  return toolCallIds;
+}
+
+function validateSubagentReferences(file: string, value: unknown, label: string): void {
+  if (value === undefined || value === null) return;
+  if (!Array.isArray(value)) localInputError(file, `${label} must be an array or null`);
+  for (const [index, reference] of value.entries()) {
+    if (!isRecord(reference)) localInputError(file, `${label}[${index}] must be an object`);
+    const trajectoryId = reference['trajectory_id'];
+    const trajectoryPath = reference['trajectory_path'];
+    for (const [key, candidate] of [
+      ['trajectory_id', trajectoryId],
+      ['trajectory_path', trajectoryPath],
+    ] as const) {
+      if (
+        candidate !== undefined &&
+        candidate !== null &&
+        (typeof candidate !== 'string' || candidate.trim().length === 0)
+      ) {
+        localInputError(file, `${label}[${index}].${key} must be a non-empty string or null`);
+      }
+    }
+    if (!trajectoryId && !trajectoryPath) {
+      localInputError(file, `${label}[${index}] must have trajectory_id or trajectory_path`);
+    }
+  }
+}
+
+function validateObservation(
+  file: string,
+  value: unknown,
+  index: number,
+  toolCallIds: Set<string>,
+): void {
+  if (value === undefined || value === null) return;
+  if (!isRecord(value) || !Array.isArray(value['results'])) {
+    localInputError(file, `steps[${index}].observation.results must be an array`);
+  }
+  for (const [resultIndex, result] of value['results'].entries()) {
+    if (!isRecord(result)) {
+      localInputError(file, `steps[${index}].observation.results[${resultIndex}] is invalid`);
+    }
+    const callId = result['source_call_id'];
+    if (callId !== undefined && callId !== null && typeof callId !== 'string') {
+      localInputError(
+        file,
+        `steps[${index}].observation.results[${resultIndex}] has invalid source_call_id`,
+      );
+    }
+    if (typeof callId === 'string' && !toolCallIds.has(callId)) {
+      localInputError(
+        file,
+        `steps[${index}].observation.results[${resultIndex}] references an unknown tool call`,
+      );
+    }
+    const content = result['content'];
+    if (content !== undefined && content !== null) {
+      validateContentParts(
+        file,
+        content,
+        `steps[${index}].observation.results[${resultIndex}].content`,
+      );
+    }
+    validateSubagentReferences(
+      file,
+      result['subagent_trajectory_ref'],
+      `steps[${index}].observation.results[${resultIndex}].subagent_trajectory_ref`,
+    );
+  }
+}
+
+function validateLocalToolData(file: string, step: Record<string, unknown>, index: number): void {
+  const toolCallIds = validateToolCalls(file, step['tool_calls'], index);
+  validateObservation(file, step['observation'], index, toolCallIds);
+}
+
+function validateFiniteMetricObject(file: string, value: unknown, label: string): void {
+  if (value === undefined || value === null) return;
+  if (!isRecord(value)) localInputError(file, `${label} must be an object`);
+  for (const key of [
+    'prompt_tokens',
+    'completion_tokens',
+    'cached_tokens',
+    'total_prompt_tokens',
+    'total_completion_tokens',
+    'total_cached_tokens',
+    'total_steps',
+  ]) {
+    const metric = value[key];
+    if (
+      metric !== undefined &&
+      metric !== null &&
+      (typeof metric !== 'number' || !Number.isFinite(metric) || !Number.isInteger(metric))
+    ) {
+      localInputError(file, `${label}.${key} must be a finite integer`);
+    }
+  }
+  for (const key of ['cost_usd', 'total_cost_usd']) {
+    const metric = value[key];
+    if (
+      metric !== undefined &&
+      metric !== null &&
+      (typeof metric !== 'number' || !Number.isFinite(metric))
+    ) {
+      localInputError(file, `${label}.${key} must be a finite number`);
+    }
+  }
+}
+
+function validateLocalTimestamp(file: string, step: Record<string, unknown>, index: number): void {
+  const timestamp = step['timestamp'];
+  if (
+    timestamp !== undefined &&
+    timestamp !== null &&
+    (typeof timestamp !== 'string' || !isSupportedIsoTimestamp(timestamp))
+  ) {
+    localInputError(file, `steps[${index}].timestamp must be an ISO 8601 string or null`);
+  }
+}
+
+function validateLocalTextFields(file: string, step: Record<string, unknown>, index: number): void {
+  for (const key of ['model_name', 'reasoning_content']) {
+    const value = step[key];
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      localInputError(file, `steps[${index}].${key} must be a string or null`);
+    }
+  }
+}
+
+function validateLocalReasoningEffort(
+  file: string,
+  step: Record<string, unknown>,
+  index: number,
+): void {
+  const effort = step['reasoning_effort'];
+  if (
+    effort !== undefined &&
+    effort !== null &&
+    typeof effort !== 'string' &&
+    (typeof effort !== 'number' || !Number.isFinite(effort))
+  ) {
+    localInputError(file, `steps[${index}].reasoning_effort must be a string or finite number`);
+  }
+}
+
+function validateLocalStepCounters(
+  file: string,
+  step: Record<string, unknown>,
+  index: number,
+): void {
+  const copied = step['is_copied_context'];
+  if (copied !== undefined && copied !== null && typeof copied !== 'boolean') {
+    localInputError(file, `steps[${index}].is_copied_context must be a boolean or null`);
+  }
+  const callCount = step['llm_call_count'];
+  if (
+    callCount !== undefined &&
+    callCount !== null &&
+    (typeof callCount !== 'number' || !Number.isInteger(callCount) || callCount < 0)
+  ) {
+    localInputError(file, `steps[${index}].llm_call_count must be a non-negative integer or null`);
+  }
+}
+
+function validateLocalStepScalars(
+  file: string,
+  step: Record<string, unknown>,
+  index: number,
+): void {
+  validateLocalTimestamp(file, step, index);
+  validateLocalTextFields(file, step, index);
+  validateLocalReasoningEffort(file, step, index);
+  validateLocalStepCounters(file, step, index);
+}
+
+function validateLocalStepRules(file: string, step: Record<string, unknown>, index: number): void {
+  const source = step['source'];
+  const agentOnly = [
+    'model_name',
+    'reasoning_effort',
+    'reasoning_content',
+    'tool_calls',
+    'metrics',
+  ];
+  if (
+    source !== 'agent' &&
+    agentOnly.some((key) => step[key] !== undefined && step[key] !== null)
+  ) {
+    localInputError(file, `steps[${index}] uses agent-only fields with source ${String(source)}`);
+  }
+  if (
+    source === 'agent' &&
+    step['llm_call_count'] === 0 &&
+    ((step['metrics'] !== undefined && step['metrics'] !== null) ||
+      (step['reasoning_content'] !== undefined && step['reasoning_content'] !== null))
+  ) {
+    localInputError(file, `steps[${index}] has metrics or reasoning_content with llm_call_count 0`);
+  }
+}
+
+function validateLocalStepFields(file: string, step: Record<string, unknown>, index: number): void {
+  validateLocalStepScalars(file, step, index);
+  validateLocalStepRules(file, step, index);
+}
+
+function validateLocalIdentity(file: string, trajectory: AtifTrajectory): void {
+  for (const key of ['session_id', 'trajectory_id'] as const) {
+    const value = trajectory[key];
+    if (value !== undefined && value !== null && typeof value !== 'string') {
+      localInputError(file, `${key} must be a string or null`);
+    }
+  }
+}
+
+function validateLocalAgent(file: string, value: unknown): void {
+  if (!isRecord(value)) localInputError(file, 'agent is required');
+  if (typeof value['name'] !== 'string' || typeof value['version'] !== 'string') {
+    localInputError(file, 'agent.name and agent.version are required strings');
+  }
+  const model = value['model_name'];
+  if (model !== undefined && model !== null && typeof model !== 'string') {
+    localInputError(file, 'agent.model_name must be a string or null');
+  }
+}
+
+function validateLocalSteps(file: string, value: unknown): void {
+  if (!Array.isArray(value) || value.length === 0) {
+    localInputError(file, 'steps must be a non-empty array');
+  }
+  for (const [index, step] of value.entries()) {
+    if (!isRecord(step)) localInputError(file, `steps[${index}] must be an object`);
+    if (step['step_id'] !== index + 1) {
+      localInputError(file, `steps[${index}].step_id must be ${index + 1}`);
+    }
+    if (!['system', 'user', 'agent'].includes(String(step['source']))) {
+      localInputError(file, `steps[${index}].source is invalid`);
+    }
+    validateContentParts(file, step['message'], `steps[${index}].message`);
+    validateLocalStepFields(file, step, index);
+    validateLocalToolData(file, step, index);
+    validateFiniteMetricObject(file, step['metrics'], `steps[${index}].metrics`);
+  }
+}
+
+function validateLocalTrajectory(file: string, trajectory: AtifTrajectory): void {
+  validateLocalIdentity(file, trajectory);
+  validateLocalAgent(file, trajectory.agent);
+  validateLocalSteps(file, trajectory.steps);
+  validateFiniteMetricObject(file, trajectory.final_metrics, 'final_metrics');
+  if (
+    trajectory.subagent_trajectories !== undefined &&
+    trajectory.subagent_trajectories !== null &&
+    !Array.isArray(trajectory.subagent_trajectories)
+  ) {
+    localInputError(file, 'subagent_trajectories must be an array or null');
+  }
+}
+
+function prepareHostedTrajectory(
+  file: string,
+  raw: Uint8Array,
+  trajectory: AtifTrajectory,
+): Required<Pick<LoadedTrajectory, 'submitted' | 'identity'>> {
   const sessionId = trajectory.session_id ?? null;
   const trajectoryId = trajectory.trajectory_id ?? null;
   if (sessionId !== null && typeof sessionId !== 'string') {
@@ -211,41 +597,52 @@ function hostedSourceIdentity(file: string, trajectory: AtifTrajectory): HostedS
     fail(`${basename(file)}: trajectory_id must be a string or null`);
   }
 
-  // The backend also supports an anonymous, content-derived fallback after
-  // strict Pydantic normalization. Reproducing that normalization in this
-  // minimally parsed client would risk binding a response to the wrong
-  // source. Hosted mode therefore requires one of ATIF's explicit identity
-  // fields; anonymous trajectories remain supported by --local.
-  const key = sessionId ? sessionId.replace(/-cont-\d+$/, '') : trajectoryId;
-  if (!key) {
-    fail(
-      `${basename(file)}: hosted analysis requires a non-empty session_id or trajectory_id ` +
-        '(anonymous trajectories are supported with --local)',
-    );
-  }
+  // When both optional ATIF identity fields are falsey, bind the exact source
+  // bytes to a deterministic, domain-separated trajectory_id before sending.
+  // The backend then follows its normal explicit-ID path and echoes that ID,
+  // avoiding a fragile reimplementation of Pydantic + Python JSON numeric and
+  // Unicode normalization in this Node client.
+  const syntheticId = anonymousTrajectoryId(raw);
+  const submitted =
+    sessionId || trajectoryId ? trajectory : { ...trajectory, trajectory_id: syntheticId };
+  const submittedTrajectoryId = submitted.trajectory_id ?? null;
+  const key = explicitTraceKey(submitted)!;
 
   return {
-    traceId: createHash('sha256').update(key, 'utf8').digest('hex').slice(0, 32),
-    schemaVersion: trajectory.schema_version!,
-    sessionId,
-    trajectoryId,
+    submitted,
+    identity: {
+      traceId: traceIdFromKey(key),
+      schemaVersion: trajectory.schema_version!,
+      sessionId,
+      trajectoryId: submittedTrajectoryId,
+    },
   };
 }
 
 async function loadTrajectories(
   files: string[],
   requireHostedIdentity: boolean,
-): Promise<Map<string, AtifTrajectory>> {
-  const trajectories = new Map<string, AtifTrajectory>();
+): Promise<Map<string, LoadedTrajectory>> {
+  const trajectories = new Map<string, LoadedTrajectory>();
   for (const file of files) {
-    const trajectory = parseTrajectory(file, await readFile(file, 'utf8'));
-    if (requireHostedIdentity) hostedSourceIdentity(file, trajectory);
-    trajectories.set(file, trajectory);
+    const raw = await readFile(file);
+    const source = parseTrajectory(file, decodeUtf8(file, raw));
+    if (!requireHostedIdentity) validateLocalTrajectory(file, source);
+    const hosted = requireHostedIdentity ? prepareHostedTrajectory(file, raw, source) : undefined;
+    const traceId =
+      hosted?.identity.traceId ??
+      traceIdFromKey(explicitTraceKey(source) ?? anonymousTrajectoryId(raw));
+    trajectories.set(file, {
+      source,
+      submitted: hosted?.submitted ?? source,
+      traceId,
+      identity: hosted?.identity,
+    });
   }
   return trajectories;
 }
 
-function toEpochMs(timestamp: string | undefined): number | undefined {
+function toEpochMs(timestamp: string | null | undefined): number | undefined {
   if (!timestamp) return undefined;
   const ms = Date.parse(timestamp);
   return Number.isNaN(ms) ? undefined : ms;
@@ -276,12 +673,17 @@ interface TokenTotals {
   costUsd: number;
 }
 
+function metricNumber(value: unknown): number {
+  if (value === undefined || value === null) return 0;
+  return typeof value === 'number' ? value : Number(value);
+}
+
 function sumStepMetrics(steps: AtifStep[]): TokenTotals {
   return steps.reduce(
     (acc, s) => ({
-      inputTokens: acc.inputTokens + (s.metrics?.prompt_tokens ?? 0),
-      outputTokens: acc.outputTokens + (s.metrics?.completion_tokens ?? 0),
-      costUsd: acc.costUsd + (s.metrics?.cost_usd ?? 0),
+      inputTokens: acc.inputTokens + metricNumber(s.metrics?.prompt_tokens),
+      outputTokens: acc.outputTokens + metricNumber(s.metrics?.completion_tokens),
+      costUsd: acc.costUsd + metricNumber(s.metrics?.cost_usd),
     }),
     { inputTokens: 0, outputTokens: 0, costUsd: 0 },
   );
@@ -295,10 +697,29 @@ function resolveTokenTotals(trajectory: AtifTrajectory, steps: AtifStep[]): Toke
   const final = trajectory.final_metrics;
   const fallback = sumStepMetrics(steps);
   return {
-    inputTokens: final?.total_prompt_tokens ?? fallback.inputTokens,
-    outputTokens: final?.total_completion_tokens ?? fallback.outputTokens,
-    costUsd: final?.total_cost_usd ?? fallback.costUsd,
+    inputTokens:
+      final?.total_prompt_tokens == null
+        ? fallback.inputTokens
+        : metricNumber(final.total_prompt_tokens),
+    outputTokens:
+      final?.total_completion_tokens == null
+        ? fallback.outputTokens
+        : metricNumber(final.total_completion_tokens),
+    costUsd: final?.total_cost_usd == null ? fallback.costUsd : metricNumber(final.total_cost_usd),
   };
+}
+
+function contentToText(message: string | AtifContentPart[] | undefined): string | undefined {
+  if (message === undefined || typeof message === 'string') return message;
+  const parts: string[] = [];
+  for (const part of message) {
+    if (part.type === 'text' && part.text !== null && part.text !== undefined) {
+      parts.push(part.text);
+    } else if (part.type === 'image' && part.source) {
+      parts.push(`[image: ${part.source.media_type} @ ${part.source.path}]`);
+    }
+  }
+  return parts.join('\n');
 }
 
 // Projects a multi-step ATIF trajectory down to the flat single-turn
@@ -311,17 +732,19 @@ function resolveTokenTotals(trajectory: AtifTrajectory, steps: AtifStep[]): Toke
 // completion/hallucination/context/derailment detectors run over a
 // trajectory's shape; it does not reconstruct the full multi-step structure
 // the backend's ATIF-native detectors see.
-function atifTrajectoryToAgentTrace(trajectory: AtifTrajectory, fallbackId: string): AgentTrace {
+function atifTrajectoryToAgentTrace(trajectory: AtifTrajectory, traceId: string): AgentTrace {
   const steps = trajectory.steps ?? [];
   const tokens = resolveTokenTotals(trajectory, steps);
 
   return {
-    traceId: trajectory.trajectory_id ?? trajectory.session_id ?? fallbackId,
+    traceId,
     startTime: toEpochMs(steps[0]?.timestamp) ?? 0,
     endTime: toEpochMs(steps[steps.length - 1]?.timestamp),
-    model: trajectory.agent?.model_name ?? steps.find((s) => s.model_name)?.model_name,
-    prompt: steps.find((s) => s.source === 'user')?.message,
-    completion: [...steps].reverse().find((s) => s.source === 'agent' && s.message)?.message,
+    model: trajectory.agent?.model_name ?? steps.find((s) => s.model_name)?.model_name ?? undefined,
+    prompt: contentToText(steps.find((s) => s.source === 'user')?.message),
+    completion: contentToText(
+      [...steps].reverse().find((s) => s.source === 'agent' && s.message)?.message,
+    ),
     toolCalls: flattenToolCalls(steps),
     inputTokens: tokens.inputTokens,
     outputTokens: tokens.outputTokens,
@@ -352,16 +775,30 @@ function buildLocalResponse(
   trajectory: AtifTrajectory,
   trace: AgentTrace,
   results: LocalDetectionResult[],
+  detectorsRun: string[],
+  detectorsFailed: Record<string, string>,
 ): AnalyzeResponse {
+  const coverageFailures = { ...detectorsFailed };
+  if (
+    Array.isArray(trajectory.subagent_trajectories) &&
+    trajectory.subagent_trajectories.length > 0
+  ) {
+    coverageFailures['embedded_subagent_analysis'] =
+      'local projection does not analyze embedded subagent trajectories';
+  }
+  const failedCount = Object.keys(coverageFailures).length;
+  const topology = sourceTopologyContract(trajectory);
+  const topologyComplete = topology.expectedUnresolvedReferences.length === 0;
   return {
     diagnosis: {
       trace_id: trace.traceId,
       has_failures: results.length > 0,
       failure_count: results.length,
-      detection_status: 'complete',
+      detection_status:
+        failedCount === 0 ? 'complete' : detectorsRun.length === 0 ? 'failed' : 'partial',
       all_detections: localDetectionsToApiShape(results),
-      detectors_run: v1Detectors.map((d) => d.name),
-      detectors_failed: {},
+      detectors_run: detectorsRun,
+      detectors_failed: coverageFailures,
     },
     trace: {
       trace_id: trace.traceId,
@@ -373,19 +810,34 @@ function buildLocalResponse(
       atif_schema_version: trajectory.schema_version ?? 'unknown',
       atif_session_id: trajectory.session_id ?? null,
       atif_trajectory_id: trajectory.trajectory_id ?? null,
-      topology_complete: true,
-      unresolved_trajectory_refs: [],
+      topology_complete: topologyComplete,
+      unresolved_trajectory_refs: topology.expectedUnresolvedReferences,
       client_resolved_trajectory_refs: [],
-      reconciled_topology_complete: true,
+      reconciled_topology_complete: topologyComplete,
     },
     healing: null,
   };
 }
 
-function analyzeTrajectoryLocally(file: string, trajectory: AtifTrajectory): AnalyzeResponse {
-  const trace = atifTrajectoryToAgentTrace(trajectory, basename(file));
-  const results = runDetectors(trace);
-  return buildLocalResponse(trajectory, trace, results);
+function analyzeTrajectoryLocally(
+  file: string,
+  trajectory: AtifTrajectory,
+  traceId: string,
+): AnalyzeResponse {
+  const trace = atifTrajectoryToAgentTrace(trajectory, traceId);
+  const results: LocalDetectionResult[] = [];
+  const detectorsRun: string[] = [];
+  const detectorsFailed: Record<string, string> = {};
+  for (const detector of v1Detectors) {
+    try {
+      const result = detector.detect(trace);
+      detectorsRun.push(detector.name);
+      if (result.detected) results.push(result);
+    } catch {
+      detectorsFailed[detector.name] = 'detector execution failed';
+    }
+  }
+  return buildLocalResponse(trajectory, trace, results, detectorsRun, detectorsFailed);
 }
 
 function finishAnalysis(
@@ -635,6 +1087,7 @@ function validateDiagnosis(value: unknown): AnalyzeResponse['diagnosis'] {
 
 interface SourceTopologyContract {
   expectedUnresolvedReferences: string[];
+  safelyResolvablePathReferences: ReadonlySet<string>;
 }
 
 function optionalRecord(value: unknown): Record<string, unknown> | undefined {
@@ -651,11 +1104,16 @@ function recordArray(value: unknown): Array<Record<string, unknown>> {
   });
 }
 
+interface EffectiveTopologyReference {
+  target: string;
+  isPath: boolean;
+}
+
 function unresolvedSubagentReferences(
   document: Record<string, unknown>,
   embeddedIds: ReadonlySet<string>,
-): string[] {
-  const unresolved: string[] = [];
+): EffectiveTopologyReference[] {
+  const unresolved: EffectiveTopologyReference[] = [];
   for (const step of recordArray(document['steps'])) {
     const observation = optionalRecord(step['observation']);
     for (const result of recordArray(observation?.['results'])) {
@@ -663,9 +1121,11 @@ function unresolvedSubagentReferences(
         const trajectoryId = reference['trajectory_id'];
         const trajectoryPath = reference['trajectory_path'];
         if (typeof trajectoryId === 'string' && embeddedIds.has(trajectoryId)) continue;
-        const target =
-          typeof trajectoryPath === 'string' && trajectoryPath ? trajectoryPath : trajectoryId;
-        if (typeof target === 'string') unresolved.push(target);
+        if (typeof trajectoryPath === 'string' && trajectoryPath) {
+          unresolved.push({ target: trajectoryPath, isPath: true });
+        } else if (typeof trajectoryId === 'string') {
+          unresolved.push({ target: trajectoryId, isPath: false });
+        }
       }
     }
   }
@@ -674,11 +1134,11 @@ function unresolvedSubagentReferences(
 
 function sourceTopologyContract(trajectory: AtifTrajectory): SourceTopologyContract {
   const expectedUnresolvedReferences: string[] = [];
-  const seen = new Set<string>();
-  const add = (reference: string): void => {
-    if (seen.has(reference)) return;
-    seen.add(reference);
-    expectedUnresolvedReferences.push(reference);
+  const allOccurrencesArePaths = new Map<string, boolean>();
+  const add = (reference: EffectiveTopologyReference): void => {
+    const prior = allOccurrencesArePaths.get(reference.target);
+    if (prior === undefined) expectedUnresolvedReferences.push(reference.target);
+    allOccurrencesArePaths.set(reference.target, (prior ?? true) && reference.isPath);
   };
 
   // Mirror backend/app/ingestion/atif_parser.py::_unresolved_trajectory_refs.
@@ -698,12 +1158,19 @@ function sourceTopologyContract(trajectory: AtifTrajectory): SourceTopologyContr
     for (const reference of unresolvedSubagentReferences(document, embeddedIds)) add(reference);
 
     const continuedReference = document['continued_trajectory_ref'];
-    if (typeof continuedReference === 'string' && continuedReference) add(continuedReference);
+    if (typeof continuedReference === 'string' && continuedReference) {
+      add({ target: continuedReference, isPath: true });
+    }
     for (const child of embedded) collect(child);
   };
 
   collect(trajectory);
-  return { expectedUnresolvedReferences };
+  return {
+    expectedUnresolvedReferences,
+    safelyResolvablePathReferences: new Set(
+      expectedUnresolvedReferences.filter((reference) => allOccurrencesArePaths.get(reference)),
+    ),
+  };
 }
 
 function sameOrderedStrings(left: string[], right: string[]): boolean {
@@ -796,11 +1263,11 @@ async function requestAnalysis(
   file: string,
   baseUrl: string,
   trajectory: AtifTrajectory,
+  sourceIdentity: HostedSourceIdentity,
   opts: AnalyzeAtifOptions,
   credentials: Record<string, unknown> | undefined,
   auth: PlatformAuth,
 ): Promise<AnalyzeResponse> {
-  const sourceIdentity = hostedSourceIdentity(file, trajectory);
   const scope: TokenScope = opts.apply ? 'full' : 'read';
   const requestId = `atif-${nanoid()}`;
   const body = JSON.stringify({
@@ -849,61 +1316,43 @@ async function requestAnalysis(
   }
 }
 
-function collectSubagentTrajectoryTargets(value: unknown): Set<string> {
-  const targets = new Set<string>();
-  const pending: unknown[] = [value];
-  while (pending.length > 0) {
-    const current = pending.pop();
-    if (Array.isArray(current)) {
-      pending.push(...current);
-      continue;
-    }
-    if (typeof current !== 'object' || current === null) continue;
-    const record = current as Record<string, unknown>;
-    const refs = record['subagent_trajectory_ref'];
-    if (Array.isArray(refs)) {
-      for (const ref of refs) {
-        if (typeof ref !== 'object' || ref === null || Array.isArray(ref)) continue;
-        for (const key of ['trajectory_path', 'trajectory_id']) {
-          const target = (ref as Record<string, unknown>)[key];
-          if (typeof target === 'string') targets.add(target);
-        }
-      }
-    }
-    pending.push(...Object.values(record));
+async function isSelectedPathReference(
+  file: string,
+  reference: string,
+  submittedFiles: ReadonlySet<string>,
+): Promise<boolean> {
+  if (isAbsolute(reference) || win32.isAbsolute(reference)) return false;
+  try {
+    const target = await realpath(resolve(dirname(file), reference));
+    return submittedFiles.has(target);
+  } catch {
+    return false;
   }
-  return targets;
 }
 
-async function reconcileSubmittedContinuation(
+async function reconcileSubmittedReferences(
   file: string,
   trajectory: AtifTrajectory,
   submittedFiles: ReadonlySet<string>,
   data: AnalyzeResponse,
 ): Promise<AnalyzeResponse> {
-  const reference = trajectory.continued_trajectory_ref;
-  if (
-    !reference ||
-    collectSubagentTrajectoryTargets(trajectory).has(reference) ||
-    !data.trace.unresolved_trajectory_refs.includes(reference)
-  ) {
-    return data;
+  const contract = sourceTopologyContract(trajectory);
+  const resolvedReferences: string[] = [];
+  for (const reference of data.trace.unresolved_trajectory_refs) {
+    if (!contract.safelyResolvablePathReferences.has(reference)) continue;
+    if (await isSelectedPathReference(file, reference, submittedFiles)) {
+      resolvedReferences.push(reference);
+    }
   }
+  if (resolvedReferences.length === 0) return data;
 
-  let target: string;
-  try {
-    target = await realpath(resolve(dirname(file), reference));
-  } catch (error) {
-    fail(`${basename(file)}: continuation changed after discovery (${(error as Error).message})`);
-  }
-  if (!submittedFiles.has(target)) return data;
-
-  const remaining = data.trace.unresolved_trajectory_refs.filter((item) => item !== reference);
+  const resolved = new Set(resolvedReferences);
+  const remaining = data.trace.unresolved_trajectory_refs.filter((item) => !resolved.has(item));
   return {
     ...data,
     trace: {
       ...data.trace,
-      client_resolved_trajectory_refs: [reference],
+      client_resolved_trajectory_refs: resolvedReferences,
       reconciled_topology_complete: remaining.length === 0,
       unresolved_trajectory_refs: remaining,
     },
@@ -912,7 +1361,7 @@ async function reconcileSubmittedContinuation(
 
 async function analyzeTrajectory(
   file: string,
-  trajectory: AtifTrajectory,
+  loaded: LoadedTrajectory,
   target: string,
   targetIsDirectory: boolean,
   baseUrl: string,
@@ -926,10 +1375,19 @@ async function analyzeTrajectory(
   analysisIncomplete: boolean;
   applyFailed: boolean;
 }> {
+  const trajectory = loaded.source;
   const rawData = opts.local
-    ? analyzeTrajectoryLocally(file, trajectory)
-    : await requestAnalysis(file, baseUrl, trajectory, opts, credentials, auth!);
-  const data = await reconcileSubmittedContinuation(file, trajectory, submittedFiles, rawData);
+    ? analyzeTrajectoryLocally(file, trajectory, loaded.traceId)
+    : await requestAnalysis(
+        file,
+        baseUrl,
+        loaded.submitted,
+        loaded.identity!,
+        opts,
+        credentials,
+        auth!,
+      );
+  const data = await reconcileSubmittedReferences(file, trajectory, submittedFiles, rawData);
   const blockingSeverity = data.diagnosis.all_detections.some((detection) =>
     ['critical', 'high'].includes((detection.severity ?? '').toLowerCase()),
   );
@@ -1343,7 +1801,7 @@ function renderTrajectorySummary(label: string, data: AnalyzeResponse): void {
   }
   if (t.client_resolved_trajectory_refs.length > 0) {
     console.log(
-      `  ${kleur.green('✓')} continuation submitted: ${t.client_resolved_trajectory_refs.join(', ')}`,
+      `  ${kleur.green('✓')} selected trajectory refs: ${t.client_resolved_trajectory_refs.join(', ')}`,
     );
   }
   if (topologyIncomplete) {

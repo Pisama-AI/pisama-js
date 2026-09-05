@@ -18,8 +18,20 @@ All notable changes to `@pisama/cli` are documented here.
   JWT for explicit `--apply`, and re-exchanges at most once after a 401.
 - `analyze-atif` fails closed on incomplete detector/topology evidence and
   binds hosted responses to the submitted schema, session, trajectory, and
-  deterministic trace identity. Hosted anonymous trajectories are rejected;
-  use `--local` when neither explicit ATIF identity field is available.
+  deterministic trace identity. Anonymous hosted files receive a stable,
+  byte-derived synthetic trajectory ID in the request clone without changing
+  the source file.
+- Local ATIF analysis validates the fields used by its projection, flattens
+  multimodal content before text detection, and reports detector exceptions
+  as incomplete instead of silently converting them into a clean result.
+  Selected file-backed continuation/subagent documents are reconciled by
+  canonical path; missing, escaping, or ID-only references and embedded
+  subagent content stay explicitly incomplete in simplified local mode. Local
+  trace IDs now use the same session-first, continuation-normalized identity
+  order and anonymous byte fallback as hosted submissions.
+- An omitted ATIF `schema_version` now receives the backend's v1.7 default in
+  the in-memory request; explicit invalid versions still fail and files are
+  never rewritten.
 - `mcp` replaces the removed anonymous project route with authenticated,
   read-scoped tenant trace, state, and detection reads. Its configuration now
   requires `PISAMA_API_KEY`; no project id is treated as an authentication
