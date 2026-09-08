@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "description": "Public TypeScript packages for Pisama agent failure detection.",
-  "packageManager": "pnpm@9.0.0",
+  "packageManager": "pnpm@10.34.5",
   "engines": {
     "node": ">=20"
   },

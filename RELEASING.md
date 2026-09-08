@@ -79,3 +79,12 @@ This step does not unpack or alter package members. It does not bypass the
 independently supplied expected SHA-256: a changed compressor or tar stream
 still stops the release on any mismatch. Never update an approved digest just
 to accommodate unexplained build drift.
+## Package-manager security checkpoint (2026-09-08)
+
+Use pnpm 10.34.5 from the root manifest and the SHA-pinned setup action v6.1.0
+in CI and release preparation. The action bootstraps pnpm 11.25.0 before
+selecting the manifest version. Both paths matter: project dependency audits
+do not audit the installer itself. Official registry advisory checks returned
+no findings for these exact pnpm versions at this checkpoint, not a permanent
+security guarantee. Recheck on release. Preserve the reviewed package archive
+hashes during tooling upgrades; never replace them just to pass a rebuild gate.
