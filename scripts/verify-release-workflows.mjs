@@ -56,8 +56,17 @@ const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
 const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
 assert.equal(manifest.packageManager, 'pnpm@10.34.5', 'reviewed package-manager version');
 const pnpmSetup = 'pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413';
-expectCount(ci, pnpmSetup, 2, 'CI bootstrap');
+expectCount(ci, pnpmSetup, 3, 'CI bootstrap');
 expectCount(prepare, pnpmSetup, 1, 'release bootstrap');
+expectCount(ci, 'node-version: "22.14.0"', 1, 'release reproduction');
+expectCount(ci, 'python-version: "3.11.13"', 1, 'release reproduction');
+expectCount(
+  ci,
+  'sha256sum --check "$GITHUB_WORKSPACE/scripts/reviewed-release-sha256.txt"',
+  1,
+  'reviewed digests',
+);
+assert.doesNotMatch(ci, /id-token: write|npm stage publish|npm publish/, 'CI must not publish');
 expectCount(prepare, "python-version: '3.11.13'", 1, 'prepare action');
 expectCount(packedConsumer, 'python3 scripts/test_canonicalize_npm_archive.py', 1, 'packed gate');
 expectCount(
