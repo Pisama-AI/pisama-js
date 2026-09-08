@@ -52,6 +52,12 @@ const prepare = readFileSync('.github/actions/prepare-npm-stage/action.yml', 'ut
 const stage = readFileSync('.github/actions/stage-npm-package/action.yml', 'utf8');
 const runbook = readFileSync('RELEASING.md', 'utf8');
 const packedConsumer = readFileSync('scripts/verify-packed-consumer.sh', 'utf8');
+const ci = readFileSync('.github/workflows/ci.yml', 'utf8');
+const manifest = JSON.parse(readFileSync('package.json', 'utf8'));
+assert.equal(manifest.packageManager, 'pnpm@10.34.5', 'reviewed package-manager version');
+const pnpmSetup = 'pnpm/action-setup@ea17c68df8912ef543352723c149a84f56e3d413';
+expectCount(ci, pnpmSetup, 2, 'CI bootstrap');
+expectCount(prepare, pnpmSetup, 1, 'release bootstrap');
 expectCount(prepare, "python-version: '3.11.13'", 1, 'prepare action');
 expectCount(packedConsumer, 'python3 scripts/test_canonicalize_npm_archive.py', 1, 'packed gate');
 expectCount(
