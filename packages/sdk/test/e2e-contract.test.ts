@@ -1,5 +1,6 @@
 // Opt-in contract test against a real Pisama deployment. Unit tests pin the
-// wire shape; this gate proves the actual auth and persistence route accepts it.
+// wire shape; this gate requires authenticated readback of the stored trace/span.
+// The designated test key must permit both ingest and read token exchange.
 //
 //   PISAMA_E2E_ENDPOINT=http://localhost:8000 \
 //   PISAMA_E2E_API_KEY=pisama_... \
@@ -96,4 +97,44 @@ test('e2e contract: scoped auth and OTLP JSON persist a real span', async (t) =>
     resourceSpans?: Array<{ scopeSpans?: Array<{ spans?: Array<{ traceId?: string }> }> }>;
   };
   assert.equal(body.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0]?.traceId, traceId);
+
+  // Reuse the CLI's real scoped transport, not a second test-only auth client.
+  const { PlatformAuth } = await import('../../cli/src/platform-auth.js');
+  const auth = new PlatformAuth(BASE_URL, API_KEY);
+  const deadline = Date.now() + 20_000;
+  const { tenantId } = await auth.identity('read', deadline);
+  const tenantUrl = `${BASE_URL}/api/v1/tenants/${encodeURIComponent(tenantId)}`;
+  let storedId: string | undefined;
+  while (Date.now() < deadline && !storedId) {
+    const response = await auth.fetch('read', `${tenantUrl}/traces?per_page=50`, {}, deadline);
+    assert.equal(response.status, 200, 'authenticated trace listing must succeed');
+    const page = (await response.json()) as { traces: Array<{ id: string; session_id: string }> };
+    assert.ok(Array.isArray(page.traces), 'trace listing must contain a traces array');
+    storedId = page.traces.find((trace) => trace.session_id === traceId)?.id;
+    if (!storedId) await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+  assert.ok(storedId, 'accepted trace must become readable before the deadline');
+  const detail = await auth.fetch(
+    'read',
+    `${tenantUrl}/traces/${encodeURIComponent(storedId)}`,
+    {},
+    deadline,
+  );
+  assert.equal(detail.status, 200);
+  const storedTrace = (await detail.json()) as { session_id: string; state_count: number };
+  assert.equal(storedTrace.session_id, traceId);
+  assert.equal(storedTrace.state_count, 1);
+  const response = await auth.fetch(
+    'read',
+    `${tenantUrl}/traces/${encodeURIComponent(storedId)}/states?full_state=true`,
+    {},
+    deadline,
+  );
+  assert.equal(response.status, 200);
+  const states = (await response.json()) as Array<{
+    state_delta: { _pisama_otel?: { span_id?: string } };
+  }>;
+  assert.ok(Array.isArray(states));
+  assert.equal(states.length, 1);
+  assert.equal(states[0]?.state_delta._pisama_otel?.span_id, spanId);
 });
