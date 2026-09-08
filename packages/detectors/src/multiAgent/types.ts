@@ -56,6 +56,8 @@ export interface PersonaAgent {
 
 export interface PersonaInput {
   agent: PersonaAgent;
+  /** User task used to distinguish on-topic answers from persona drift. */
+  task: string;
   /** The agent's most recent output to be checked for persona drift. */
   output: string;
   correlation_id?: string;

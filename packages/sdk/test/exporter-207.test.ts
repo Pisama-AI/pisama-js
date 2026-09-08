@@ -2,12 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { TraceExporter } from '../src/exporter.js';
 import type { TraceEvent } from '../src/types.js';
+import { tokenResponse } from './otlp-helpers.js';
 
 function fakeEvent(traceId: string): TraceEvent {
   return {
-    projectId: 'ws_207_test',
+    projectId: 'ws_partial_test',
     traceId,
-    spanId: 'span-1',
+    spanId: '0000000000000001',
     startTime: Date.now(),
     endTime: Date.now() + 10,
     model: 'mock',
@@ -16,130 +17,63 @@ function fakeEvent(traceId: string): TraceEvent {
   };
 }
 
-interface ConsoleSpy {
-  logs: string[];
-  warns: string[];
-  restore: () => void;
-}
-
-function spyConsole(): ConsoleSpy {
-  const log = console.log;
-  const warn = console.warn;
-  const s: ConsoleSpy = {
-    logs: [],
-    warns: [],
-    restore: () => {
-      console.log = log;
-      console.warn = warn;
-    },
-  };
-  console.log = (...a: unknown[]) => {
-    s.logs.push(a.map(String).join(' '));
-  };
-  console.warn = (...a: unknown[]) => {
-    s.warns.push(a.map(String).join(' '));
-  };
-  return s;
-}
-
-test('exporter logs a partial-flush warning on HTTP 207 (silent partial drop fix)', async () => {
-  delete process.env.PISAMA_SILENT;
-  delete process.env.PISAMA_DEBUG;
-  const fetchImpl = (async () =>
-    new Response(
-      JSON.stringify({
-        accepted: 1,
-        submitted: 2,
-        failed: [{ traceId: 'trace-bad', reason: 'missing_project_id' }],
-      }),
-      { status: 207, headers: { 'content-type': 'application/json' } },
-    )) as typeof fetch;
-
-  const exporter = new TraceExporter({
-    projectId: 'ws_207_test',
-    endpoint: 'https://test/api/v1/spans',
-    fetchImpl,
-    flushIntervalMs: 50,
+function exporterWithResult(body: Record<string, unknown>, status = 202): TraceExporter {
+  return new TraceExporter({
+    apiKey: 'pisama_partial_test_key',
+    projectId: 'ws_partial_test',
+    endpoint: 'https://test/api/v1/traces/ingest',
+    fetchImpl: (async (input: RequestInfo | URL) =>
+      String(input).endsWith('/api/v1/auth/token')
+        ? tokenResponse()
+        : Response.json(body, { status })) as typeof fetch,
   });
-  exporter.enqueue(fakeEvent('trace-good'));
-  exporter.enqueue(fakeEvent('trace-bad'));
+}
 
-  const c = spyConsole();
+function spyWarnings() {
+  const original = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+  return { warnings, restore: () => (console.warn = original) };
+}
+
+test('exporter warns when the OTLP ingest response reports rejected spans', async () => {
+  delete process.env.PISAMA_SILENT;
+  const exporter = exporterWithResult({ accepted: 1, submitted: 2, rejected: 1 });
+  exporter.enqueue(fakeEvent('00000000000000000000000000000001'));
+  exporter.enqueue(fakeEvent('00000000000000000000000000000002'));
+  const spy = spyWarnings();
   try {
     await exporter.flush();
-    assert.ok(
-      c.warns.some((l) => /partial flush/i.test(l)),
-      `expected a 'partial flush' warning, got: ${JSON.stringify(c.warns)}`,
-    );
-    assert.ok(
-      c.warns.some((l) => /1\/2 accepted/.test(l) && /1 dropped/.test(l)),
-      'expected counts in the warning',
-    );
+    assert.ok(spy.warnings.some((line) => /partial flush/i.test(line)));
+    assert.ok(spy.warnings.some((line) => /1\/2 accepted/.test(line) && /1 rejected/.test(line)));
   } finally {
-    c.restore();
+    spy.restore();
   }
 });
 
-test('exporter logs each failed event with reason in PISAMA_DEBUG=1 mode', async () => {
-  process.env.PISAMA_DEBUG = '1';
+test('successful OTLP response with no rejections stays quiet', async () => {
   delete process.env.PISAMA_SILENT;
-  const fetchImpl = (async () =>
-    new Response(
-      JSON.stringify({
-        accepted: 0,
-        submitted: 2,
-        failed: [
-          { traceId: 't1', reason: 'missing_project_id' },
-          { traceId: 't2', reason: 'persist_failed' },
-        ],
-      }),
-      { status: 207, headers: { 'content-type': 'application/json' } },
-    )) as typeof fetch;
-
-  const exporter = new TraceExporter({
-    projectId: 'ws_207_debug',
-    endpoint: 'https://test/api/v1/spans',
-    fetchImpl,
-  });
-  exporter.enqueue(fakeEvent('t1'));
-  exporter.enqueue(fakeEvent('t2'));
-
-  const c = spyConsole();
+  const exporter = exporterWithResult({ accepted: 1, submitted: 1, rejected: 0 });
+  exporter.enqueue(fakeEvent('00000000000000000000000000000001'));
+  const spy = spyWarnings();
   try {
     await exporter.flush();
-    assert.ok(c.warns.some((l) => /t1/.test(l) && /missing_project_id/.test(l)));
-    assert.ok(c.warns.some((l) => /t2/.test(l) && /persist_failed/.test(l)));
+    assert.equal(spy.warnings.length, 0);
   } finally {
-    c.restore();
-    delete process.env.PISAMA_DEBUG;
+    spy.restore();
   }
 });
 
-test('exporter respects PISAMA_SILENT=1 even on 207', async () => {
+test('PISAMA_SILENT=1 suppresses rejected-span warnings', async () => {
   process.env.PISAMA_SILENT = '1';
-  const fetchImpl = (async () =>
-    new Response(
-      JSON.stringify({
-        accepted: 0,
-        submitted: 1,
-        failed: [{ traceId: 't1', reason: 'boom' }],
-      }),
-      { status: 207, headers: { 'content-type': 'application/json' } },
-    )) as typeof fetch;
-
-  const exporter = new TraceExporter({
-    projectId: 'ws_207_silent',
-    endpoint: 'https://test/api/v1/spans',
-    fetchImpl,
-  });
-  exporter.enqueue(fakeEvent('t1'));
-
-  const c = spyConsole();
+  const exporter = exporterWithResult({ accepted: 0, submitted: 1, rejected: 1 });
+  exporter.enqueue(fakeEvent('00000000000000000000000000000001'));
+  const spy = spyWarnings();
   try {
     await exporter.flush();
-    assert.equal(c.warns.length, 0, 'silent mode must suppress 207 warning');
+    assert.equal(spy.warnings.length, 0);
   } finally {
-    c.restore();
+    spy.restore();
     delete process.env.PISAMA_SILENT;
   }
 });

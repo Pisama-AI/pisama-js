@@ -3,9 +3,14 @@ export type RedactMode = 'off' | 'standard' | 'aggressive' | 'metadata-only';
 const STANDARD_PATTERNS: Array<[RegExp, string]> = [
   [/eyJ[A-Za-z0-9_-]{10,}\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+/g, '[jwt]'],
   [/sk-ant-[A-Za-z0-9_-]{20,}/g, '[anthropic-key]'],
-  [/sk-[A-Za-z0-9]{20,}/g, '[openai-key]'],
+  // Keep the provider-specific forms before the generic `sk-` form so the
+  // whole value is replaced instead of leaving a visible suffix.
+  [/sk-proj-[A-Za-z0-9_-]{20,}/g, '[openai-key]'],
+  [/sk-[A-Za-z0-9_-]{20,}/g, '[openai-key]'],
+  [/\bpisama_[A-Za-z0-9_-]{32,}(?![A-Za-z0-9_-])/g, '[pisama-key]'],
   [/AKIA[0-9A-Z]{16}/g, '[aws-key]'],
-  [/ghp_[A-Za-z0-9]{36}/g, '[github-pat]'],
+  [/github_pat_[A-Za-z0-9_]{20,}/g, '[github-token]'],
+  [/gh[pousr]_[A-Za-z0-9]{20,}/g, '[github-token]'],
   [/xox[bpars]-[A-Za-z0-9-]{10,}/g, '[slack-token]'],
   [/\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b/g, '[email]'],
   [/\b(?:\+?\d{1,3}[\s-]?)?\(?\d{3}\)?[\s-]?\d{3}[\s-]?\d{4}\b/g, '[phone]'],

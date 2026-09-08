@@ -1,6 +1,6 @@
-import { nanoid } from 'nanoid';
+import { customAlphabet } from 'nanoid';
 import type { LanguageModelV4Middleware } from '@ai-sdk/provider';
-import { redactObject, type RedactMode } from './redact.js';
+import { redactObject, redactText, type RedactMode } from './redact.js';
 import { TraceExporter } from './exporter.js';
 import {
   isTelemetryDisabled,
@@ -11,6 +11,8 @@ import {
 import type { ToolCall, TraceEvent } from './types.js';
 
 export interface PisamaMiddlewareOptions {
+  /** Pisama API key. Defaults to PISAMA_API_KEY. Never sent as a bearer token. */
+  apiKey?: string;
   projectId?: string;
   endpoint?: string;
   redact?: RedactMode;
@@ -37,6 +39,9 @@ export interface PisamaMiddlewareOptions {
    */
   eager?: boolean;
 }
+
+const createTraceId = customAlphabet('0123456789abcdef', 32);
+const createSpanId = customAlphabet('0123456789abcdef', 16);
 
 function detectEdgeRuntime(): boolean {
   // Cloudflare Workers exposes WebSocketPair as a global. nodejs_compat
@@ -175,6 +180,10 @@ function resolveProjectId(opts: PisamaMiddlewareOptions): string | undefined {
   );
 }
 
+function resolveApiKey(opts: PisamaMiddlewareOptions): string | undefined {
+  return opts.apiKey ?? (typeof process !== 'undefined' ? process.env.PISAMA_API_KEY : undefined);
+}
+
 function buildBaseMetadata(opts: PisamaMiddlewareOptions): Record<string, unknown> {
   const metadata: Record<string, unknown> = {};
   if (opts.contact && /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/.test(opts.contact)) {
@@ -201,13 +210,16 @@ function disabledMiddleware(): PisamaLanguageModelMiddleware {
 }
 
 function buildMiddleware(opts: PisamaMiddlewareOptions = {}): PisamaLanguageModelMiddleware {
-  const projectId = resolveProjectId(opts);
-  const enabled = opts.enabled !== false && Boolean(projectId) && !isTelemetryDisabled();
+  const apiKey = resolveApiKey(opts);
+  const projectId = resolveProjectId(opts) ?? '@pisama/sdk';
+  const enabled =
+    opts.enabled !== false && Boolean(apiKey || opts.exporter) && !isTelemetryDisabled();
   const redactMode: RedactMode = opts.redact ?? 'standard';
 
-  if (!enabled || !projectId) return disabledMiddleware();
+  if (!enabled) return disabledMiddleware();
 
-  const exporter = opts.exporter ?? new TraceExporter({ projectId, endpoint: opts.endpoint });
+  const exporter =
+    opts.exporter ?? new TraceExporter({ projectId, apiKey, endpoint: opts.endpoint });
   const baseMetadata = buildBaseMetadata(opts);
 
   // Eager flush: required on Cloudflare Workers / Vercel Edge / Deno Deploy
@@ -225,8 +237,8 @@ function buildMiddleware(opts: PisamaMiddlewareOptions = {}): PisamaLanguageMode
     specificationVersion: 'v4',
 
     async wrapGenerate({ doGenerate, params, model }) {
-      const traceId = nanoid();
-      const spanId = nanoid();
+      const traceId = createTraceId();
+      const spanId = createSpanId();
       const startTime = Date.now();
       try {
         const result = await doGenerate();
@@ -271,8 +283,8 @@ function buildMiddleware(opts: PisamaMiddlewareOptions = {}): PisamaLanguageMode
     },
 
     async wrapStream({ doStream, params, model }) {
-      const traceId = nanoid();
-      const spanId = nanoid();
+      const traceId = createTraceId();
+      const spanId = createSpanId();
       const startTime = Date.now();
 
       let upstream: { stream: ReadableStream<StreamPartLike> };
@@ -465,7 +477,12 @@ function buildFromStream(args: BuildArgs & { collected: StreamCollector }): Trac
 }
 
 function buildErrorEvent(args: BuildArgs & { error: unknown }): TraceEvent {
-  const err = args.error as { message?: string; name?: string };
+  const rawMessage =
+    safeErrorField(args.error, 'message') ??
+    (typeof args.error === 'string' ? args.error : 'unknown');
+  const rawName = safeErrorField(args.error, 'name');
+  const message = redactText(rawMessage, args.redactMode);
+  const name = rawName ? redactText(rawName, args.redactMode) : undefined;
   return {
     projectId: args.projectId,
     traceId: args.traceId,
@@ -475,9 +492,26 @@ function buildErrorEvent(args: BuildArgs & { error: unknown }): TraceEvent {
     model: args.model.modelId ?? '',
     prompt: extractPromptStr(args.params, args.redactMode),
     toolCalls: [],
-    error: { message: err?.message ?? 'unknown', name: err?.name },
+    // Error text is telemetry content too. Redact it before creating the
+    // TraceEvent so neither direct OTLP error attributes nor gen_ai.state can
+    // ever see the unprocessed value.
+    error: { message, name },
     metadata: { ...args.metadata },
   };
+}
+
+function safeErrorField(error: unknown, field: 'message' | 'name'): string | undefined {
+  if ((typeof error !== 'object' && typeof error !== 'function') || error === null) {
+    return undefined;
+  }
+  try {
+    const value = (error as Record<string, unknown>)[field];
+    return typeof value === 'string' ? value : undefined;
+  } catch {
+    // A hostile provider error can expose a throwing getter. Telemetry must
+    // never replace the original model failure with a redaction failure.
+    return undefined;
+  }
 }
 
 function extractPromptStr(params: ParamsLike, mode: RedactMode): string | undefined {

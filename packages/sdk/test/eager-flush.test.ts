@@ -152,3 +152,59 @@ test('eager: false explicit override wins over auto-detect', async () => {
     delete process.env.PISAMA_SILENT;
   }
 });
+
+test('eager transport failure warns by default without echoing the transport error', async () => {
+  delete process.env.PISAMA_SILENT;
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  globalThis.fetch = (async () => {
+    throw new Error('socket reset: super-sensitive-value');
+  }) as typeof fetch;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+  try {
+    const model = observe(mockTextModel('completed despite export failure', 'mock-failure'), {
+      apiKey: 'test-key',
+      projectId: 'eager-failure',
+      redact: 'metadata-only',
+      eager: true,
+    });
+    const result = await streamText({ model, prompt: 'hi' });
+    for await (const _ of result.textStream) {
+      // discard
+    }
+    assert.ok(warnings.some((line) => /flush failed; events were dropped/.test(line)));
+    assert.doesNotMatch(warnings.join('\n'), /super-sensitive-value/);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+  }
+});
+
+test('PISAMA_SILENT suppresses eager transport-failure warnings', async () => {
+  process.env.PISAMA_SILENT = '1';
+  const originalFetch = globalThis.fetch;
+  const originalWarn = console.warn;
+  const warnings: string[] = [];
+  globalThis.fetch = (async () => {
+    throw new Error('socket reset');
+  }) as typeof fetch;
+  console.warn = (...args: unknown[]) => warnings.push(args.map(String).join(' '));
+  try {
+    const model = observe(mockTextModel('completed silently', 'mock-silent-failure'), {
+      apiKey: 'test-key',
+      projectId: 'eager-silent-failure',
+      redact: 'metadata-only',
+      eager: true,
+    });
+    const result = await streamText({ model, prompt: 'hi' });
+    for await (const _ of result.textStream) {
+      // discard
+    }
+    assert.deepEqual(warnings, []);
+  } finally {
+    globalThis.fetch = originalFetch;
+    console.warn = originalWarn;
+    delete process.env.PISAMA_SILENT;
+  }
+});

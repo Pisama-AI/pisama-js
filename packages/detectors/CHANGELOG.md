@@ -4,6 +4,14 @@ All notable changes to `@pisama/detectors` are documented here.
 
 ## [Unreleased]
 
+## [0.10.1] - 2026-09-04
+
+- Exchange API keys for full-scoped platform JWTs before calling the hosted
+  diagnose service; raw keys are never sent as bearer credentials.
+- Cache the scoped JWT and refresh it exactly once after a 401 while preserving
+  the serialized request and `X-Request-ID` for safe backend deduplication.
+- Fail closed without an API key, before any network request.
+
 - Remove the unsupported `delegation` and `consensus_collapse` client
   operations so an unavailable backend capability cannot look like a clean
   detector result.

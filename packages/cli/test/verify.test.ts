@@ -1,12 +1,29 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { verify } from '../src/verify.js';
+import { normaliseVerifyTimeout, verify } from '../src/verify.js';
 
 interface Spy {
   logs: string[];
   errs: string[];
   exitCode: number | null;
   restore: () => void;
+}
+
+interface CapturedRequest {
+  url: string;
+  method: string;
+  authorization?: string;
+  requestId?: string;
+  body: unknown;
+}
+
+interface PlatformOptions {
+  tokenStatus?: number;
+  ingestStatus?: number;
+  ingest401s?: number;
+  read401s?: number;
+  neverLand?: boolean;
+  ingestThrows?: boolean;
 }
 
 function spy(): Spy {
@@ -23,13 +40,8 @@ function spy(): Spy {
       process.exit = origExit;
     },
   };
-  console.log = (...a: unknown[]) => {
-    s.logs.push(a.map(String).join(' '));
-  };
-  console.error = (...a: unknown[]) => {
-    s.errs.push(a.map(String).join(' '));
-  };
-  // throw a sentinel so we can catch the early-exit
+  console.log = (...args: unknown[]) => s.logs.push(args.map(String).join(' '));
+  console.error = (...args: unknown[]) => s.errs.push(args.map(String).join(' '));
   process.exit = ((code?: number) => {
     s.exitCode = code ?? 0;
     throw new Error('__exit__');
@@ -37,407 +49,399 @@ function spy(): Spy {
   return s;
 }
 
-function extractAuthHeader(init?: RequestInit): string | undefined {
-  const headers = init?.headers as Record<string, string> | undefined;
-  return headers?.authorization;
+function token(tenantId: string, scope: string, sequence: number): string {
+  const header = Buffer.from(JSON.stringify({ alg: 'none' })).toString('base64url');
+  const payload = Buffer.from(JSON.stringify({ tenant_id: tenantId, scope })).toString('base64url');
+  return `${header}.${payload}.token-${scope}-${sequence}`;
 }
 
+function installPlatform(options: PlatformOptions = {}) {
+  const originalFetch = globalThis.fetch;
+  const requests: CapturedRequest[] = [];
+  const tokenCounts = new Map<string, number>();
+  let seenTraceId: string | undefined;
+  let pollCount = 0;
+  let ingest401s = options.ingest401s ?? 0;
+  let read401s = options.read401s ?? 0;
+
+  globalThis.fetch = (async (input: unknown, init: RequestInit = {}) => {
+    const url = String(input);
+    const headers = new Headers(init.headers);
+    let body: unknown;
+    try {
+      body = init.body ? JSON.parse(String(init.body)) : undefined;
+    } catch {
+      body = init.body;
+    }
+    requests.push({
+      url,
+      method: init.method ?? 'GET',
+      authorization: headers.get('authorization') ?? undefined,
+      requestId: headers.get('x-request-id') ?? undefined,
+      body,
+    });
+
+    if (url.endsWith('/api/v1/auth/token')) {
+      if (options.tokenStatus) return new Response('', { status: options.tokenStatus });
+      const scope = String((body as { scope?: unknown })?.scope ?? '');
+      const count = (tokenCounts.get(scope) ?? 0) + 1;
+      tokenCounts.set(scope, count);
+      return Response.json({ access_token: token('tenant-abc', scope, count) });
+    }
+    if (url.endsWith('/api/v1/traces/ingest')) {
+      if (options.ingestThrows) throw new Error('connect ECONNREFUSED');
+      if (ingest401s > 0) {
+        ingest401s--;
+        return new Response('expired', { status: 401 });
+      }
+      const otlp = body as {
+        resourceSpans?: Array<{ scopeSpans?: Array<{ spans?: Array<{ traceId?: string }> }> }>;
+      };
+      seenTraceId = otlp.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0]?.traceId;
+      return Response.json(
+        { accepted: 1, submitted: 1, rejected: 0, duplicates: 0 },
+        { status: options.ingestStatus ?? 202 },
+      );
+    }
+    if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
+      if (read401s > 0) {
+        read401s--;
+        return new Response('expired', { status: 401 });
+      }
+      pollCount++;
+      const landed = !options.neverLand && pollCount >= 2 && seenTraceId;
+      const id = landed
+        ? seenTraceId?.replace(/^(........)(....)(....)(....)(............)$/, '$1-$2-$3-$4-$5')
+        : undefined;
+      return Response.json({ traces: id ? [{ id }] : [] });
+    }
+    return new Response('', { status: 404 });
+  }) as typeof fetch;
+
+  return {
+    requests,
+    tokenCounts,
+    restore: () => {
+      globalThis.fetch = originalFetch;
+    },
+  };
+}
+
+async function expectExit(run: () => Promise<void>): Promise<void> {
+  try {
+    await run();
+  } catch (error) {
+    assert.equal((error as Error).message, '__exit__');
+  }
+}
+
+function hangingResponse(status = 200): Response {
+  return new Response(
+    new ReadableStream({
+      start() {
+        // Intentionally never enqueue or close: exercises the total body deadline.
+      },
+    }),
+    { status },
+  );
+}
+
+test('verify normalises a positive finite timeout and rejects unsafe values', () => {
+  assert.equal(normaliseVerifyTimeout(1.9), 1);
+  for (const value of [0, -1, Number.NaN, Number.POSITIVE_INFINITY, 2_147_483_648]) {
+    assert.throws(() => normaliseVerifyTimeout(value), /--timeout-ms must be between/);
+  }
+});
+
+for (const hangAt of [
+  'token fetch',
+  'token body',
+  'ingest fetch',
+  'ingest body',
+  'poll fetch',
+  'poll body',
+] as const) {
+  test(`verify total deadline bounds a hanging ${hangAt}`, async () => {
+    const originalFetch = globalThis.fetch;
+    globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+      const url = String(input);
+      if (url.endsWith('/api/v1/auth/token')) {
+        if (hangAt === 'token fetch') return new Promise<Response>(() => {});
+        if (hangAt === 'token body') return hangingResponse();
+        const body = JSON.parse(String(init.body)) as { scope?: string };
+        return Response.json({ access_token: token('tenant-abc', body.scope ?? 'read', 1) });
+      }
+      if (url.endsWith('/api/v1/traces/ingest')) {
+        if (hangAt === 'ingest fetch') return new Promise<Response>(() => {});
+        if (hangAt === 'ingest body') return hangingResponse(202);
+        return Response.json({ accepted: 1 }, { status: 202 });
+      }
+      if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
+        if (hangAt === 'poll fetch') return new Promise<Response>(() => {});
+        if (hangAt === 'poll body') return hangingResponse();
+        return Response.json({ traces: [] });
+      }
+      return new Response('', { status: 404 });
+    }) as typeof fetch;
+    const s = spy();
+    const started = Date.now();
+    try {
+      await expectExit(() =>
+        verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 25 }),
+      );
+      assert.equal(s.exitCode, 1);
+      assert.ok(Date.now() - started < 1_000, `${hangAt} exceeded the bounded deadline`);
+    } finally {
+      s.restore();
+      globalThis.fetch = originalFetch;
+    }
+  });
+}
+
+test('verify shares one deadline across sequential authentication stages', async () => {
+  const originalFetch = globalThis.fetch;
+  let protectedIngestCalls = 0;
+  globalThis.fetch = (async (input: RequestInfo | URL, init: RequestInit = {}) => {
+    const url = String(input);
+    if (url.endsWith('/api/v1/auth/token')) {
+      const body = JSON.parse(String(init.body)) as { scope?: string };
+      await new Promise((resolve) => setTimeout(resolve, 70));
+      return Response.json({ access_token: token('tenant-abc', body.scope ?? 'read', 1) });
+    }
+    if (url.endsWith('/api/v1/traces/ingest')) protectedIngestCalls += 1;
+    return Response.json({ accepted: 1 }, { status: 202 });
+  }) as typeof fetch;
+  const s = spy();
+  const started = Date.now();
+  try {
+    await expectExit(() =>
+      verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 100 }),
+    );
+    assert.equal(s.exitCode, 1);
+    assert.equal(protectedIngestCalls, 0, 'ingest must not start after the total deadline expires');
+    assert.ok(Date.now() - started < 500);
+  } finally {
+    s.restore();
+    globalThis.fetch = originalFetch;
+  }
+});
+
 test('verify fails clearly when no API key is available anywhere', async () => {
-  const orig = process.env.PISAMA_API_KEY;
+  const original = process.env.PISAMA_API_KEY;
   delete process.env.PISAMA_API_KEY;
   const s = spy();
   try {
-    try {
-      await verify({ cwd: '/tmp' });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
+    await expectExit(() => verify({ cwd: '/tmp' }));
     assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /no API key/i.test(l)),
-      "expected 'no API key' message",
-    );
-    assert.ok(
-      s.errs.some((l) => /settings\/api-keys/.test(l)),
-      'expected a pointer to the dashboard api-keys settings page',
-    );
+    assert.ok(s.errs.some((line) => /no API key/i.test(line)));
+    assert.ok(s.errs.some((line) => /settings\/api-keys/.test(line)));
   } finally {
     s.restore();
-    if (orig !== undefined) process.env.PISAMA_API_KEY = orig;
+    if (original !== undefined) process.env.PISAMA_API_KEY = original;
   }
 });
 
-test('verify happy path: tenant resolved, ingest accepted, trace found on second poll', async () => {
-  const originalFetch = globalThis.fetch;
-  const seenTraceId: { value?: string } = {};
-  let pollCount = 0;
-  const authHeaders: string[] = [];
-  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-    const url = String(input);
-    const auth = extractAuthHeader(init);
-    if (auth) authHeaders.push(auth);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      const body = JSON.parse(String(init?.body ?? '{}'));
-      seenTraceId.value = body.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0]?.traceId;
-      return new Response(JSON.stringify({ accepted: 1 }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
-      pollCount++;
-      const traces =
-        pollCount >= 2 && seenTraceId.value
-          ? [{ trace_id: seenTraceId.value, session_id: null }]
-          : [];
-      return new Response(JSON.stringify({ traces }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-
+test('verify exchanges scoped JWTs, caches them, and never uses the raw key as bearer', async () => {
+  const platform = installPlatform();
   const s = spy();
+  const rawKey = 'pisama_raw_secret_test';
   try {
     await verify({
       cwd: '/tmp',
-      apiKey: 'test-key-123',
+      apiKey: rawKey,
       baseUrl: 'https://api.pisama.ai/',
       timeoutMs: 5000,
     });
-    assert.equal(s.exitCode, null, 'should not exit on success');
-    assert.ok(
-      s.logs.some((l) => /tenant-abc/.test(l)),
-      'expected tenant id in output',
+    assert.equal(s.exitCode, null);
+    assert.ok(s.logs.some((line) => /tenant-abc/.test(line)));
+    assert.ok(s.logs.some((line) => /Install is working/.test(line)));
+    assert.ok(s.logs.some((line) => /https:\/\/pisama\.ai\/dashboard/.test(line)));
+    assert.equal(platform.tokenCounts.get('read'), 1, 'read JWT is cached across both polls');
+    assert.equal(platform.tokenCounts.get('ingest'), 1);
+    assert.equal(
+      platform.requests.some((request) => request.url.endsWith('/api/v1/auth/me')),
+      false,
+      'dashboard-only auth/me must not be used for API-key identity',
     );
-    assert.ok(
-      s.logs.some((l) => /Install is working/.test(l)),
-      'expected success message',
+    for (const request of platform.requests) {
+      assert.notEqual(request.authorization, `Bearer ${rawKey}`);
+      if (request.url.endsWith('/api/v1/auth/token')) {
+        assert.equal(request.authorization, undefined);
+        assert.equal((request.body as { api_key?: string }).api_key, rawKey);
+      }
+    }
+    const ingest = platform.requests.find((request) =>
+      request.url.endsWith('/api/v1/traces/ingest'),
     );
-    assert.ok(
-      s.logs.some((l) => /Dashboard: https:\/\/pisama\.ai\/dashboard/.test(l)),
-      'expected the dashboard link',
-    );
-    assert.ok(authHeaders.length >= 3, 'expected auth header on auth/me, ingest, and poll calls');
-    assert.ok(
-      authHeaders.every((h) => h === 'Bearer test-key-123'),
-      'expected every outbound request to carry the bearer token',
-    );
+    assert.match(ingest?.authorization ?? '', /^Bearer .+\.token-ingest-1$/);
+    assert.match(ingest?.requestId ?? '', /^pisama-cli-[0-9a-f]{24}$/);
   } finally {
     s.restore();
-    globalThis.fetch = originalFetch;
+    platform.restore();
   }
 });
 
-test('verify happy path via PISAMA_API_KEY env var', async () => {
-  const orig = process.env.PISAMA_API_KEY;
-  process.env.PISAMA_API_KEY = 'env-key-456';
-  const originalFetch = globalThis.fetch;
-  const seenTraceId: { value?: string } = {};
-  let pollCount = 0;
-  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      const auth = extractAuthHeader(init);
-      assert.equal(auth, 'Bearer env-key-456');
-      return new Response(JSON.stringify({ tenant_id: 'tenant-env' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      const body = JSON.parse(String(init?.body ?? '{}'));
-      seenTraceId.value = body.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0]?.traceId;
-      return new Response(JSON.stringify({ accepted: 1 }), { status: 200 });
-    }
-    if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
-      pollCount++;
-      const traces =
-        pollCount >= 2 && seenTraceId.value
-          ? [{ trace_id: seenTraceId.value, session_id: null }]
-          : [];
-      return new Response(JSON.stringify({ traces }), { status: 200 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-
+test('verify reads PISAMA_API_KEY from the environment', async () => {
+  const original = process.env.PISAMA_API_KEY;
+  process.env.PISAMA_API_KEY = 'pisama_env_key';
+  const platform = installPlatform();
   const s = spy();
   try {
-    await verify({ cwd: '/tmp', baseUrl: 'https://api.pisama.ai/', timeoutMs: 5000 });
-    assert.equal(s.exitCode, null, 'should not exit on success');
-    assert.ok(s.logs.some((l) => /Install is working/.test(l)));
+    await verify({ cwd: '/tmp', baseUrl: 'https://api.pisama.ai', timeoutMs: 5000 });
+    assert.equal(s.exitCode, null);
+    assert.ok(
+      platform.requests
+        .filter((request) => request.url.endsWith('/api/v1/auth/token'))
+        .every((request) => (request.body as { api_key?: string }).api_key === 'pisama_env_key'),
+    );
   } finally {
     s.restore();
-    globalThis.fetch = originalFetch;
-    if (orig !== undefined) process.env.PISAMA_API_KEY = orig;
+    platform.restore();
+    if (original !== undefined) process.env.PISAMA_API_KEY = original;
     else delete process.env.PISAMA_API_KEY;
   }
 });
 
-test('verify fails when auth/me returns 401', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response('unauthorized', { status: 401 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
+test('verify fails clearly when API-key exchange is rejected', async () => {
+  const platform = installPlatform({ tokenStatus: 401 });
   const s = spy();
   try {
-    try {
-      await verify({ cwd: '/tmp', apiKey: 'bad-key', baseUrl: 'https://test', timeoutMs: 5000 });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
-    assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /API key rejected/.test(l)),
-      'expected API key rejected message',
+    await expectExit(() =>
+      verify({ cwd: '/tmp', apiKey: 'bad-key', baseUrl: 'https://test', timeoutMs: 100 }),
     );
+    assert.equal(s.exitCode, 1);
+    assert.ok(s.errs.some((line) => /API key rejected/.test(line)));
   } finally {
     s.restore();
-    globalThis.fetch = originalFetch;
+    platform.restore();
   }
 });
 
-test('verify fails when ingest returns 401', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      return new Response('unauthorized', { status: 401 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
+test('verify re-exchanges once on ingest 401 and reuses exact payload and request id', async () => {
+  const platform = installPlatform({ ingest401s: 1 });
   const s = spy();
   try {
-    try {
-      await verify({ cwd: '/tmp', apiKey: 'bad-key', baseUrl: 'https://test', timeoutMs: 5000 });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
-    assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /rejected the API key/.test(l)),
-      'expected ingest-rejected-key message',
-    );
-  } finally {
-    s.restore();
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('verify fails when ingest returns 404 naming the endpoint and self-hosted deployments', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      return new Response('not found', { status: 404 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-  const s = spy();
-  try {
-    try {
-      await verify({ cwd: '/tmp', apiKey: 'k', baseUrl: 'https://test', timeoutMs: 5000 });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
-    assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /api\/v1\/traces\/ingest/.test(l)),
-      'expected the ingest endpoint path named in the error',
-    );
-    assert.ok(
-      s.errs.some((l) => /self-hosted/i.test(l)),
-      'expected a mention of self-hosted deployments',
-    );
-  } finally {
-    s.restore();
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('verify fails when ingest returns 502', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      return new Response('server error', { status: 502 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-  const s = spy();
-  try {
-    try {
-      await verify({ cwd: '/tmp', apiKey: 'k', baseUrl: 'https://test', timeoutMs: 5000 });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
-    assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /HTTP 502/.test(l)),
-      'expected HTTP 502 in error',
-    );
-    assert.ok(
-      s.errs.some((l) => /https:\/\/test\/api\/v1\/health/.test(l)),
-      'expected the configured API health endpoint in the error',
-    );
-  } finally {
-    s.restore();
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('verify reports the configured health endpoint when the ingest endpoint is unreachable', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      throw new Error('connect ECONNREFUSED');
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-  const s = spy();
-  try {
-    try {
-      await verify({
-        cwd: '/tmp',
-        apiKey: 'k',
-        baseUrl: 'https://test',
-        timeoutMs: 100,
-      });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
-    assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /cannot reach the configured API/.test(l)),
-      'expected a host-neutral connectivity error',
-    );
-    assert.ok(
-      s.errs.some((l) => /https:\/\/test\/api\/v1\/health/.test(l)),
-      'expected the configured API health endpoint',
-    );
-  } finally {
-    s.restore();
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('verify fails when trace never lands within timeout', async () => {
-  const originalFetch = globalThis.fetch;
-  globalThis.fetch = (async (input: unknown) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      return new Response(JSON.stringify({ accepted: 1 }), { status: 200 });
-    }
-    if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
-      return new Response(JSON.stringify({ traces: [] }), { status: 200 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-  const s = spy();
-  try {
-    try {
-      await verify({ cwd: '/tmp', apiKey: 'k', baseUrl: 'https://test', timeoutMs: 1500 });
-    } catch (e) {
-      assert.equal((e as Error).message, '__exit__');
-    }
-    assert.equal(s.exitCode, 1);
-    assert.ok(
-      s.errs.some((l) => /didn't appear/.test(l)),
-      "expected 'didn't appear' in error",
-    );
-  } finally {
-    s.restore();
-    globalThis.fetch = originalFetch;
-  }
-});
-
-test('verify sends a structurally valid OTLP payload', async () => {
-  const originalFetch = globalThis.fetch;
-  let capturedSpan: Record<string, unknown> | undefined;
-  let capturedResourceSpans: unknown;
-  let pollCount = 0;
-  let seenTraceId: string | undefined;
-  globalThis.fetch = (async (input: unknown, init?: RequestInit) => {
-    const url = String(input);
-    if (url.endsWith('/api/v1/auth/me')) {
-      return new Response(JSON.stringify({ tenant_id: 'tenant-abc' }), {
-        status: 200,
-        headers: { 'content-type': 'application/json' },
-      });
-    }
-    if (url.endsWith('/api/v1/traces/ingest')) {
-      const body = JSON.parse(String(init?.body ?? '{}'));
-      capturedResourceSpans = body.resourceSpans;
-      capturedSpan = body.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0];
-      seenTraceId = capturedSpan?.traceId as string | undefined;
-      return new Response(JSON.stringify({ accepted: 1 }), { status: 200 });
-    }
-    if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
-      pollCount++;
-      const traces = pollCount >= 2 && seenTraceId ? [{ trace_id: seenTraceId }] : [];
-      return new Response(JSON.stringify({ traces }), { status: 200 });
-    }
-    return new Response('', { status: 404 });
-  }) as typeof fetch;
-
-  const s = spy();
-  try {
-    await verify({ cwd: '/tmp', apiKey: 'k', baseUrl: 'https://api.pisama.ai/', timeoutMs: 5000 });
+    await verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 5000 });
     assert.equal(s.exitCode, null);
-    assert.ok(Array.isArray(capturedResourceSpans), 'resourceSpans should be an array');
-    assert.ok((capturedResourceSpans as unknown[]).length > 0, 'resourceSpans should be non-empty');
-    assert.ok(capturedSpan, 'expected a captured span');
-    assert.match(String(capturedSpan?.traceId), /^[0-9a-f]{32}$/);
-    assert.match(String(capturedSpan?.spanId), /^[0-9a-f]{16}$/);
-    const start = String(capturedSpan?.startTimeUnixNano);
-    const end = String(capturedSpan?.endTimeUnixNano);
-    assert.match(start, /^\d+$/);
-    assert.match(end, /^\d+$/);
-    assert.ok(BigInt(end) > BigInt(start), 'end time should be after start time');
+    assert.equal(platform.tokenCounts.get('ingest'), 2);
+    const attempts = platform.requests.filter((request) =>
+      request.url.endsWith('/api/v1/traces/ingest'),
+    );
+    assert.equal(attempts.length, 2);
+    assert.deepEqual(attempts[1]?.body, attempts[0]?.body);
+    assert.equal(attempts[1]?.requestId, attempts[0]?.requestId);
+    assert.notEqual(attempts[1]?.authorization, attempts[0]?.authorization);
   } finally {
     s.restore();
-    globalThis.fetch = originalFetch;
+    platform.restore();
+  }
+});
+
+test('verify stops after one re-exchange when ingest keeps returning 401', async () => {
+  const platform = installPlatform({ ingest401s: 99 });
+  const s = spy();
+  try {
+    await expectExit(() =>
+      verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 100 }),
+    );
+    assert.equal(s.exitCode, 1);
+    assert.equal(platform.tokenCounts.get('ingest'), 2);
+    assert.equal(
+      platform.requests.filter((request) => request.url.endsWith('/api/v1/traces/ingest')).length,
+      2,
+    );
+    assert.ok(s.errs.some((line) => /after one re-exchange/.test(line)));
+  } finally {
+    s.restore();
+    platform.restore();
+  }
+});
+
+test('verify re-exchanges the cached read token once on polling 401', async () => {
+  const platform = installPlatform({ read401s: 1 });
+  const s = spy();
+  try {
+    await verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 5000 });
+    assert.equal(s.exitCode, null);
+    assert.equal(platform.tokenCounts.get('read'), 2);
+  } finally {
+    s.restore();
+    platform.restore();
+  }
+});
+
+for (const status of [404, 502]) {
+  test(`verify reports ingest HTTP ${status} clearly`, async () => {
+    const platform = installPlatform({ ingestStatus: status });
+    const s = spy();
+    try {
+      await expectExit(() =>
+        verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 100 }),
+      );
+      assert.equal(s.exitCode, 1);
+      if (status === 404) {
+        assert.ok(s.errs.some((line) => /api\/v1\/traces\/ingest/.test(line)));
+        assert.ok(s.errs.some((line) => /self-hosted/i.test(line)));
+      }
+      if (status !== 404) assert.ok(s.errs.some((line) => line.includes(String(status))));
+      if (status === 502) assert.ok(s.errs.some((line) => /api\/v1\/health/.test(line)));
+    } finally {
+      s.restore();
+      platform.restore();
+    }
+  });
+}
+
+test('verify reports the health endpoint when ingest is unreachable', async () => {
+  const platform = installPlatform({ ingestThrows: true });
+  const s = spy();
+  try {
+    await expectExit(() =>
+      verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 100 }),
+    );
+    assert.ok(s.errs.some((line) => /cannot reach the configured API/.test(line)));
+    assert.ok(s.errs.some((line) => /https:\/\/test\/api\/v1\/health/.test(line)));
+  } finally {
+    s.restore();
+    platform.restore();
+  }
+});
+
+test('verify fails when the accepted trace never lands within timeout', async () => {
+  const platform = installPlatform({ neverLand: true });
+  const s = spy();
+  try {
+    await expectExit(() =>
+      verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 10 }),
+    );
+    assert.ok(s.errs.some((line) => /didn't appear/.test(line)));
+  } finally {
+    s.restore();
+    platform.restore();
+  }
+});
+
+test('verify sends a structurally valid OTLP payload with scoped ingest auth', async () => {
+  const platform = installPlatform();
+  const s = spy();
+  try {
+    await verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 5000 });
+    const ingest = platform.requests.find((request) =>
+      request.url.endsWith('/api/v1/traces/ingest'),
+    );
+    const body = ingest?.body as {
+      resourceSpans?: Array<{ scopeSpans?: Array<{ spans?: Array<Record<string, unknown>> }> }>;
+    };
+    const span = body.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0];
+    assert.ok(span);
+    assert.match(String(span.traceId), /^[0-9a-f]{32}$/);
+    assert.match(String(span.spanId), /^[0-9a-f]{16}$/);
+    assert.match(String(span.startTimeUnixNano), /^\d+$/);
+    assert.match(String(span.endTimeUnixNano), /^\d+$/);
+    assert.ok(BigInt(String(span.endTimeUnixNano)) > BigInt(String(span.startTimeUnixNano)));
+    assert.match(ingest?.authorization ?? '', /^Bearer .+\.token-ingest-1$/);
+  } finally {
+    s.restore();
+    platform.restore();
   }
 });

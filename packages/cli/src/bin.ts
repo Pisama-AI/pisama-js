@@ -1,15 +1,23 @@
 #!/usr/bin/env node
 import { createRequire } from 'module';
-import { Command } from 'commander';
+import { Command, InvalidArgumentError } from 'commander';
 import { analyzeAtif } from './analyze-atif.js';
 import { init } from './init.js';
 import { startMcpServer } from './mcp.js';
-import { verify } from './verify.js';
+import { normaliseVerifyTimeout, verify } from './verify.js';
 
 const require = createRequire(import.meta.url);
 const { version } = require('../package.json') as { version: string };
 
 const program = new Command();
+
+function parseTimeoutMs(value: string): number {
+  try {
+    return normaliseVerifyTimeout(Number(value));
+  } catch (error) {
+    throw new InvalidArgumentError((error as Error).message);
+  }
+}
 
 program
   .name('pisama')
@@ -33,18 +41,18 @@ program
 program
   .command('mcp')
   .description(
-    "Run an MCP server over stdio so any MCP-compatible AI assistant can read your project's failures.",
+    'Run an authenticated MCP server over stdio so an MCP-compatible AI assistant can read your tenant traces.',
   )
-  .option('-p, --project-id <id>', 'Pisama project id (defaults to PISAMA_PROJECT_ID env var)')
+  .option('--api-key <key>', 'Pisama API key (defaults to PISAMA_API_KEY)')
   .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
-  .action(async (opts: { projectId?: string; baseUrl?: string }) => {
-    const projectId = opts.projectId ?? process.env.PISAMA_PROJECT_ID;
-    if (!projectId) {
-      console.error('no project id. Pass --project-id or set PISAMA_PROJECT_ID.');
+  .action(async (opts: { apiKey?: string; baseUrl?: string }) => {
+    const apiKey = opts.apiKey ?? process.env.PISAMA_API_KEY;
+    if (!apiKey) {
+      console.error('no API key. Pass --api-key or set PISAMA_API_KEY.');
       process.exit(1);
     }
     await startMcpServer({
-      projectId,
+      apiKey,
       baseUrl: opts.baseUrl,
       serverVersion: version,
     });
@@ -58,8 +66,10 @@ program
   .option('--cwd <path>', 'Project root', process.cwd())
   .option('--api-key <key>', 'Pisama API key (defaults to PISAMA_API_KEY)')
   .option('--base-url <url>', 'Override the Pisama API base URL (default https://api.pisama.ai)')
-  .option('--timeout-ms <ms>', 'How long to wait for the trace to surface (default 15000)', (v) =>
-    Number(v),
+  .option(
+    '--timeout-ms <ms>',
+    'Total deadline for authentication, ingest, and readback (default 15000)',
+    parseTimeoutMs,
   )
   .action(async (opts: { cwd: string; apiKey?: string; baseUrl?: string; timeoutMs?: number }) => {
     await verify({
@@ -73,7 +83,7 @@ program
 program
   .command('analyze-atif')
   .description(
-    "Analyze a Harbor ATIF trajectory (or directory of trajectories) with Pisama's detectors. Exits non-zero on any high-severity finding so it works in CI.",
+    "Analyze a Harbor ATIF trajectory (or directory of trajectories) with Pisama's detectors. Exits non-zero on any critical/high-severity finding so it works in CI.",
   )
   .argument('<path>', 'Path to an ATIF .json file or a directory of them')
   .option('-p, --project-id <id>', 'Optional Pisama project id for correlation')

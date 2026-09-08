@@ -1,6 +1,6 @@
 {
   "name": "@pisama/detectors",
-  "version": "0.10.0",
+  "version": "0.10.1",
   "description": "TypeScript-native failure detectors for AI agent traces.",
   "type": "module",
   "main": "./dist/index.js",
@@ -43,5 +43,9 @@
   "homepage": "https://pisama.ai",
   "bugs": {
     "url": "https://github.com/Pisama-AI/pisama-js/issues"
+  },
+  "publishConfig": {
+    "access": "public",
+    "registry": "https://registry.npmjs.org"
   }
 }

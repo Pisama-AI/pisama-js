@@ -7,6 +7,7 @@
 
 import { simulateReadableStream } from 'ai';
 import type { LanguageModelV3, LanguageModelV3StreamPart } from '@ai-sdk/provider';
+import { decodeEvents, tokenResponse } from '../../otlp-helpers.js';
 
 export interface CapturedEvent {
   endpoint: string;
@@ -19,21 +20,32 @@ export function setupFetchCapture(): {
 } {
   const captured: CapturedEvent[] = [];
   const originalFetch = globalThis.fetch;
+  const originalApiKey = process.env.PISAMA_API_KEY;
+  process.env.PISAMA_API_KEY = 'pisama_integration_test_key';
   globalThis.fetch = (async (input: RequestInfo | URL, init?: RequestInit) => {
     const url = String(input);
-    if (url.includes('/api/v1/spans')) {
+    if (url.includes('/api/v1/auth/token')) return tokenResponse();
+    if (url.includes('/api/v1/traces/ingest')) {
+      const body = JSON.parse(String(init?.body ?? '{}'));
       captured.push({
         endpoint: url,
-        body: JSON.parse(String(init?.body ?? '{}')),
+        body: { events: decodeEvents(body) },
       });
-      return new Response(JSON.stringify({ accepted: 1, detections: [] }), {
-        status: 200,
+      return new Response(JSON.stringify({ accepted: 1, submitted: 1, rejected: 0 }), {
+        status: 202,
         headers: { 'content-type': 'application/json' },
       });
     }
     return new Response('', { status: 404 });
   }) as typeof fetch;
-  return { captured, restore: () => (globalThis.fetch = originalFetch) };
+  return {
+    captured,
+    restore: () => {
+      globalThis.fetch = originalFetch;
+      if (originalApiKey === undefined) delete process.env.PISAMA_API_KEY;
+      else process.env.PISAMA_API_KEY = originalApiKey;
+    },
+  };
 }
 
 export function mockTextModel(text: string, modelId = 'mock'): LanguageModelV3 {

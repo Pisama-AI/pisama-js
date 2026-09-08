@@ -9,6 +9,7 @@ import { test } from 'node:test';
 import assert from 'node:assert';
 import { TraceExporter } from '../src/exporter.js';
 import { pisamaMiddleware } from '../src/middleware.js';
+import { scopedToken } from './otlp-helpers.js';
 
 test.beforeEach(() => {
   delete process.env.PISAMA_TELEMETRY;
@@ -29,8 +30,9 @@ test('PISAMA_TELEMETRY=false: TraceExporter.flush makes zero network requests', 
   }) as typeof fetch;
 
   const exporter = new TraceExporter({
+    apiKey: 'pisama_killswitch_test_key',
     projectId: 'ps_killswitch_test',
-    endpoint: 'https://test/api/v1/spans',
+    endpoint: 'https://test/api/v1/traces/ingest',
     fetchImpl,
   });
   exporter.enqueue({
@@ -89,8 +91,9 @@ test('PISAMA_TELEMETRY=false: enqueue drops events immediately (no buffer growth
   process.env.PISAMA_TELEMETRY = 'false';
   const fetchImpl = (async () => new Response('{}', { status: 200 })) as typeof fetch;
   const exporter = new TraceExporter({
+    apiKey: 'pisama_dropguard_test_key',
     projectId: 'ps_dropguard',
-    endpoint: 'https://test/api/v1/spans',
+    endpoint: 'https://test/api/v1/traces/ingest',
     fetchImpl,
   });
   for (let i = 0; i < 100; i++) {
@@ -112,15 +115,21 @@ test('PISAMA_TELEMETRY=false: enqueue drops events immediately (no buffer growth
 });
 
 test('default (PISAMA_TELEMETRY unset): exporter still issues requests', async () => {
-  let calls = 0;
-  const fetchImpl = (async () => {
-    calls++;
+  let tokenCalls = 0;
+  let ingestCalls = 0;
+  const fetchImpl = (async (input: RequestInfo | URL) => {
+    if (String(input).endsWith('/api/v1/auth/token')) {
+      tokenCalls++;
+      return Response.json({ access_token: scopedToken() });
+    }
+    ingestCalls++;
     return new Response('{}', { status: 200 });
   }) as typeof fetch;
 
   const exporter = new TraceExporter({
+    apiKey: 'pisama_default_test_key',
     projectId: 'ps_default',
-    endpoint: 'https://test/api/v1/spans',
+    endpoint: 'https://test/api/v1/traces/ingest',
     fetchImpl,
   });
   exporter.enqueue({
@@ -134,5 +143,6 @@ test('default (PISAMA_TELEMETRY unset): exporter still issues requests', async (
     metadata: {},
   });
   await exporter.flush();
-  assert.equal(calls, 1, 'default mode posts the batch');
+  assert.equal(tokenCalls, 1, 'default mode exchanges the API key once');
+  assert.equal(ingestCalls, 1, 'default mode posts the batch once');
 });
