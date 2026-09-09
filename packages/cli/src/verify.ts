@@ -80,11 +80,13 @@ export async function verify(opts: VerifyOptions): Promise<void> {
               {
                 traceId,
                 spanId,
-                name: 'pisama.verify',
+                name: 'gen_ai.chat pisama.verify',
                 kind: 1,
                 startTimeUnixNano: startNano.toString(),
                 endTimeUnixNano: (startNano + 50_000_000n).toString(),
                 attributes: [
+                  attr('gen_ai.system', 'pisama-synthetic'),
+                  attr('gen_ai.operation.name', 'chat'),
                   attr('gen_ai.request.model', 'verify-cli'),
                   attr('gen_ai.prompt', 'pisama verify probe'),
                   attr('gen_ai.completion', 'ok'),
@@ -110,7 +112,7 @@ export async function verify(opts: VerifyOptions): Promise<void> {
     },
     deadline,
   );
-  assertIngestAccepted(postRes, baseUrl, dashboardBaseUrl, healthUrl);
+  await assertIngestAccepted(postRes, baseUrl, dashboardBaseUrl, healthUrl);
   ok(`Ingest accepted (HTTP ${postRes.status}).`);
 
   step('Waiting for the trace to surface...');
@@ -190,12 +192,12 @@ async function postTrace(
   }
 }
 
-function assertIngestAccepted(
+async function assertIngestAccepted(
   postRes: Response,
   baseUrl: string,
   dashboardBaseUrl: string,
   healthUrl: string,
-): void {
+): Promise<void> {
   if (postRes.status === 401 || postRes.status === 403) {
     fail(
       `Ingest rejected the scoped access token (HTTP ${postRes.status}) after one re-exchange.\n` +
@@ -215,6 +217,25 @@ function assertIngestAccepted(
       `Ingest returned HTTP ${postRes.status}. Aborting.\n  If this persists, check ${healthUrl}`,
     );
   }
+  // HTTP 202 alone does not mean a span was stored: unrecognized spans can
+  // produce accepted=0. This fresh probe must account for exactly one span.
+  const body: unknown = await postRes.json().catch(() => null);
+  if (!confirmsSyntheticSpan(body)) {
+    fail(
+      `Ingest did not confirm acceptance of the synthetic span (HTTP ${postRes.status}).\n` +
+        '  Expected submitted=1, accepted=1, rejected=0, duplicates=0, traces=1.\n' +
+        '  No successful round-trip has been verified; check CLI/server compatibility.\n' +
+        `  Check ${healthUrl}`,
+    );
+  }
+}
+
+function confirmsSyntheticSpan(body: unknown): boolean {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return false;
+  const counters = body as Record<string, unknown>;
+  return Object.entries({ submitted: 1, accepted: 1, rejected: 0, duplicates: 0, traces: 1 }).every(
+    ([name, expected]) => counters[name] === expected,
+  );
 }
 
 function attr(key: string, value: string) {
