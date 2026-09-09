@@ -39,7 +39,7 @@
   "devDependencies": {
     "@ai-sdk/provider": "^4.0.0",
     "ai": "^7.0.0",
-    "tsx": "^4.19.0",
+    "tsx": "^4.23.13",
     "typescript": "^6.0.3",
     "zod": "^4.0.0"
   },
