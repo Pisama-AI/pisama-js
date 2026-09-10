@@ -24,6 +24,7 @@ interface PlatformOptions {
   read401s?: number;
   neverLand?: boolean;
   ingestThrows?: boolean;
+  ingestBody?: unknown;
 }
 
 function spy(): Spy {
@@ -99,7 +100,9 @@ function installPlatform(options: PlatformOptions = {}) {
       };
       seenTraceId = otlp.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0]?.traceId;
       return Response.json(
-        { accepted: 1, submitted: 1, rejected: 0, duplicates: 0 },
+        options.ingestBody === undefined
+          ? { accepted: 1, submitted: 1, rejected: 0, duplicates: 0, traces: 1 }
+          : options.ingestBody,
         { status: options.ingestStatus ?? 202 },
       );
     }
@@ -174,7 +177,10 @@ for (const hangAt of [
       if (url.endsWith('/api/v1/traces/ingest')) {
         if (hangAt === 'ingest fetch') return new Promise<Response>(() => {});
         if (hangAt === 'ingest body') return hangingResponse(202);
-        return Response.json({ accepted: 1 }, { status: 202 });
+        return Response.json(
+          { accepted: 1, submitted: 1, rejected: 0, duplicates: 0, traces: 1 },
+          { status: 202 },
+        );
       }
       if (url.includes('/api/v1/tenants/') && url.includes('/traces')) {
         if (hangAt === 'poll fetch') return new Promise<Response>(() => {});
@@ -392,6 +398,41 @@ for (const status of [404, 502]) {
   });
 }
 
+for (const ingestBody of [
+  { submitted: 1, accepted: 0, rejected: 0, duplicates: 0, traces: 0 },
+  { submitted: 1, accepted: 0, rejected: 1, duplicates: 0, traces: 0 },
+  { submitted: 1, accepted: 0, rejected: 0, duplicates: 1, traces: 1 },
+  { submitted: 2, accepted: 1, rejected: 1, duplicates: 0, traces: 1 },
+  { submitted: 1, accepted: '1', rejected: 0, duplicates: 0, traces: 1 },
+  { accepted: 1 },
+  null,
+  [],
+  'not a counter object',
+]) {
+  test(`verify rejects unconfirmed ingest counters ${JSON.stringify(ingestBody)}`, async () => {
+    const platform = installPlatform({ ingestBody });
+    const s = spy();
+    try {
+      await expectExit(() =>
+        verify({ cwd: '/tmp', apiKey: 'key', baseUrl: 'https://test', timeoutMs: 5000 }),
+      );
+      assert.equal(s.exitCode, 1);
+      assert.ok(s.errs.some((line) => /did not confirm acceptance/.test(line)));
+      assert.equal(
+        s.logs.some((line) => /Ingest accepted|Install is working/.test(line)),
+        false,
+      );
+      assert.equal(
+        platform.requests.some((request) => request.url.includes('/tenants/')),
+        false,
+      );
+    } finally {
+      s.restore();
+      platform.restore();
+    }
+  });
+}
+
 test('verify reports the health endpoint when ingest is unreachable', async () => {
   const platform = installPlatform({ ingestThrows: true });
   const s = spy();
@@ -434,6 +475,14 @@ test('verify sends a structurally valid OTLP payload with scoped ingest auth', a
     };
     const span = body.resourceSpans?.[0]?.scopeSpans?.[0]?.spans?.[0];
     assert.ok(span);
+    assert.equal(span.name, 'gen_ai.chat pisama.verify');
+    assert.ok(
+      (span.attributes as Array<{ key: string; value: { stringValue: string } }>).some(
+        (attribute) =>
+          attribute.key === 'gen_ai.system' && attribute.value.stringValue === 'pisama-synthetic',
+      ),
+      'production ingestion requires a recognized GenAI span',
+    );
     assert.match(String(span.traceId), /^[0-9a-f]{32}$/);
     assert.match(String(span.spanId), /^[0-9a-f]{16}$/);
     assert.match(String(span.startTimeUnixNano), /^\d+$/);
